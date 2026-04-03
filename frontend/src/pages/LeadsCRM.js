@@ -4,7 +4,7 @@ import {
   Check, X, Trash2, RefreshCw,
   DollarSign, UserCheck, AlertTriangle,
   GripVertical, Eye, Settings, Smartphone,
-  ArrowRight, BarChart3, Zap, Copy, ChevronDown, User
+  ArrowRight, BarChart3, Zap, Copy, ChevronDown, User, Target
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -97,7 +97,7 @@ const StatusSelector = ({ currentStatus, onSelect, disabled }) => {
 
 // ─── Funnel (admin only) ───────────────────────────────────────────
 
-const FunnelDisplay = ({ funnel, conversionRates, totals }) => {
+const FunnelDisplay = ({ funnel, conversionRates, totals, period, onFilterChange, filterType, startDate, endDate }) => {
   const steps = [
     { key: 'visitas', label: 'Visitas',    value: funnel?.visitas || 0, icon: Eye },
     { key: 'clicks',  label: 'Clicks WA',  value: funnel?.clicks  || 0, icon: Smartphone },
@@ -109,11 +109,68 @@ const FunnelDisplay = ({ funnel, conversionRates, totals }) => {
     conversionRates?.clicks_to_chats   || 0,
     conversionRates?.chats_to_cargas   || 0,
   ];
+  
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [customStart, setCustomStart] = useState(startDate || '');
+  const [customEnd, setCustomEnd] = useState(endDate || '');
+  
   return (
     <div className="bg-slate-900/50 rounded-xl p-4 border border-slate-800">
-      <h3 className="text-sm font-medium text-slate-400 mb-4 flex items-center gap-2">
-        <BarChart3 className="w-4 h-4" /> Embudo de Conversión
-      </h3>
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-sm font-medium text-slate-400 flex items-center gap-2">
+          <BarChart3 className="w-4 h-4" /> Embudo de Conversión
+          {period && <span className="text-xs text-slate-500">({period})</span>}
+        </h3>
+        {onFilterChange && (
+          <div className="flex items-center gap-2">
+            <select
+              value={filterType || '30'}
+              onChange={(e) => {
+                const val = e.target.value;
+                if (val === 'custom') {
+                  setShowDatePicker(true);
+                } else {
+                  setShowDatePicker(false);
+                  onFilterChange(val, null, null);
+                }
+              }}
+              className="bg-slate-800 border border-slate-700 text-white text-xs rounded-lg px-2 py-1"
+            >
+              <option value="diario">Hoy</option>
+              <option value="semanal">Esta semana</option>
+              <option value="mensual">Este mes</option>
+              <option value="7">Últimos 7 días</option>
+              <option value="30">Últimos 30 días</option>
+              <option value="90">Últimos 90 días</option>
+              <option value="custom">Fecha específica</option>
+            </select>
+            {showDatePicker && (
+              <div className="flex items-center gap-2">
+                <input
+                  type="date"
+                  value={customStart}
+                  onChange={(e) => setCustomStart(e.target.value)}
+                  className="bg-slate-800 border border-slate-700 text-white text-xs rounded-lg px-2 py-1"
+                />
+                <span className="text-slate-500 text-xs">a</span>
+                <input
+                  type="date"
+                  value={customEnd}
+                  onChange={(e) => setCustomEnd(e.target.value)}
+                  className="bg-slate-800 border border-slate-700 text-white text-xs rounded-lg px-2 py-1"
+                />
+                <Button 
+                  size="sm" 
+                  onClick={() => onFilterChange('custom', customStart, customEnd)}
+                  className="bg-teal-600 hover:bg-teal-700 text-xs h-7"
+                >
+                  Aplicar
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
       <div className="flex items-center justify-between">
         {steps.map((step, idx) => {
           const Icon = step.icon;
@@ -436,7 +493,7 @@ const ChatMessage = ({ message }) => {
 
 // ─── Chat Panel (shared between cajero and admin modal) ────────────
 
-const ChatPanel = ({ lead, onStatusChange, onClose, showCloseButton = false }) => {
+const ChatPanel = ({ lead, onStatusChange, onClose, showCloseButton = false, userMessages = {} }) => {
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState('');
   const [sending, setSending] = useState(false);
@@ -487,13 +544,14 @@ const ChatPanel = ({ lead, onStatusChange, onClose, showCloseButton = false }) =
   };
 
   const sendBienvenida = async () => {
-    const mensaje = `¡Buenas!👋 Trabajamos con las plataformas MÁS COMPLETAS del país!  
-    💟 ¡GANAMOS! 💟 💜 GANAMOSvip 💜 🥇 OROPURO 🥇  
-    ℹ MINIMOS: $2000 Acreditación // $5000 Retiro. 
-    🏦 Retiras tus ganancias UNA vez cada 24hs! 
-    ⛔ No abonamos ni trabajamos con Ruletas 
-    🎁B0N0 ¡Beneficio de bienvenida activado! B0N0🎁  
-    ✨¡Decime tu nombre para generar el usuario!✨`;
+    // Use custom user message or default
+    const mensaje = userMessages.welcome_message || `¡Buenas!👋 Trabajamos con las plataformas MÁS COMPLETAS del país!  
+💟 ¡GANAMOS! 💟 💜 GANAMOSvip 💜 🥇 OROPURO 🥇  
+ℹ MINIMOS: $2000 Acreditación // $5000 Retiro. 
+🏦 Retiras tus ganancias UNA vez cada 24hs! 
+⛔ No abonamos ni trabajamos con Ruletas 
+🎁B0N0 ¡Beneficio de bienvenida activado! B0N0🎁  
+✨¡Decime tu nombre para generar el usuario!✨`;
     try {
       await api.post(`/crm/leads/${lead.id}/messages`, { content: mensaje, sender: 'admin' });
       loadMessages();
@@ -508,18 +566,23 @@ const ChatPanel = ({ lead, onStatusChange, onClose, showCloseButton = false }) =
     } catch {
       clipboardText = '[usuario]';
     }
-    const mensaje = `¡Te dejo tus datos de acceso!:
-    👤Usuario: ${clipboardText}
-    🔑Contraseña: hola123
-    🌐Link de acceso: https://ganamosnet.org
-    🌐Link de acceso: https://oropuro.net
-    🌐Link de acceso: https://1ganamos.vip
-    ¡Te dejo el CBU para que puedas cargar! 
-    Le envio nuestros datos de cuenta 👇`;
+    // Use custom user message or default, replace [CLIPBOARD] with clipboard content
+    const defaultMsg = `¡Te dejo tus datos de acceso!:
+👤Usuario: [CLIPBOARD]
+🔑Contraseña: hola123
+🌐Link de acceso: https://ganamosnet.org
+🌐Link de acceso: https://oropuro.net
+🌐Link de acceso: https://1ganamos.vip
+¡Te dejo el CBU para que puedas cargar! 
+Le envio nuestros datos de cuenta 👇`;
+    const template = userMessages.user_message || defaultMsg;
+    const mensaje = template.replace(/\[CLIPBOARD\]/g, clipboardText);
     try {
       await api.post(`/crm/leads/${lead.id}/messages`, { content: mensaje, sender: 'admin' });
       loadMessages();
       toast.success('Datos de usuario enviados');
+      // Copy clipboard text to make it easier to paste
+      await navigator.clipboard.writeText(clipboardText);
     } catch { toast.error('Error enviando datos de usuario'); }
   };
 
@@ -637,6 +700,7 @@ const LeadCard = ({ lead, onClick, onDragStart }) => {
       <div className="text-xs text-slate-400 space-y-1">
         <div className="flex items-center gap-1"><Phone className="w-3 h-3" /><span className="truncate">{lead.phone}</span></div>
         {lead.line_name && <div className="flex items-center gap-1"><Smartphone className="w-3 h-3" /><span className="truncate">{lead.line_name}</span></div>}
+        {lead.ad_source && <div className="flex items-center gap-1 text-purple-400"><Target className="w-3 h-3" /><span className="truncate text-[10px]">{lead.ad_source}</span></div>}
         {lead.charge_amount > 0 && <div className="flex items-center gap-1 text-emerald-400"><DollarSign className="w-3 h-3" />${lead.charge_amount.toLocaleString()}</div>}
         {lead.messages_count > 0 && (
           <div className={`flex items-center gap-1 ${hasNewMessage ? 'text-red-400 font-medium' : ''}`}>
@@ -716,6 +780,9 @@ export default function LeadsCRM() {
   const [draggedLead, setDraggedLead] = useState(null);
   const [selectedLineId, setSelectedLineId] = useState(null);
   const [showFunnelModal, setShowFunnelModal] = useState(false);
+  
+  // Funnel filter state
+  const [funnelFilter, setFunnelFilter] = useState({ type: '30', startDate: null, endDate: null });
 
   const isAdmin = !currentUser?.role || currentUser?.role === 'admin';
 
@@ -802,12 +869,27 @@ export default function LeadsCRM() {
 
   const loadFunnel = useCallback(async () => {
     try {
-      const params = { days: 30 };
+      const params = {};
       if (selectedLineId) params.line_id = selectedLineId;
+      
+      // Apply filter
+      if (funnelFilter.type === 'custom' && funnelFilter.startDate && funnelFilter.endDate) {
+        params.start_date = funnelFilter.startDate;
+        params.end_date = funnelFilter.endDate;
+      } else if (['diario', 'semanal', 'mensual'].includes(funnelFilter.type)) {
+        params.filter_type = funnelFilter.type;
+      } else {
+        params.days = parseInt(funnelFilter.type) || 30;
+      }
+      
       const { data } = await api.get('/crm/funnel/stats', { params });
       setFunnel(data);
     } catch { /* silent */ }
-  }, [selectedLineId]);
+  }, [selectedLineId, funnelFilter]);
+  
+  const handleFunnelFilterChange = (type, startDate, endDate) => {
+    setFunnelFilter({ type, startDate, endDate });
+  };
 
   useEffect(() => { loadLeads(); loadLines(); loadFunnel(); }, [loadLeads, loadLines, loadFunnel]);
 
@@ -913,7 +995,16 @@ export default function LeadsCRM() {
                 </button>
               </div>
               <div className="p-5">
-                <FunnelDisplay funnel={funnel.funnel} conversionRates={funnel.conversion_rates} totals={funnel.totals} />
+                <FunnelDisplay 
+                  funnel={funnel.funnel} 
+                  conversionRates={funnel.conversion_rates} 
+                  totals={funnel.totals}
+                  period={funnel.period}
+                  onFilterChange={handleFunnelFilterChange}
+                  filterType={funnelFilter.type}
+                  startDate={funnelFilter.startDate}
+                  endDate={funnelFilter.endDate}
+                />
               </div>
             </div>
           </div>
@@ -1036,6 +1127,10 @@ export default function LeadsCRM() {
                 lead={selectedLead}
                 onStatusChange={handleStatusChange}
                 showCloseButton={false}
+                userMessages={{
+                  welcome_message: currentUser?.welcome_message,
+                  user_message: currentUser?.user_message
+                }}
               />
             )}
           </div>
@@ -1060,7 +1155,18 @@ export default function LeadsCRM() {
             <RefreshCw className="w-4 h-4 mr-2" /> Actualizar
           </Button>
         </div>
-        {funnel && <FunnelDisplay funnel={funnel.funnel} conversionRates={funnel.conversion_rates} totals={funnel.totals} />}
+        {funnel && (
+          <FunnelDisplay 
+            funnel={funnel.funnel} 
+            conversionRates={funnel.conversion_rates} 
+            totals={funnel.totals}
+            period={funnel.period}
+            onFilterChange={handleFunnelFilterChange}
+            filterType={funnelFilter.type}
+            startDate={funnelFilter.startDate}
+            endDate={funnelFilter.endDate}
+          />
+        )}
       </div>
 
       {/* Main content */}

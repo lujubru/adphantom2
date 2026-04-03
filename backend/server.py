@@ -289,13 +289,26 @@ async def get_me(current_user=Depends(get_current_user)):
         "email": current_user["email"],
         "is_active": current_user.get("is_active", True),
         "role": current_user.get("role", "admin"),
-        "line_ids": current_user.get("line_ids", [])
+        "line_ids": current_user.get("line_ids", []),
+        "welcome_message": current_user.get("welcome_message", ""),
+        "user_message": current_user.get("user_message", ""),
     }
 class UserCreate(BaseModel):
     email: str
     password: str
     role: str = "cajero"
-    line_ids: List[str] = []  
+    line_ids: List[str] = []
+    welcome_message: Optional[str] = ""
+    user_message: Optional[str] = ""
+
+class UserUpdate(BaseModel):
+    email: Optional[str] = None
+    password: Optional[str] = None
+    role: Optional[str] = None
+    line_ids: Optional[List[str]] = None
+    welcome_message: Optional[str] = None
+    user_message: Optional[str] = None
+    is_active: Optional[bool] = None
 
 @api_router.post("/auth/users")
 async def create_user(data: UserCreate, current_user=Depends(get_current_user)):
@@ -311,10 +324,71 @@ async def create_user(data: UserCreate, current_user=Depends(get_current_user)):
         "hashed_password": hashed,
         "role": data.role,
         "line_ids": data.line_ids,
+        "welcome_message": data.welcome_message or "",
+        "user_message": data.user_message or "",
         "is_active": True,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     return {"message": f"Usuario {data.email} creado con rol {data.role}", "line_ids": data.line_ids}
+
+@api_router.get("/auth/users")
+async def get_all_users(current_user=Depends(get_current_user)):
+    """Get all users (admin only)"""
+    if current_user.get("role") not in (None, "admin"):
+        raise HTTPException(status_code=403, detail="Sin permisos")
+    users = await db.users.find({}, {"_id": 0, "hashed_password": 0}).to_list(100)
+    # Add line names for each user
+    for user in users:
+        line_names = []
+        for line_id in user.get("line_ids", []):
+            line = await db.crm_lines.find_one({"id": line_id}, {"_id": 0, "name": 1})
+            if line:
+                line_names.append(line["name"])
+        user["line_names"] = line_names
+    return users
+
+@api_router.get("/auth/users/{user_id}")
+async def get_user(user_id: str, current_user=Depends(get_current_user)):
+    """Get a specific user (admin only)"""
+    if current_user.get("role") not in (None, "admin"):
+        raise HTTPException(status_code=403, detail="Sin permisos")
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "hashed_password": 0})
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    return user
+
+@api_router.put("/auth/users/{user_id}")
+async def update_user(user_id: str, data: UserUpdate, current_user=Depends(get_current_user)):
+    """Update a user (admin only)"""
+    if current_user.get("role") not in (None, "admin"):
+        raise HTTPException(status_code=403, detail="Sin permisos")
+    existing = await db.users.find_one({"id": user_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    
+    update_data = {}
+    for k, v in data.model_dump(exclude_unset=True).items():
+        if k == "password" and v:
+            update_data["hashed_password"] = pwd_context.hash(v)
+        elif v is not None:
+            update_data[k] = v
+    
+    if update_data:
+        update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await db.users.update_one({"id": user_id}, {"$set": update_data})
+    
+    updated = await db.users.find_one({"id": user_id}, {"_id": 0, "hashed_password": 0})
+    return updated
+
+@api_router.delete("/auth/users/{user_id}")
+async def delete_user(user_id: str, current_user=Depends(get_current_user)):
+    """Delete a user (admin only)"""
+    if current_user.get("role") not in (None, "admin"):
+        raise HTTPException(status_code=403, detail="Sin permisos")
+    result = await db.users.delete_one({"id": user_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    return {"message": "Usuario eliminado"}
 # ─── Campaign Routes ──────────────────────────────────────────────
 
 @api_router.get("/campaigns/")
@@ -2814,8 +2888,8 @@ async def send_meta_conversion_event(
     
     Uses line-specific token/pixel if provided, otherwise falls back to defaults
     """
-    token = access_token or META_ACCESS_TOKEN
-    pixel = pixel_id or META_PIXEL_ID
+    token = access_token
+    pixel = pixel_id
     
     if not token or not pixel:
         logger.warning("Meta Conversions API not configured (missing TOKEN or PIXEL_ID)")
@@ -3089,6 +3163,20 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                     sender_name = contact_map.get(from_phone, "")
                     now = datetime.now(timezone.utc).isoformat()
 
+                    # Extract click_id from message if present (format: "(ID: XXXXX)")
+                    click_id = None
+                    ad_source = None
+                    utm_content = None
+                    import re
+                    click_match = re.search(r'\(ID:\s*([A-Z0-9]+)\)', text)
+                    if click_match:
+                        click_id = click_match.group(1)
+                        # Find the wa_click to get utm_content (ad source)
+                        wa_click = await db.wa_clicks.find_one({"click_id": click_id})
+                        if wa_click:
+                            utm_content = wa_click.get("utm_content", "")
+                            ad_source = utm_content if utm_content else None
+
                     # Find or create CRM lead for this line
                     crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": line_id})
                     
@@ -3098,11 +3186,24 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                         
                         if crm_lead and not crm_lead.get("line_id"):
                             # Assign existing lead to this line
+                            update_fields = {"line_id": line_id, "updated_at": now}
+                            # Also update ad_source if not set and we have one
+                            if ad_source and not crm_lead.get("ad_source"):
+                                update_fields["ad_source"] = ad_source
+                                update_fields["utm_content"] = utm_content
+                                update_fields["click_id"] = click_id
                             await db.crm_leads.update_one(
                                 {"id": crm_lead["id"]},
-                                {"$set": {"line_id": line_id, "updated_at": now}}
+                                {"$set": update_fields}
                             )
                             crm_lead["line_id"] = line_id
+                    
+                    # Update ad_source if lead exists but doesn't have ad tracking
+                    if crm_lead and ad_source and not crm_lead.get("ad_source"):
+                        await db.crm_leads.update_one(
+                            {"id": crm_lead["id"]},
+                            {"$set": {"ad_source": ad_source, "utm_content": utm_content, "click_id": click_id}}
+                        )
                     
                     if not crm_lead:
                         # Create new lead
@@ -3117,6 +3218,9 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                             "source": "whatsapp",
                             "line_id": line_id,
                             "charge_amount": 0.0,
+                            "ad_source": ad_source,
+                            "utm_content": utm_content,
+                            "click_id": click_id,
                             "metadata": {
                                 "phone_number_id": phone_number_id,
                                 "display_phone": display_phone,
@@ -3131,7 +3235,7 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                             "meta_events_sent": [],
                         }
                         await db.crm_leads.insert_one(crm_lead)
-                        logger.info(f"CRM: Created new lead for {from_phone} on line {line['name']}")
+                        logger.info(f"CRM: Created new lead for {from_phone} on line {line['name']}{' from ad: ' + ad_source if ad_source else ''}")
                         
                         # Send Contact event to Meta if line has credentials
                         if line.get("meta_access_token") and line.get("meta_pixel_id"):
@@ -3207,11 +3311,45 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
 @api_router.get("/crm/funnel/stats")
 async def crm_funnel_stats(
     line_id: Optional[str] = None,
-    days: int = Query(30, ge=1, le=90),
+    days: int = Query(30, ge=1, le=365),
+    start_date: Optional[str] = Query(None, description="Fecha inicio YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="Fecha fin YYYY-MM-DD"),
+    filter_type: Optional[str] = Query(None, description="diario, semanal, mensual"),
     current_user=Depends(get_current_user)
 ):
-    date_from = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    date_query = {"created_at": {"$gte": date_from}}
+    # Calculate date range based on parameters
+    now = datetime.now(timezone.utc)
+    
+    if start_date and end_date:
+        # Custom date range
+        date_from = start_date + "T00:00:00+00:00"
+        date_to = end_date + "T23:59:59+00:00"
+        period_label = f"{start_date} a {end_date}"
+    elif filter_type:
+        if filter_type == "diario":
+            date_from = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            date_to = now.isoformat()
+            period_label = "Hoy"
+        elif filter_type == "semanal":
+            start_of_week = now - timedelta(days=now.weekday())
+            date_from = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            date_to = now.isoformat()
+            period_label = "Esta semana"
+        elif filter_type == "mensual":
+            start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            date_from = start_of_month.isoformat()
+            date_to = now.isoformat()
+            period_label = "Este mes"
+        else:
+            date_from = (now - timedelta(days=days)).isoformat()
+            date_to = now.isoformat()
+            period_label = f"Últimos {days} días"
+    else:
+        date_from = (now - timedelta(days=days)).isoformat()
+        date_to = now.isoformat()
+        period_label = f"Últimos {days} días"
+    
+    date_query = {"created_at": {"$gte": date_from, "$lte": date_to}}
 
     # Determinar qué líneas puede ver este usuario
     user_line_ids = current_user.get("line_ids", [])
@@ -3292,7 +3430,7 @@ async def crm_funnel_stats(
     total_leads = await db.crm_leads.count_documents({**line_query, **date_query})
 
     return {
-        "period": f"Últimos {days} días",
+        "period": period_label,
         "line_id": line_id,
         "funnel": {
             "visitas": total_visits,
@@ -3361,6 +3499,58 @@ async def crm_funnel_by_line(
         })
     
     return results
+
+@api_router.get("/crm/funnel/by-ad")
+async def crm_funnel_by_ad(
+    line_id: Optional[str] = None,
+    days: int = Query(30, ge=1, le=90),
+    current_user=Depends(get_current_user)
+):
+    """Get conversion stats grouped by ad source (utm_content)"""
+    now = datetime.now(timezone.utc)
+    start_date = (now - timedelta(days=days)).isoformat()
+    date_query = {"created_at": {"$gte": start_date}}
+    
+    # Build line filter based on user role
+    user_line_ids = current_user.get("line_ids", [])
+    if current_user.get("role") == "cajero" and user_line_ids:
+        if line_id and line_id in user_line_ids:
+            line_query = {"line_id": line_id}
+        else:
+            line_query = {"line_id": {"$in": user_line_ids}}
+    elif current_user.get("role") == "cajero" and not user_line_ids:
+        return []
+    elif line_id:
+        line_query = {"line_id": line_id}
+    else:
+        line_query = {}
+    
+    # Aggregate by utm_content/ad_source
+    pipeline = [
+        {"$match": {**line_query, **date_query, "ad_source": {"$ne": None, "$exists": True}}},
+        {"$group": {
+            "_id": "$ad_source",
+            "total_leads": {"$sum": 1},
+            "validos": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
+            "total_monto": {"$sum": {"$ifNull": ["$charge_amount", 0]}},
+        }},
+        {"$sort": {"total_leads": -1}}
+    ]
+    
+    results = await db.crm_leads.aggregate(pipeline).to_list(100)
+    
+    # Format results
+    formatted = []
+    for r in results:
+        formatted.append({
+            "ad_source": r["_id"],
+            "leads": r["total_leads"],
+            "conversiones": r["validos"],
+            "monto_total": r["total_monto"],
+            "conversion_rate": round((r["validos"] / r["total_leads"] * 100), 2) if r["total_leads"] > 0 else 0,
+        })
+    
+    return formatted
 
 # ─── CRM Leads Routes ──────────────────────────────────────────────
 
@@ -3540,9 +3730,9 @@ async def crm_classify_lead(
     meta_result = None
     event_sent = None
     
-    # Determine which token/pixel to use (line-specific or default)
-    use_token = line_token or META_ACCESS_TOKEN
-    use_pixel = line_pixel or META_PIXEL_ID
+    # Determine which token/pixel to use (only line-specific, no fallback to env vars)
+    use_token = line_token
+    use_pixel = line_pixel
     
     # Send event to Meta based on classification
     if data.send_to_meta and line_token and line_pixel:
@@ -4409,17 +4599,21 @@ async def startup():
         logger.error(f"MongoDB connection FAILED: {e}")
         return
     # Create admin user if not exists
-#    existing = await db.users.find_one({"email": "admin@blackguardian.com"})
-#    if not existing:
-#        hashed = pwd_context.hash("20060920+")
-#        await db.users.insert_one({
-#            "id": str(uuid.uuid4()),
-#            "email": "admin@aresguardian.com",
-#            "hashed_password": hashed,
-#            "is_active": True,
-#            "created_at": datetime.now(timezone.utc).isoformat(),
-#        })
-#        logger.info("Admin user created: admin@blackguardian.com")
+    existing = await db.users.find_one({"email": "admin@adphantom.com"})
+    if not existing:
+        hashed = pwd_context.hash("admin123")
+        await db.users.insert_one({
+            "id": str(uuid.uuid4()),
+            "email": "admin@adphantom.com",
+            "hashed_password": hashed,
+            "role": "admin",
+            "is_active": True,
+            "welcome_message": "",
+            "user_message": "",
+            "line_ids": [],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.info("Admin user created: admin@adphantom.com")
     # Create cajero user if not exists 
 #    existing_cajero = await db.users.find_one({"email": "cajero@blackguardian.com"})
 #    if not existing_cajero:

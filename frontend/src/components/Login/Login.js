@@ -43,7 +43,7 @@ const handleSubmit = async (e) => {
             <div className="bg-gradient-to-br from-blue-500 to-cyan-500 p-3 rounded-xl mb-4">
               <ShieldCheck className="w-8 h-8 text-white" />
             </div>
-            <h1 className="text-2xl font-bold text-white mb-1">Black Guardian</h1>
+            <h1 className="text-2xl font-bold text-white mb-1">AdPhantom</h1>
             <p className="text-slate-400 text-sm">Portal de Administración</p>
           </div>
 

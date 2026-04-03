@@ -15,6 +15,7 @@ import WhatsAppCRM from '@/pages/WhatsAppCRM';
 import WALandings from '@/pages/WALandings';
 import WALandingForensics from '@/pages/WALandingForensics';
 import LeadsCRM from '@/pages/LeadsCRM';
+import UserManagement from '@/pages/UserManagement';
 import '@/App.css';
 
 function App() {
@@ -37,6 +38,7 @@ function App() {
             <Route path="wa-landings" element={<WALandings />} />
             <Route path="wa-landing-forensics" element={<WALandingForensics />} />
             <Route path="leads-crm" element={<LeadsCRM />} />
+            <Route path="user-management" element={<UserManagement />} />
           </Route>
         </Routes>
       </BrowserRouter>
