@@ -204,6 +204,120 @@ const FunnelDisplay = ({ funnel, conversionRates, totals, period, onFilterChange
   );
 };
 
+// ─── Ad Performance Dashboard ──────────────────────────────────────
+
+const AdPerformanceDashboard = ({ lineId }) => {
+  const [adStats, setAdStats] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [days, setDays] = useState(30);
+
+  useEffect(() => {
+    const loadAdStats = async () => {
+      setLoading(true);
+      try {
+        const params = { days };
+        if (lineId) params.line_id = lineId;
+        const { data } = await api.get('/crm/funnel/by-ad', { params });
+        setAdStats(data || []);
+      } catch { /* silent */ }
+      finally { setLoading(false); }
+    };
+    loadAdStats();
+  }, [lineId, days]);
+
+  if (loading) {
+    return (
+      <div className="bg-slate-900/50 rounded-xl p-4 border border-slate-800">
+        <div className="flex items-center justify-center h-24">
+          <RefreshCw className="w-5 h-5 text-purple-400 animate-spin" />
+        </div>
+      </div>
+    );
+  }
+
+  if (adStats.length === 0) {
+    return (
+      <div className="bg-slate-900/50 rounded-xl p-4 border border-slate-800">
+        <h3 className="text-sm font-medium text-slate-400 mb-3 flex items-center gap-2">
+          <Target className="w-4 h-4 text-purple-400" /> Rendimiento por Anuncio
+        </h3>
+        <p className="text-slate-500 text-sm text-center py-4">Sin datos de anuncios aún. Los leads con utm_content aparecerán aquí.</p>
+      </div>
+    );
+  }
+
+  const totalLeads = adStats.reduce((sum, ad) => sum + ad.leads, 0);
+  const totalConversiones = adStats.reduce((sum, ad) => sum + ad.conversiones, 0);
+  const totalMonto = adStats.reduce((sum, ad) => sum + ad.monto_total, 0);
+
+  return (
+    <div className="bg-slate-900/50 rounded-xl p-4 border border-slate-800">
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-sm font-medium text-slate-400 flex items-center gap-2">
+          <Target className="w-4 h-4 text-purple-400" /> Rendimiento por Anuncio
+        </h3>
+        <select
+          value={days}
+          onChange={(e) => setDays(parseInt(e.target.value))}
+          className="bg-slate-800 border border-slate-700 text-white text-xs rounded-lg px-2 py-1"
+        >
+          <option value="7">7 días</option>
+          <option value="30">30 días</option>
+          <option value="90">90 días</option>
+        </select>
+      </div>
+
+      {/* Summary */}
+      <div className="grid grid-cols-3 gap-3 mb-4">
+        <div className="bg-slate-800/50 rounded-lg p-3 text-center">
+          <p className="text-2xl font-bold text-white">{totalLeads}</p>
+          <p className="text-xs text-slate-400">Total Leads</p>
+        </div>
+        <div className="bg-slate-800/50 rounded-lg p-3 text-center">
+          <p className="text-2xl font-bold text-emerald-400">{totalConversiones}</p>
+          <p className="text-xs text-slate-400">Conversiones</p>
+        </div>
+        <div className="bg-slate-800/50 rounded-lg p-3 text-center">
+          <p className="text-2xl font-bold text-amber-400">${totalMonto.toLocaleString()}</p>
+          <p className="text-xs text-slate-400">Monto Total</p>
+        </div>
+      </div>
+
+      {/* Ad list */}
+      <div className="space-y-2 max-h-[300px] overflow-y-auto">
+        {adStats.map((ad, idx) => (
+          <div key={ad.ad_source || idx} className="bg-slate-800/30 rounded-lg p-3 border border-slate-700/50">
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                <span className="text-purple-400 font-mono text-xs bg-purple-500/10 px-2 py-0.5 rounded">
+                  {ad.ad_source || 'Sin ID'}
+                </span>
+                <span className="text-white font-medium text-sm">{ad.leads} leads</span>
+              </div>
+              <span className={`text-xs font-medium ${ad.conversion_rate >= 10 ? 'text-emerald-400' : ad.conversion_rate >= 5 ? 'text-amber-400' : 'text-slate-400'}`}>
+                {ad.conversion_rate}% conv.
+              </span>
+            </div>
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-slate-400">
+                <span className="text-emerald-400 font-medium">{ad.conversiones}</span> válidos
+              </span>
+              <span className="text-amber-400 font-medium">${ad.monto_total.toLocaleString()}</span>
+            </div>
+            {/* Progress bar */}
+            <div className="mt-2 h-1.5 bg-slate-700 rounded-full overflow-hidden">
+              <div 
+                className="h-full bg-gradient-to-r from-purple-500 to-emerald-500 rounded-full transition-all"
+                style={{ width: `${Math.min((ad.leads / totalLeads) * 100, 100)}%` }}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
 // ─── Lines Manager (admin only) ────────────────────────────────────
 
 const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
@@ -985,7 +1099,7 @@ export default function LeadsCRM() {
         {/* Funnel modal para cajero */}
         {showFunnelModal && funnel && (
           <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={() => setShowFunnelModal(false)}>
-            <div className="bg-slate-900 rounded-xl border border-slate-700 w-full max-w-2xl shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div className="bg-slate-900 rounded-xl border border-slate-700 w-full max-w-3xl max-h-[90vh] overflow-y-auto shadow-2xl" onClick={e => e.stopPropagation()}>
               <div className="flex items-center justify-between px-5 py-4 border-b border-slate-700">
                 <h2 className="text-sm font-semibold text-white flex items-center gap-2">
                   <BarChart3 className="w-4 h-4 text-blue-400" /> Embudo de Conversión
@@ -994,7 +1108,7 @@ export default function LeadsCRM() {
                   <X className="w-4 h-4" />
                 </button>
               </div>
-              <div className="p-5">
+              <div className="p-5 space-y-4">
                 <FunnelDisplay 
                   funnel={funnel.funnel} 
                   conversionRates={funnel.conversion_rates} 
@@ -1005,6 +1119,7 @@ export default function LeadsCRM() {
                   startDate={funnelFilter.startDate}
                   endDate={funnelFilter.endDate}
                 />
+                <AdPerformanceDashboard lineId={selectedLineId} />
               </div>
             </div>
           </div>
@@ -1171,9 +1286,10 @@ export default function LeadsCRM() {
 
       {/* Main content */}
       <div className="max-w-[1800px] mx-auto flex gap-6">
-        {/* Sidebar - Lines */}
-        <div className="w-80 flex-shrink-0">
+        {/* Sidebar - Lines + Ad Performance */}
+        <div className="w-80 flex-shrink-0 space-y-4">
           <LinesManager lines={lines} onRefresh={loadLines} onSelectLine={setSelectedLineId} selectedLineId={selectedLineId} />
+          <AdPerformanceDashboard lineId={selectedLineId} />
         </div>
 
         {/* Kanban */}
