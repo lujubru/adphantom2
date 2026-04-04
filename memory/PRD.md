@@ -42,6 +42,8 @@ Aplicación AdPhantom - CRM de WhatsApp con tracking de conversiones para Meta P
 - Actualizado branding a "AdPhantom" en navbar y login
 - Quitado fallback a variables de entorno en eventos Meta
 - **Dashboard de rendimiento por anuncio**: Componente AdPerformanceDashboard que muestra leads, conversiones y monto por utm_content. Visible en sidebar de admin y modal de cajero.
+- **Tema claro/oscuro global**: ThemeContext global que aplica el tema a toda la aplicación, no solo al menú. Toggle en navbar.
+- **Logo en login**: Reemplazado el icono de escudo por el logo.png de AdPhantom
 
 ## Prioritized Backlog
 ### P0 (Critical)
