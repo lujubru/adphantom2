@@ -86,7 +86,7 @@ function LinesManager({ lines, onRefresh }) {
         await api.put(`/crm/lines/${editingLine.id}`, form);
         toast.success('Línea actualizada');
       } else {
-        await api.post('/crm/lines/', form);
+        await api.post('/crm/lines', form);
         toast.success('Línea creada');
       }
       setShowForm(false);

@@ -358,7 +358,7 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
     setSaving(true);
     try {
       if (editingLine) { await api.put(`/crm/lines/${editingLine.id}`, form); toast.success('Línea actualizada'); }
-      else { await api.post('/crm/lines/', form); toast.success('Línea creada'); }
+      else { await api.post('/crm/lines', form); toast.success('Línea creada'); }
       setShowCreate(false); setEditingLine(null); resetForm(); onRefresh();
     } catch { toast.error('Error guardando línea'); }
     finally { setSaving(false); }

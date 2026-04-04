@@ -39,7 +39,7 @@ const CustomFilters = () => {
         await api.put(`/filters/${editingFilter.id}`, formData);
         toast.success('Filtro actualizado');
       } else {
-        await api.post('/filters/', formData);
+        await api.post('/filters', formData);
         toast.success('Filtro creado');
       }
       setDialogOpen(false);

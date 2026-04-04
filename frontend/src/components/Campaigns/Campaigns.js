@@ -59,7 +59,7 @@ const Campaigns = () => {
         await api.put(`/campaigns/${editingCampaign.id}`, payload);
         toast.success('Campana actualizada');
       } else {
-        await api.post('/campaigns/', payload);
+        await api.post('/campaigns', payload);
         toast.success('Campana creada');
       }
       setDialogOpen(false);
