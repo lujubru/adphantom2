@@ -52,7 +52,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Traffic Guardian API", version="1.0.0")
+app = FastAPI(title="Traffic Guardian API", version="1.0.0", redirect_slashes=False)
 api_router = APIRouter(prefix="/api")
 
 # ─── Pydantic Models ───────────────────────────────────────────────
@@ -4574,6 +4574,17 @@ if not cors_env or cors_env.strip() == '*':
 else:
     _origins = [o.strip() for o in cors_env.split(',') if o.strip()]
     _creds = True
+
+# Middleware to handle proxy headers (Railway uses reverse proxy)
+@app.middleware("http")
+async def force_https_redirects(request: Request, call_next):
+    response = await call_next(request)
+    # If there's a redirect, ensure it uses HTTPS
+    if response.status_code in (301, 302, 307, 308):
+        location = response.headers.get("location", "")
+        if location.startswith("http://") and "localhost" not in location:
+            response.headers["location"] = location.replace("http://", "https://", 1)
+    return response
 
 app.add_middleware(
     CORSMiddleware,
