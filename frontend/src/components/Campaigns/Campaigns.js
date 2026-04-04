@@ -35,7 +35,7 @@ const Campaigns = () => {
 
   const fetchCampaigns = async () => {
     try {
-      const response = await api.get('/campaigns/');
+      const response = await api.get('/campaigns');
       setCampaigns(response.data);
     } catch (error) {
       toast.error('Error al cargar campanas');

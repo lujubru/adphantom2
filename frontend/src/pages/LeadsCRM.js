@@ -963,7 +963,7 @@ export default function LeadsCRM() {
     try {
       const params = { limit: 200 };
       if (selectedLineId) params.line_id = selectedLineId;
-      const { data } = await api.get('/crm/leads/', { params });
+      const { data } = await api.get('/crm/leads', { params });
       let list = data.leads || [];
       list.sort((a, b) => new Date(b.last_interaction || b.created_at || '') - new Date(a.last_interaction || a.created_at || ''));
       // Detect newly unread leads and play sound
@@ -979,7 +979,7 @@ export default function LeadsCRM() {
   }, [selectedLineId, playNotificationSound]);
 
   const loadLines = useCallback(async () => {
-    try { const { data } = await api.get('/crm/lines/'); setLines(data || []); }
+    try { const { data } = await api.get('/crm/lines'); setLines(data || []); }
     catch { /* silent */ }
   }, []);
 

@@ -23,7 +23,7 @@ const CustomFilters = () => {
 
   const fetchFilters = async () => {
     try {
-      const response = await api.get('/filters/');
+      const response = await api.get('/filters');
       setFilters(response.data);
     } catch (error) {
       toast.error('Error al cargar filtros');

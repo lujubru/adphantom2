@@ -375,7 +375,7 @@ export default function WhatsAppCRM() {
   const loadLeads = useCallback(async () => {
     try {
       const params = { limit: 200 };
-      const { data } = await api.get('/crm/leads/', { params });
+      const { data } = await api.get('/crm/leads', { params });
       let list = data.leads || [];
       // Sort by last interaction descending
       list.sort((a, b) => {
@@ -390,7 +390,7 @@ export default function WhatsAppCRM() {
 
   const loadLines = useCallback(async () => {
     try {
-      const { data } = await api.get('/crm/lines/');
+      const { data } = await api.get('/crm/lines');
       setLines(data || []);
     } catch { /* silent */ }
   }, []);

@@ -27,7 +27,7 @@ const AIGenerator = () => {
 
   const fetchCampaigns = async () => {
     try {
-      const res = await api.get('/campaigns/');
+      const res = await api.get('/campaigns');
       setCampaigns(res.data);
     } catch (e) { /* silent */ }
   };

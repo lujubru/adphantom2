@@ -21,7 +21,7 @@ const ClickForensics = () => {
 
   const fetchCampaigns = useCallback(async () => {
     try {
-      const resp = await api.get('/campaigns/');
+      const resp = await api.get('/campaigns');
       setCampaigns(resp.data);
     } catch {}
   }, []);
