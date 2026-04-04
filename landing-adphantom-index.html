@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AdPhantom - CRM de WhatsApp con Tracking de Conversiones</title>
+    <meta name="description" content="El CRM de WhatsApp que trackea cada conversión. Multi-líneas, Pixel por línea, anti-bot integrado.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+</head>
+<body>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        :root {
+            --primary: #0d9488;
+            --primary-dark: #0f766e;
+            --primary-light: #14b8a6;
+            --secondary: #1e293b;
+            --dark: #0f172a;
+            --light: #f8fafc;
+            --gray: #64748b;
+            --success: #10b981;
+            --warning: #f59e0b;
+        }
+        
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #0f172a;
+            color: #f8fafc;
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+        
+        .navbar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 100;
+            padding: 1rem 2rem;
+            background: rgba(15, 23, 42, 0.95);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        
+        .navbar-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            font-weight: 800;
+            font-size: 1.5rem;
+            color: white;
+            text-decoration: none;
+        }
+        
+        .logo img { height: 40px; width: 40px; border-radius: 10px; }
+        
+        .nav-links {
+            display: flex;
+            gap: 2rem;
+            align-items: center;
+        }
+        
+        .nav-links a {
+            color: #64748b;
+            text-decoration: none;
+            font-weight: 500;
+            transition: color 0.3s;
+        }
+        
+        .nav-links a:hover { color: white; }
+        
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.75rem 1.5rem;
+            border-radius: 10px;
+            font-weight: 600;
+            text-decoration: none;
+            transition: all 0.3s;
+            border: none;
+            cursor: pointer;
+            font-size: 1rem;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #0d9488, #14b8a6);
+            color: white;
+            box-shadow: 0 4px 20px rgba(13, 148, 136, 0.3);
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 30px rgba(13, 148, 136, 0.4);
+        }
+        
+        .btn-secondary {
+            background: rgba(255,255,255,0.1);
+            color: white;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        
+        .btn-secondary:hover { background: rgba(255,255,255,0.15); }
+        
+        .btn-large { padding: 1rem 2rem; font-size: 1.1rem; }
+        
+        .hero {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            padding: 8rem 2rem 4rem;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            right: -20%;
+            width: 800px;
+            height: 800px;
+            background: radial-gradient(circle, rgba(13, 148, 136, 0.15) 0%, transparent 70%);
+            pointer-events: none;
+        }
+        
+        .hero-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4rem;
+            align-items: center;
+        }
+        
+        .hero-text h1 {
+            font-size: 3.5rem;
+            font-weight: 900;
+            line-height: 1.1;
+            margin-bottom: 1.5rem;
+        }
+        
+        .gradient-text {
+            background: linear-gradient(135deg, #14b8a6, #22d3ee);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .hero-text p {
+            font-size: 1.25rem;
+            color: #64748b;
+            margin-bottom: 2rem;
+            max-width: 500px;
+        }
+        
+        .hero-buttons { display: flex; gap: 1rem; flex-wrap: wrap; }
+        
+        .hero-stats {
+            display: flex;
+            gap: 2rem;
+            margin-top: 3rem;
+            padding-top: 2rem;
+            border-top: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .stat { text-align: center; }
+        .stat-number { font-size: 2rem; font-weight: 800; color: #14b8a6; }
+        .stat-label { font-size: 0.875rem; color: #64748b; }
+        
+        .hero-visual { position: relative; }
+        
+        .hero-image {
+            width: 100%;
+            border-radius: 20px;
+            box-shadow: 0 25px 80px rgba(0,0,0,0.5);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .floating-card {
+            position: absolute;
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 1rem;
+            border: 1px solid rgba(255,255,255,0.1);
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+        }
+        
+        .floating-card-1 { top: 10%; left: -10%; animation: float 6s ease-in-out infinite; }
+        .floating-card-2 { bottom: 15%; right: -5%; animation: float 6s ease-in-out infinite 2s; }
+        
+        @keyframes float {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-15px); }
+        }
+        
+        .planes {
+            padding: 6rem 2rem;
+            background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%);
+        }
+        
+        .section-header {
+            text-align: center;
+            max-width: 700px;
+            margin: 0 auto 4rem;
+        }
+        
+        .section-badge {
+            display: inline-block;
+            background: rgba(13, 148, 136, 0.2);
+            color: #14b8a6;
+            padding: 0.5rem 1rem;
+            border-radius: 50px;
+            font-size: 0.875rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+        }
+        
+        .section-header h2 {
+            font-size: 2.5rem;
+            font-weight: 800;
+            margin-bottom: 1rem;
+        }
+        
+        .section-header p { color: #64748b; font-size: 1.1rem; }
+        
+        .planes-grid {
+            max-width: 1000px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 2rem;
+        }
+        
+        .plan-card {
+            background: #0f172a;
+            border-radius: 24px;
+            padding: 2.5rem;
+            border: 1px solid rgba(255,255,255,0.1);
+            position: relative;
+            overflow: hidden;
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        
+        .plan-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        
+        .plan-card.featured {
+            border-color: #0d9488;
+            background: linear-gradient(180deg, rgba(13, 148, 136, 0.1) 0%, #0f172a 100%);
+        }
+        
+        .popular-badge {
+            position: absolute;
+            top: 1.5rem;
+            right: -2rem;
+            background: #0d9488;
+            color: white;
+            padding: 0.25rem 3rem;
+            font-size: 0.7rem;
+            font-weight: 700;
+            transform: rotate(45deg);
+        }
+        
+        .plan-icon {
+            width: 60px;
+            height: 60px;
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.75rem;
+            margin-bottom: 1.5rem;
+        }
+        
+        .plan-icon-blue { background: linear-gradient(135deg, #3b82f6, #8b5cf6); }
+        .plan-icon-teal { background: linear-gradient(135deg, #0d9488, #22d3ee); }
+        
+        .plan-card h3 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.5rem; }
+        .plan-card .plan-desc { color: #64748b; margin-bottom: 1.5rem; font-size: 0.95rem; }
+        
+        .plan-features { list-style: none; margin-bottom: 2rem; }
+        
+        .plan-features li {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.75rem;
+            padding: 0.75rem 0;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            font-size: 0.95rem;
+        }
+        
+        .plan-features li:last-child { border-bottom: none; }
+        .check { color: #10b981; font-weight: bold; }
+        .plan-card .btn { width: 100%; justify-content: center; }
+        
+        .features {
+            padding: 6rem 2rem;
+            background: #1e293b;
+        }
+        
+        .features-grid {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 2rem;
+        }
+        
+        .feature-card {
+            background: #0f172a;
+            border-radius: 20px;
+            padding: 2rem;
+            border: 1px solid rgba(255,255,255,0.05);
+            transition: all 0.3s;
+        }
+        
+        .feature-card:hover {
+            border-color: rgba(13, 148, 136, 0.3);
+            transform: translateY(-3px);
+        }
+        
+        .feature-icon {
+            width: 50px;
+            height: 50px;
+            border-radius: 12px;
+            background: rgba(13, 148, 136, 0.2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            margin-bottom: 1.25rem;
+        }
+        
+        .feature-card h3 { font-size: 1.1rem; font-weight: 700; margin-bottom: 0.5rem; }
+        .feature-card p { color: #64748b; font-size: 0.9rem; }
+        
+        .comparativa {
+            padding: 6rem 2rem;
+            background: #0f172a;
+        }
+        
+        .comparativa-table {
+            max-width: 900px;
+            margin: 0 auto;
+            background: #1e293b;
+            border-radius: 20px;
+            overflow: hidden;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .table-row {
+            display: grid;
+            grid-template-columns: 2fr repeat(4, 1fr);
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        
+        .table-row:last-child { border-bottom: none; }
+        .table-header { background: #0f172a; font-weight: 700; }
+        .table-header .table-cell:first-child { color: #64748b; }
+        
+        .table-cell {
+            padding: 1.25rem 1rem;
+            text-align: center;
+            font-size: 0.9rem;
+        }
+        
+        .table-cell:first-child { text-align: left; font-weight: 500; }
+        
+        .table-cell.highlight {
+            background: rgba(13, 148, 136, 0.1);
+            color: #14b8a6;
+            font-weight: 600;
+        }
+        
+        .yes { color: #10b981; }
+        .no { color: #ef4444; }
+        .partial { color: #f59e0b; }
+        
+        .cta {
+            padding: 6rem 2rem;
+            background: linear-gradient(180deg, #0f172a 0%, #1e293b 50%, #0f172a 100%);
+            text-align: center;
+        }
+        
+        .cta-content { max-width: 700px; margin: 0 auto; }
+        .cta h2 { font-size: 2.5rem; font-weight: 800; margin-bottom: 1rem; }
+        .cta p { color: #64748b; font-size: 1.1rem; margin-bottom: 2rem; }
+        .cta-buttons { display: flex; justify-content: center; gap: 1rem; flex-wrap: wrap; }
+        
+        .footer {
+            padding: 3rem 2rem;
+            background: #0f172a;
+            border-top: 1px solid rgba(255,255,255,0.05);
+        }
+        
+        .footer-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+        
+        .footer-text { color: #64748b; font-size: 0.9rem; }
+        .footer-links { display: flex; gap: 2rem; }
+        
+        .footer-links a {
+            color: #64748b;
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: color 0.3s;
+        }
+        
+        .footer-links a:hover { color: white; }
+        
+        .whatsapp-float {
+            position: fixed;
+            bottom: 2rem;
+            right: 2rem;
+            width: 60px;
+            height: 60px;
+            background: #25d366;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 20px rgba(37, 211, 102, 0.4);
+            z-index: 1000;
+            transition: transform 0.3s;
+            text-decoration: none;
+            font-size: 2rem;
+        }
+        
+        .whatsapp-float:hover { transform: scale(1.1); }
+        
+        .card-content {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        
+        .card-icon { font-size: 1.5rem; }
+        .card-title { font-weight: 600; font-size: 0.9rem; }
+        .card-subtitle { color: #64748b; font-size: 0.75rem; }
+        .card-subtitle-green { color: #10b981; font-size: 0.75rem; }
+        
+        @media (max-width: 968px) {
+            .hero-content { grid-template-columns: 1fr; text-align: center; }
+            .hero-text h1 { font-size: 2.5rem; }
+            .hero-text p { margin: 0 auto 2rem; }
+            .hero-buttons { justify-content: center; }
+            .hero-stats { justify-content: center; }
+            .hero-visual { display: none; }
+            .planes-grid { grid-template-columns: 1fr; }
+            .features-grid { grid-template-columns: 1fr; }
+            .table-row { grid-template-columns: 2fr repeat(2, 1fr); }
+            .table-cell:nth-child(4), .table-cell:nth-child(5) { display: none; }
+            .nav-links { display: none; }
+        }
+    </style>
+
+    <!-- Navbar -->
+    <nav class="navbar">
+        <div class="navbar-content">
+            <a href="#" class="logo">
+                <img src="logo.png" alt="AdPhantom">
+                AdPhantom
+            </a>
+            <div class="nav-links">
+                <a href="#planes">Planes</a>
+                <a href="#features">Funciones</a>
+                <a href="#comparativa">Comparativa</a>
+                <a href="#contacto" class="btn btn-primary">Empezar Ahora</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Hero -->
+    <section class="hero">
+        <div class="hero-content">
+            <div class="hero-text">
+                <h1>El CRM de WhatsApp que <span class="gradient-text">trackea cada conversión</span></h1>
+                <p>Multi-líneas, Pixel por línea, tracking de anuncios y anti-bot integrado. Sabé exactamente qué anuncio trae cada cliente.</p>
+                <div class="hero-buttons">
+                    <a href="#planes" class="btn btn-primary btn-large">Ver Planes</a>
+                    <a href="https://wa.me/5491112345678?text=Hola!%20Quiero%20info%20sobre%20AdPhantom" class="btn btn-secondary btn-large">💬 Hablar por WhatsApp</a>
+                </div>
+                <div class="hero-stats">
+                    <div class="stat">
+                        <div class="stat-number">100%</div>
+                        <div class="stat-label">Tracking Real</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-number">∞</div>
+                        <div class="stat-label">Líneas</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-number">24/7</div>
+                        <div class="stat-label">Soporte</div>
+                    </div>
+                </div>
+            </div>
+            <div class="hero-visual">
+                <img src="https://placehold.co/600x400/1e293b/0d9488?text=Dashboard+Preview" alt="AdPhantom Dashboard" class="hero-image">
+                <div class="floating-card floating-card-1">
+                    <div class="card-content">
+                        <span class="card-icon">📊</span>
+                        <div>
+                            <div class="card-title">+23 Conversiones</div>
+                            <div class="card-subtitle">Hoy</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="floating-card floating-card-2">
+                    <div class="card-content">
+                        <span class="card-icon">✅</span>
+                        <div>
+                            <div class="card-title">Evento enviado</div>
+                            <div class="card-subtitle-green">Meta Pixel</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Planes -->
+    <section class="planes" id="planes">
+        <div class="section-header">
+            <span class="section-badge">💼 ELEGÍ TU PLAN</span>
+            <h2>Dos formas de trabajar con nosotros</h2>
+            <p>Ya sea que quieras manejarlo vos o que lo hagamos por vos, tenemos la solución perfecta.</p>
+        </div>
+        <div class="planes-grid">
+            <div class="plan-card">
+                <div class="plan-icon plan-icon-blue">🛠️</div>
+                <h3>Solo CRM</h3>
+                <p class="plan-desc">Accedé a la plataforma y manejá todo vos mismo. Ideal si ya tenés tu equipo de marketing.</p>
+                <ul class="plan-features">
+                    <li><span class="check">✓</span> CRM de WhatsApp multi-línea</li>
+                    <li><span class="check">✓</span> Pixel de Meta por línea</li>
+                    <li><span class="check">✓</span> Tracking de anuncios (utm_content)</li>
+                    <li><span class="check">✓</span> Landings con anti-bot</li>
+                    <li><span class="check">✓</span> Usuarios ilimitados (admin/cajero)</li>
+                    <li><span class="check">✓</span> Audios, imágenes y PDFs</li>
+                    <li><span class="check">✓</span> Embudo de conversión</li>
+                    <li><span class="check">✓</span> Soporte técnico</li>
+                </ul>
+                <a href="https://wa.me/5491112345678?text=Hola!%20Quiero%20info%20sobre%20el%20plan%20Solo%20CRM" class="btn btn-secondary">Consultar Precio</a>
+            </div>
+            
+            <div class="plan-card featured">
+                <span class="popular-badge">MÁS POPULAR</span>
+                <div class="plan-icon plan-icon-teal">🚀</div>
+                <h3>Solución Completa</h3>
+                <p class="plan-desc">Nosotros manejamos todo: publicidad, landings, optimización. Vos solo atendés clientes.</p>
+                <ul class="plan-features">
+                    <li><span class="check">✓</span> <strong>Todo lo del plan Solo CRM</strong></li>
+                    <li><span class="check">✓</span> Gestión de campañas de Meta Ads</li>
+                    <li><span class="check">✓</span> Creación y optimización de landings</li>
+                    <li><span class="check">✓</span> Configuración de píxeles</li>
+                    <li><span class="check">✓</span> Optimización de conversiones</li>
+                    <li><span class="check">✓</span> Reportes semanales</li>
+                    <li><span class="check">✓</span> Account manager dedicado</li>
+                    <li><span class="check">✓</span> Soporte prioritario 24/7</li>
+                </ul>
+                <a href="https://wa.me/5491112345678?text=Hola!%20Quiero%20info%20sobre%20la%20Solucion%20Completa" class="btn btn-primary">Quiero que lo manejen ustedes</a>
+            </div>
+        </div>
+    </section>
+
+    <!-- Features -->
+    <section class="features" id="features">
+        <div class="section-header">
+            <span class="section-badge">⚡ FUNCIONALIDADES</span>
+            <h2>Todo lo que necesitás para vender más</h2>
+            <p>Herramientas diseñadas para equipos de ventas que usan WhatsApp.</p>
+        </div>
+        <div class="features-grid">
+            <div class="feature-card">
+                <div class="feature-icon">📱</div>
+                <h3>Multi-Líneas de WhatsApp</h3>
+                <p>Conectá todas las líneas que necesites. Cada una con su propio tracking.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">📊</div>
+                <h3>Pixel por Línea</h3>
+                <p>Cada línea envía eventos a su propio Pixel de Meta.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🎯</div>
+                <h3>Tracking de Anuncios</h3>
+                <p>Identificá qué anuncio trajo cada lead.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🛡️</div>
+                <h3>Anti-Bot Integrado</h3>
+                <p>Landings con detección de bots. Solo clicks reales.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">👥</div>
+                <h3>Roles de Usuario</h3>
+                <p>Admin y Cajero. Mensajes personalizados por usuario.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🎤</div>
+                <h3>Multimedia Completo</h3>
+                <p>Escuchá audios, mirá imágenes y descargá PDFs.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">📈</div>
+                <h3>Embudo de Conversión</h3>
+                <p>Visualizá tu embudo. Filtrá por día, semana o mes.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🤖</div>
+                <h3>Landing Generator con IA</h3>
+                <p>Creá landings optimizadas en segundos.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🌓</div>
+                <h3>Tema Claro/Oscuro</h3>
+                <p>Trabajá cómodo con el tema que prefieras.</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- Comparativa -->
+    <section class="comparativa" id="comparativa">
+        <div class="section-header">
+            <span class="section-badge">🆚 COMPARATIVA</span>
+            <h2>¿Por qué AdPhantom?</h2>
+            <p>Mirá cómo nos comparamos con otras soluciones del mercado.</p>
+        </div>
+        <div class="comparativa-table">
+            <div class="table-row table-header">
+                <div class="table-cell">Función</div>
+                <div class="table-cell highlight">AdPhantom</div>
+                <div class="table-cell">Scalebox</div>
+                <div class="table-cell">Kommo</div>
+                <div class="table-cell">Convertix</div>
+            </div>
+            <div class="table-row">
+                <div class="table-cell">Multi-líneas WhatsApp</div>
+                <div class="table-cell highlight"><span class="yes">✓ Ilimitadas</span></div>
+                <div class="table-cell"><span class="partial">Limitadas</span></div>
+                <div class="table-cell"><span class="partial">Con costo</span></div>
+                <div class="table-cell"><span class="no">✗</span></div>
+            </div>
+            <div class="table-row">
+                <div class="table-cell">Pixel por línea</div>
+                <div class="table-cell highlight"><span class="yes">✓</span></div>
+                <div class="table-cell"><span class="no">✗</span></div>
+                <div class="table-cell"><span class="no">✗</span></div>
+                <div class="table-cell"><span class="no">✗</span></div>
+            </div>
+            <div class="table-row">
+                <div class="table-cell">Tracking de anuncios</div>
+                <div class="table-cell highlight"><span class="yes">✓</span></div>
+                <div class="table-cell"><span class="no">✗</span></div>
+                <div class="table-cell"><span class="partial">Básico</span></div>
+                <div class="table-cell"><span class="no">✗</span></div>
+            </div>
+            <div class="table-row">
+                <div class="table-cell">Anti-bot en landings</div>
+                <div class="table-cell highlight"><span class="yes">✓</span></div>
+                <div class="table-cell"><span class="no">✗</span></div>
+                <div class="table-cell"><span class="no">✗</span></div>
+                <div class="table-cell"><span class="partial">Básico</span></div>
+            </div>
+            <div class="table-row">
+                <div class="table-cell">Audios en chat</div>
+                <div class="table-cell highlight"><span class="yes">✓</span></div>
+                <div class="table-cell"><span class="yes">✓</span></div>
+                <div class="table-cell"><span class="yes">✓</span></div>
+                <div class="table-cell"><span class="no">✗</span></div>
+            </div>
+            <div class="table-row">
+                <div class="table-cell">Precio por usuario</div>
+                <div class="table-cell highlight"><span class="yes">Sin costo extra</span></div>
+                <div class="table-cell"><span class="no">Por usuario</span></div>
+                <div class="table-cell"><span class="no">Por usuario</span></div>
+                <div class="table-cell"><span class="partial">Limitado</span></div>
+            </div>
+        </div>
+    </section>
+
+    <!-- CTA -->
+    <section class="cta" id="contacto">
+        <div class="cta-content">
+            <h2>¿Listo para vender más?</h2>
+            <p>Unite a los equipos de ventas que ya están usando AdPhantom para trackear cada conversión.</p>
+            <div class="cta-buttons">
+                <a href="https://wa.me/5491112345678?text=Hola!%20Quiero%20empezar%20con%20AdPhantom" class="btn btn-primary btn-large">💬 Hablar por WhatsApp</a>
+                <a href="#planes" class="btn btn-secondary btn-large">Ver Planes</a>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="footer-content">
+            <div class="footer-text">© 2024 AdPhantom. Todos los derechos reservados.</div>
+            <div class="footer-links">
+                <a href="#">Términos</a>
+                <a href="#">Privacidad</a>
+                <a href="#">Contacto</a>
+            </div>
+        </div>
+    </footer>
+
+    <!-- WhatsApp Float -->
+    <a href="https://wa.me/5491112345678?text=Hola!%20Quiero%20info%20sobre%20AdPhantom" class="whatsapp-float" target="_blank">💬</a>
+
+</body>
+</html>
