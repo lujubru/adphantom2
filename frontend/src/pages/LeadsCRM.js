@@ -10,6 +10,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { toast } from 'sonner';
 import api from '@/utils/api';
+import { useTheme } from '@/contexts/ThemeContext';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || '';
 
@@ -883,6 +884,7 @@ const AdminLeadModal = ({ lead, lines, onClose, onUpdate }) => {
 // ─── Main Component ───────────────────────────────────────────────
 
 export default function LeadsCRM() {
+  const { darkMode } = useTheme();
   const [currentUser, setCurrentUser] = useState(null);
   const [leads, setLeads] = useState([]);
   const [lines, setLines] = useState([]);
@@ -1051,15 +1053,23 @@ export default function LeadsCRM() {
 
   // ── CAJERO VIEW ────────────────────────────────────────────────
   if (currentUser && !isAdmin) {
+    const bgMain = darkMode ? 'bg-slate-950' : 'bg-gray-50';
+    const bgCard = darkMode ? 'bg-slate-900/80' : 'bg-white';
+    const bgSidebar = darkMode ? 'bg-slate-900/50' : 'bg-white';
+    const borderColor = darkMode ? 'border-slate-800' : 'border-gray-200';
+    const textPrimary = darkMode ? 'text-white' : 'text-gray-900';
+    const textSecondary = darkMode ? 'text-slate-400' : 'text-gray-600';
+    const inputBg = darkMode ? 'bg-slate-800 border-slate-700 text-white' : 'bg-gray-50 border-gray-300 text-gray-900';
+    
     return (
-      <div className="h-screen bg-slate-950 flex flex-col overflow-hidden">
+      <div className={`h-screen ${bgMain} flex flex-col overflow-hidden`}>
         {/* Top bar */}
-        <div className="flex items-center gap-3 px-4 py-3 border-b border-slate-800 bg-slate-900/80 shrink-0">
+        <div className={`flex items-center gap-3 px-4 py-3 border-b ${borderColor} ${bgCard} shrink-0`}>
           <div className="bg-emerald-500/20 p-2 rounded-xl border border-emerald-500/30">
             <MessageCircle className="w-5 h-5 text-emerald-400" />
           </div>
           <div>
-            <h1 className="text-base font-bold text-white leading-tight flex items-center gap-2">
+            <h1 className={`text-base font-bold leading-tight flex items-center gap-2 ${textPrimary}`}>
               WhatsApp CRM
               {(() => {
                 const totalUnread = leads.filter(l => (l.unread_count > 0 || l.has_unread_messages) && selectedLead?.id !== l.id).length;
@@ -1070,7 +1080,7 @@ export default function LeadsCRM() {
                 ) : null;
               })()}
             </h1>
-            <p className="text-xs text-slate-400">Bienvenido, {currentUser.email}</p>
+            <p className={`text-xs ${textSecondary}`}>Bienvenido, {currentUser.email}</p>
           </div>
           <div className="ml-auto flex items-center gap-2">
             {funnel && (
@@ -1078,7 +1088,7 @@ export default function LeadsCRM() {
                 onClick={() => setShowFunnelModal(true)}
                 size="sm"
                 variant="outline"
-                className="border-slate-600 text-slate-300 hover:text-white text-xs gap-1.5"
+                className={darkMode ? "border-slate-600 text-slate-300 hover:text-white text-xs gap-1.5" : "border-gray-300 text-gray-600 hover:text-gray-900 text-xs gap-1.5"}
               >
                 <BarChart3 className="w-3.5 h-3.5" /> Embudo de Conversión
               </Button>
@@ -1127,12 +1137,12 @@ export default function LeadsCRM() {
 
         <div className="flex flex-1 overflow-hidden">
           {/* Left: conversation list */}
-          <div className="w-72 shrink-0 border-r border-slate-800 flex flex-col bg-slate-900/50">
-            <div className="p-3 border-b border-slate-800 space-y-2">
+          <div className={`w-72 shrink-0 border-r ${borderColor} flex flex-col ${bgSidebar}`}>
+            <div className={`p-3 border-b ${borderColor} space-y-2`}>
               <div className="relative">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+                <Search className={`absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 ${textSecondary}`} />
                 <Input placeholder="Buscar..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)}
-                  className="pl-9 bg-slate-800 border-slate-700 text-white text-sm h-9" />
+                  className={`pl-9 ${inputBg} text-sm h-9`} />
               </div>
               <div className="flex gap-1 flex-wrap">
                 {['all', ...STATUS_ORDER].map(key => (
@@ -1157,11 +1167,11 @@ export default function LeadsCRM() {
               ) : null;
             })()}
 
-            <div className="flex-1 overflow-y-auto divide-y divide-slate-800/50">
+            <div className={`flex-1 overflow-y-auto divide-y ${darkMode ? 'divide-slate-800/50' : 'divide-gray-200'}`}>
               {loading ? (
                 <div className="flex items-center justify-center h-32"><RefreshCw className="w-5 h-5 text-emerald-400 animate-spin" /></div>
               ) : filteredLeads.length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-32 text-slate-500 text-center px-4">
+                <div className={`flex flex-col items-center justify-center h-32 ${textSecondary} text-center px-4`}>
                   <MessageCircle className="w-8 h-8 mb-2 opacity-20" />
                   <p className="text-xs">No hay conversaciones</p>
                 </div>
@@ -1181,7 +1191,11 @@ export default function LeadsCRM() {
                       // Persist the read state to backend
                       api.post(`/crm/leads/${lead.id}/read`).catch(() => {});
                     }}
-                    className={`w-full p-3 text-left hover:bg-slate-800/60 transition-colors relative ${isSelected ? 'bg-slate-800' : ''} ${hasUnread ? 'bg-red-950/20' : ''}`}>
+                    className={`w-full p-3 text-left transition-colors relative ${
+                      isSelected ? (darkMode ? 'bg-slate-800' : 'bg-teal-50') : ''
+                    } ${hasUnread ? (darkMode ? 'bg-red-950/20' : 'bg-red-50') : ''} ${
+                      darkMode ? 'hover:bg-slate-800/60' : 'hover:bg-gray-50'
+                    }`}>
                     {/* Unread left bar */}
                     {hasUnread && <span className="absolute left-0 top-0 bottom-0 w-0.5 bg-red-500 rounded-r" />}
                     <div className="flex items-start gap-3">
@@ -1255,18 +1269,23 @@ export default function LeadsCRM() {
   }
 
   // ── ADMIN VIEW ────────────────────────────────────────────────
+  const bgMain = darkMode ? 'bg-slate-950' : 'bg-gray-50';
+  const textPrimary = darkMode ? 'text-white' : 'text-gray-900';
+  const textSecondary = darkMode ? 'text-slate-400' : 'text-gray-600';
+  const inputBg = darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-gray-300';
+  
   return (
-    <div className="min-h-screen bg-slate-950 p-6">
+    <div className={`min-h-screen ${bgMain} p-6`}>
       {/* Header */}
       <div className="max-w-[1800px] mx-auto mb-6">
         <div className="flex items-center justify-between mb-4">
           <div>
-            <h1 className="text-2xl font-bold text-white flex items-center gap-3">
+            <h1 className={`text-2xl font-bold ${textPrimary} flex items-center gap-3`}>
               <Users className="w-7 h-7 text-blue-500" /> CRM Multi-Líneas
             </h1>
-            <p className="text-slate-400 text-sm mt-1">Gestiona y clasifica leads de WhatsApp</p>
+            <p className={`${textSecondary} text-sm mt-1`}>Gestiona y clasifica leads de WhatsApp</p>
           </div>
-          <Button onClick={() => { loadLeads(); loadLines(); loadFunnel(); }} variant="outline" className="border-slate-600">
+          <Button onClick={() => { loadLeads(); loadLines(); loadFunnel(); }} variant="outline" className={darkMode ? "border-slate-600" : "border-gray-300"}>
             <RefreshCw className="w-4 h-4 mr-2" /> Actualizar
           </Button>
         </div>
@@ -1296,9 +1315,9 @@ export default function LeadsCRM() {
         <div className="flex-1">
           <div className="mb-4">
             <div className="relative">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+              <Search className={`absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 ${textSecondary}`} />
               <Input value={searchTerm} onChange={e => setSearchTerm(e.target.value)} placeholder="Buscar por nombre o teléfono..."
-                className="pl-10 bg-slate-900 border-slate-700" />
+                className={`pl-10 ${inputBg}`} />
             </div>
           </div>
           {loading ? (

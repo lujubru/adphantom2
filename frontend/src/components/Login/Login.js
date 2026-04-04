@@ -4,7 +4,6 @@ import api from '@/utils/api';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { ShieldCheck } from 'lucide-react';
 import { toast } from 'sonner';
 
 const Login = () => {
@@ -40,9 +39,7 @@ const handleSubmit = async (e) => {
       <div className="w-full max-w-md">
         <div className="bg-slate-900/50 backdrop-blur-xl border border-slate-800 rounded-2xl p-8 shadow-2xl">
           <div className="flex flex-col items-center mb-8">
-            <div className="bg-gradient-to-br from-blue-500 to-cyan-500 p-3 rounded-xl mb-4">
-              <ShieldCheck className="w-8 h-8 text-white" />
-            </div>
+            <img src="/logo.png" alt="AdPhantom" className="w-20 h-20 rounded-xl mb-4 object-contain" />
             <h1 className="text-2xl font-bold text-white mb-1">AdPhantom</h1>
             <p className="text-slate-400 text-sm">Portal de Administración</p>
           </div>

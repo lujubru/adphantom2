@@ -1,7 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import { Navigate, Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
 import { LayoutDashboard, Target, LogOut, BarChart, Globe, Users, UserCog, Sun, Moon, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { useTheme } from '@/contexts/ThemeContext';
 
 const ALL_NAV_ITEMS = [
   { path: '/dashboard', label: 'Panel', icon: LayoutDashboard, roles: ['admin'] },
@@ -27,21 +28,7 @@ const Layout = () => {
   const navigate = useNavigate();
   const token = localStorage.getItem('token');
   const role = localStorage.getItem('role') || 'admin';
-  const [darkMode, setDarkMode] = useState(() => {
-    const saved = localStorage.getItem('theme');
-    return saved ? saved === 'dark' : true;
-  });
-
-  useEffect(() => {
-    localStorage.setItem('theme', darkMode ? 'dark' : 'light');
-    if (darkMode) {
-      document.documentElement.classList.add('dark');
-      document.documentElement.classList.remove('light');
-    } else {
-      document.documentElement.classList.remove('dark');
-      document.documentElement.classList.add('light');
-    }
-  }, [darkMode]);
+  const { darkMode, toggleTheme } = useTheme();
 
   if (!token) return <Navigate to="/login" />;
 
@@ -94,7 +81,7 @@ const Layout = () => {
             </div>
             <div className="flex items-center gap-3">
               <Button
-                onClick={() => setDarkMode(!darkMode)}
+                onClick={toggleTheme}
                 data-testid="theme-toggle"
                 variant="ghost"
                 size="icon"
@@ -119,7 +106,7 @@ const Layout = () => {
         </div>
       </nav>
       <main>
-        <Outlet context={{ darkMode }} />
+        <Outlet />
       </main>
     </div>
   );

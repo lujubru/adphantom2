@@ -1,12 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { useOutletContext } from 'react-router-dom';
-import { UserPlus, Edit2, Trash2, X, Check, Copy } from 'lucide-react';
+import { UserPlus, Edit2, Trash2, X, Check } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import api from '@/utils/api';
 import { toast } from 'sonner';
+import { useTheme } from '@/contexts/ThemeContext';
 
 const UserManagement = () => {
-  const { darkMode } = useOutletContext() || { darkMode: true };
+  const { darkMode } = useTheme();
   const [users, setUsers] = useState([]);
   const [lines, setLines] = useState([]);
   const [loading, setLoading] = useState(true);
