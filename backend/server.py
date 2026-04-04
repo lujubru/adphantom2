@@ -391,7 +391,7 @@ async def delete_user(user_id: str, current_user=Depends(get_current_user)):
     return {"message": "Usuario eliminado"}
 # ─── Campaign Routes ──────────────────────────────────────────────
 
-@api_router.get("/campaigns/")
+@api_router.get("/campaigns")
 async def get_campaigns(current_user=Depends(get_current_user)):
     campaigns = await db.campaigns.find({}, {"_id": 0}).to_list(1000)
     return campaigns
@@ -403,7 +403,7 @@ async def get_campaign(campaign_id: str, current_user=Depends(get_current_user))
         raise HTTPException(status_code=404, detail="Campaña no encontrada")
     return campaign
 
-@api_router.post("/campaigns/")
+@api_router.post("/campaigns")
 async def create_campaign(data: CampaignCreate, current_user=Depends(get_current_user)):
     now = datetime.now(timezone.utc).isoformat()
     # Generate unique short code
@@ -727,7 +727,7 @@ async def export_csv(current_user=Depends(get_current_user)):
 
 # ─── Custom Filters Routes ────────────────────────────────────────
 
-@api_router.get("/filters/")
+@api_router.get("/filters")
 async def get_filters(current_user=Depends(get_current_user)):
     filters = await db.custom_filters.find({}, {"_id": 0}).sort("priority", -1).to_list(1000)
     return filters
@@ -739,7 +739,7 @@ async def get_filter(filter_id: str, current_user=Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Filtro no encontrado")
     return f
 
-@api_router.post("/filters/")
+@api_router.post("/filters")
 async def create_filter(data: FilterCreate, current_user=Depends(get_current_user)):
     now = datetime.now(timezone.utc).isoformat()
     doc = {
@@ -2953,7 +2953,7 @@ async def send_meta_conversion_event(
 
 # ─── CRM Lines Routes ──────────────────────────────────────────────
 
-@api_router.get("/crm/lines/")
+@api_router.get("/crm/lines")
 async def crm_get_all_lines(current_user=Depends(get_current_user)):
     """Get all WhatsApp lines"""
     lines = await db.crm_lines.find({}, {"_id": 0}).sort("created_at", -1).to_list(100)
@@ -2968,7 +2968,7 @@ async def crm_get_all_lines(current_user=Depends(get_current_user)):
     
     return lines
 
-@api_router.post("/crm/lines/")
+@api_router.post("/crm/lines")
 async def crm_create_line(data: CRMLineCreate, current_user=Depends(get_current_user)):
     """Create a new WhatsApp line with full configuration"""
     if data.line_type not in CRM_LINE_TYPES:
@@ -3554,7 +3554,7 @@ async def crm_funnel_by_ad(
 
 # ─── CRM Leads Routes ──────────────────────────────────────────────
 
-@api_router.get("/crm/leads/")
+@api_router.get("/crm/leads")
 async def crm_get_all_leads(
     status: Optional[str] = None,
     line_id: Optional[str] = None,
@@ -3604,7 +3604,7 @@ async def crm_get_all_leads(
         "pages": (total + limit - 1) // limit if total > 0 else 1
     }
 
-@api_router.post("/crm/leads/")
+@api_router.post("/crm/leads")
 async def crm_create_lead(data: CRMLeadCreate, current_user=Depends(get_current_user)):
     """Create a new CRM lead manually"""
     now = datetime.now(timezone.utc).isoformat()
