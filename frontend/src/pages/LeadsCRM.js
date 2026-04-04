@@ -514,6 +514,8 @@ const ChatMessage = ({ message }) => {
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [docSrc, setDocSrc] = useState(null);
   const [loadingDoc, setLoadingDoc] = useState(false);
+  const [audioSrc, setAudioSrc] = useState(null);
+  const [loadingAudio, setLoadingAudio] = useState(false);
 
   const loadImage = useCallback(async () => {
     if (imgSrc || loadingImg) return;
@@ -536,9 +538,20 @@ const ChatMessage = ({ message }) => {
     finally { setLoadingDoc(false); }
   }, [message.id, docSrc, loadingDoc]);
 
+  const loadAudio = useCallback(async () => {
+    if (audioSrc || loadingAudio) return;
+    setLoadingAudio(true);
+    try {
+      const { data } = await api.get(`/crm/messages/${message.id}/audio`);
+      setAudioSrc(`data:${data.mime_type};base64,${data.audio_base64}`);
+    } catch { /* silent */ }
+    finally { setLoadingAudio(false); }
+  }, [message.id, audioSrc, loadingAudio]);
+
   useEffect(() => {
     if (message.message_type === 'image' && message.media_id) loadImage();
     if (message.message_type === 'document' && message.media_id) loadDocument();
+    if (message.message_type === 'audio' && message.media_id) loadAudio();
   }, [message.id]);
 
   const handleDocDownload = () => {
@@ -591,6 +604,22 @@ const ChatMessage = ({ message }) => {
             ) : (
               <div className="flex items-center gap-2 text-xs opacity-60">
                 <span>📄</span> Documento no disponible
+              </div>
+            )
+          ) : message.message_type === 'audio' ? (
+            loadingAudio ? (
+              <div className="flex items-center gap-2 text-xs opacity-70"><RefreshCw className="w-3 h-3 animate-spin" />Cargando audio...</div>
+            ) : audioSrc ? (
+              <div className="flex items-center gap-2 min-w-[200px]">
+                <span className="text-lg">🎤</span>
+                <audio controls className="h-10 max-w-[250px]" preload="metadata">
+                  <source src={audioSrc} type={message.mime_type || 'audio/ogg'} />
+                  Tu navegador no soporta audio
+                </audio>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 text-xs opacity-60">
+                <span>🎤</span> Audio no disponible
               </div>
             )
           ) : (

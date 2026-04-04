@@ -3149,8 +3149,14 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                         mime_type = image_data.get("mime_type", "image/jpeg")
                     elif msg_type == "audio":
                         text = "[Audio]"
+                        audio_data = msg.get("audio", {})
+                        media_id = audio_data.get("id", "")
+                        mime_type = audio_data.get("mime_type", "audio/ogg")
                     elif msg_type == "video":
                         text = "[Video]"
+                        video_data = msg.get("video", {})
+                        media_id = video_data.get("id", "")
+                        mime_type = video_data.get("mime_type", "video/mp4")
                     elif msg_type == "document":
                         doc_data = msg.get("document", {})
                         media_id = doc_data.get("id", "")
@@ -3283,8 +3289,8 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                         "sender": "lead",
                         "wa_message_id": msg_id,
                         "message_type": msg_type,
-                        "media_id": media_id if msg_type in ("image", "document") else None,
-                        "mime_type": mime_type if msg_type in ("image", "document") else None,
+                        "media_id": media_id if msg_type in ("image", "document", "audio", "video") else None,
+                        "mime_type": mime_type if msg_type in ("image", "document", "audio", "video") else None,
                         "doc_filename": doc_filename if msg_type == "document" else None,
                         "created_at": now,
                     }
@@ -3949,6 +3955,46 @@ async def crm_get_message_document(message_id: str, current_user=Depends(get_cur
         filename = msg.get("doc_filename", "documento.pdf")
         return {"image_base64": doc_base64, "mime_type": mime, "filename": filename}
 
+@api_router.get("/crm/messages/{message_id}/audio")
+async def crm_get_message_audio(message_id: str, current_user=Depends(get_current_user)):
+    """Download audio from WhatsApp media and return as base64"""
+    msg = await db.crm_messages.find_one({"id": message_id}, {"_id": 0})
+    if not msg:
+        raise HTTPException(status_code=404, detail="Mensaje no encontrado")
+    if msg.get("message_type") != "audio" or not msg.get("media_id"):
+        raise HTTPException(status_code=400, detail="El mensaje no es un audio")
+
+    lead = await db.crm_leads.find_one({"id": msg["lead_id"]}, {"_id": 0})
+    if not lead or not lead.get("line_id"):
+        raise HTTPException(status_code=400, detail="Lead sin línea asignada")
+
+    line = await db.crm_lines.find_one({"id": lead["line_id"]}, {"_id": 0})
+    if not line or not line.get("whatsapp_token"):
+        raise HTTPException(status_code=400, detail="Línea sin token de WhatsApp")
+
+    token = line["whatsapp_token"]
+    media_id = msg["media_id"]
+
+    async with httpx.AsyncClient() as client:
+        url_resp = await client.get(
+            f"https://graph.facebook.com/v18.0/{media_id}",
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        if url_resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Error obteniendo URL del audio")
+        media_url = url_resp.json().get("url")
+
+        audio_resp = await client.get(
+            media_url,
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        if audio_resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Error descargando audio")
+
+        audio_base64 = base64.b64encode(audio_resp.content).decode("utf-8")
+        mime = msg.get("mime_type", "audio/ogg")
+        return {"audio_base64": audio_base64, "mime_type": mime}
+
 
 @api_router.post("/crm/leads/{lead_id}/messages")
 async def crm_send_message(
@@ -4297,6 +4343,7 @@ async def crm_send_conversion_to_meta(
     """
     Manually send a conversion event to Meta for this lead.
     Only works if lead is 'cliente_real'.
+    Uses the line's Meta credentials (not global env vars).
     """
     lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
@@ -4308,10 +4355,22 @@ async def crm_send_conversion_to_meta(
             detail="Solo se pueden enviar conversiones para leads con status 'cliente_real'"
         )
     
-    if not META_ACCESS_TOKEN or not META_PIXEL_ID:
+    # Get the line's Meta credentials
+    line_id = lead.get("line_id")
+    if not line_id:
+        raise HTTPException(status_code=400, detail="Lead no tiene línea asignada")
+    
+    line = await db.crm_lines.find_one({"id": line_id}, {"_id": 0})
+    if not line:
+        raise HTTPException(status_code=400, detail="Línea no encontrada")
+    
+    access_token = line.get("meta_access_token")
+    pixel_id = line.get("meta_pixel_id")
+    
+    if not access_token or not pixel_id:
         raise HTTPException(
             status_code=400,
-            detail="Meta Conversions API no configurada. Configura META_ACCESS_TOKEN y META_PIXEL_ID en .env"
+            detail=f"La línea '{line.get('name', 'N/A')}' no tiene configurado Meta Pixel. Configura meta_access_token y meta_pixel_id en la línea."
         )
     
     custom_data = {
@@ -4322,7 +4381,9 @@ async def crm_send_conversion_to_meta(
     result = await send_meta_conversion_event(
         event_name="Purchase",
         lead_data=lead,
-        custom_data=custom_data
+        custom_data=custom_data,
+        access_token=access_token,
+        pixel_id=pixel_id
     )
     
     # Log the event
@@ -4335,6 +4396,7 @@ async def crm_send_conversion_to_meta(
                 "timestamp": now,
                 "value": value,
                 "currency": currency,
+                "line": line.get("name"),
                 "success": result.get("success", False)
             }
         }}
@@ -4344,12 +4406,26 @@ async def crm_send_conversion_to_meta(
 
 @api_router.get("/crm/meta/status")
 async def crm_meta_integration_status(current_user=Depends(get_current_user)):
-    """Check Meta Conversions API configuration status"""
+    """Check Meta Conversions API configuration status for all lines"""
+    lines = await db.crm_lines.find({}, {"_id": 0, "id": 1, "name": 1, "meta_access_token": 1, "meta_pixel_id": 1}).to_list(100)
+    
+    lines_status = []
+    for line in lines:
+        has_token = bool(line.get("meta_access_token"))
+        has_pixel = bool(line.get("meta_pixel_id"))
+        lines_status.append({
+            "line_id": line["id"],
+            "line_name": line.get("name", "N/A"),
+            "configured": has_token and has_pixel,
+            "has_token": has_token,
+            "has_pixel_id": has_pixel,
+            "pixel_id_preview": line.get("meta_pixel_id", "")[:8] + "..." if line.get("meta_pixel_id") else None,
+        })
+    
     return {
-        "configured": bool(META_ACCESS_TOKEN and META_PIXEL_ID),
-        "has_token": bool(META_ACCESS_TOKEN),
-        "has_pixel_id": bool(META_PIXEL_ID),
-        "pixel_id_preview": META_PIXEL_ID[:8] + "..." if META_PIXEL_ID else None,
+        "lines": lines_status,
+        "total_configured": sum(1 for l in lines_status if l["configured"]),
+        "total_lines": len(lines_status),
     }
 
 
