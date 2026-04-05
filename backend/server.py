@@ -2761,27 +2761,52 @@ async def wa_landing_track_wa(request: Request):
         
         # Get landing to check if Conversions API is configured
         landing = await db.wa_landings.find_one({"code": landing_code}, {"_id": 0})
-        if landing and landing.get("meta_access_token") and landing.get("pixel_id"):
+        if not landing:
+            return {"status": "ok"}
+        
+        # Try to get Meta credentials from landing first, then from associated line
+        access_token = landing.get("meta_access_token")
+        pixel_id = landing.get("pixel_id")
+        
+        # If landing doesn't have pixel config, try to get from associated line
+        if not access_token or not pixel_id:
+            wa_numbers = landing.get("wa_numbers", [])
+            if wa_numbers:
+                # Find line with this WhatsApp number
+                line = await db.crm_lines.find_one(
+                    {"whatsapp_number": {"$in": wa_numbers}},
+                    {"_id": 0, "meta_access_token": 1, "meta_pixel_id": 1}
+                )
+                if line:
+                    access_token = access_token or line.get("meta_access_token")
+                    pixel_id = pixel_id or line.get("meta_pixel_id")
+        
+        if access_token and pixel_id:
             # Get click data for user info
             click = await db.wa_clicks.find_one(
                 {"landing_code": landing_code, "click_id": click_id},
-                {"_id": 0, "ip": 1, "user_agent": 1, "fbp": 1, "fbc": 1}
+                {"_id": 0}
             )
             if click:
                 # Send Lead event via Conversions API
                 await send_meta_conversion_event(
                     event_name="Lead",
                     lead_data={
+                        "id": click.get("id", ""),
                         "ip_address": click.get("ip", ""),
                         "user_agent": click.get("user_agent", ""),
                         "fbp": click.get("fbp", ""),
                         "fbc": click.get("fbc", ""),
+                        "phone": "",  # No phone at this stage
+                        "click_id": click_id,
                     },
                     custom_data={"content_name": landing.get("name", "WA Landing")},
-                    access_token=landing["meta_access_token"],
-                    pixel_id=landing["pixel_id"]
+                    access_token=access_token,
+                    pixel_id=pixel_id
                 )
                 logger.info(f"Lead event sent via Conversions API for landing {landing_code}")
+        else:
+            logger.warning(f"Landing {landing_code} has no Meta Pixel configured (neither in landing nor in associated line)")
     except Exception as e:
         logger.error(f"WA landing track-wa error: {e}")
     return {"status": "ok"}
@@ -2900,26 +2925,70 @@ async def send_meta_conversion_event(
         
         url = f"https://graph.facebook.com/v18.0/{pixel}/events"
         
-        # Build user data
-        user_data = {
-            "client_ip_address": lead_data.get("ip_address", ""),
-            "client_user_agent": lead_data.get("user_agent", ""),
-        }
+        # Try to get click data for better matching
+        click_data = {}
+        if lead_data.get("click_id"):
+            wa_click = await db.wa_clicks.find_one({"click_id": lead_data["click_id"]}, {"_id": 0})
+            if wa_click:
+                click_data = wa_click
         
-        # Add Facebook cookies if available
-        if lead_data.get("fbp"):
-            user_data["fbp"] = lead_data["fbp"]
-        if lead_data.get("fbc"):
-            user_data["fbc"] = lead_data["fbc"]
+        # If no click_id, try to find by phone
+        if not click_data and lead_data.get("phone"):
+            phone_clean = re.sub(r'\D', '', lead_data["phone"])[-10:]
+            wa_click = await db.wa_clicks.find_one(
+                {"phone": {"$regex": phone_clean}},
+                {"_id": 0},
+                sort=[("created_at", -1)]
+            )
+            if wa_click:
+                click_data = wa_click
         
-        # Add phone/email if available (hashed)
-        if lead_data.get("phone"):
+        # Build user data with all available info
+        user_data = {}
+        
+        # IP and User Agent (required for good matching)
+        ip = click_data.get("ip") or click_data.get("ip_address") or lead_data.get("ip_address") or lead_data.get("metadata", {}).get("ip_address", "")
+        ua = click_data.get("user_agent") or lead_data.get("user_agent") or lead_data.get("metadata", {}).get("user_agent", "")
+        
+        if ip:
+            user_data["client_ip_address"] = ip
+        if ua:
+            user_data["client_user_agent"] = ua
+        
+        # Facebook cookies (critical for matching)
+        fbp = click_data.get("fbp") or lead_data.get("fbp")
+        fbc = click_data.get("fbc") or lead_data.get("fbc")
+        
+        if fbp:
+            user_data["fbp"] = fbp
+        if fbc:
+            user_data["fbc"] = fbc
+        
+        # Phone (required - hash it)
+        phone = lead_data.get("phone")
+        if phone:
             import hashlib
-            phone_clean = re.sub(r'\D', '', lead_data["phone"])
+            # Clean phone: remove all non-digits, keep last 10-11 digits
+            phone_clean = re.sub(r'\D', '', phone)
+            # Try different formats for better matching
             user_data["ph"] = [hashlib.sha256(phone_clean.encode()).hexdigest()]
-        if lead_data.get("email"):
+        
+        # Email if available
+        email = lead_data.get("email")
+        if email:
             import hashlib
-            user_data["em"] = [hashlib.sha256(lead_data["email"].lower().encode()).hexdigest()]
+            user_data["em"] = [hashlib.sha256(email.lower().strip().encode()).hexdigest()]
+        
+        # External ID (lead ID for deduplication)
+        if lead_data.get("id"):
+            import hashlib
+            user_data["external_id"] = [hashlib.sha256(lead_data["id"].encode()).hexdigest()]
+        
+        # Country code (helps with matching)
+        user_data["country"] = [hashlib.sha256("ar".encode()).hexdigest()]  # Argentina
+        
+        # Log what we're sending for debugging
+        logger.info(f"Meta event user_data keys: {list(user_data.keys())}, has_fbp: {bool(fbp)}, has_fbc: {bool(fbc)}, has_phone: {bool(phone)}")
         
         event_data = {
             "event_name": event_name,
@@ -2927,6 +2996,10 @@ async def send_meta_conversion_event(
             "action_source": "website",
             "user_data": user_data,
         }
+        
+        # Add event_source_url if we have landing info
+        if click_data.get("landing_url") or click_data.get("referrer"):
+            event_data["event_source_url"] = click_data.get("landing_url") or click_data.get("referrer")
         
         if custom_data:
             event_data["custom_data"] = custom_data
@@ -2941,7 +3014,7 @@ async def send_meta_conversion_event(
             result = response.json()
             
             if response.status_code == 200:
-                logger.info(f"Meta event '{event_name}' sent successfully for lead")
+                logger.info(f"Meta event '{event_name}' sent successfully for lead {lead_data.get('id', 'unknown')}")
                 return {"success": True, "result": result}
             else:
                 logger.error(f"Meta API error: {result}")
