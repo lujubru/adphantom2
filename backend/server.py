@@ -3246,6 +3246,8 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                     click_id = None
                     ad_source = None
                     utm_content = None
+                    referral_data = None
+                    
                     import re
                     click_match = re.search(r'\(ID:\s*([A-Z0-9]+)\)', text)
                     if click_match:
@@ -3255,6 +3257,21 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                         if wa_click:
                             utm_content = wa_click.get("utm_content", "")
                             ad_source = utm_content if utm_content else None
+                    
+                    # Check for Meta Ads referral data (Click-to-WhatsApp ads)
+                    # Meta sends this when user clicks on a CTWA ad
+                    if msg.get("referral"):
+                        referral_data = msg.get("referral", {})
+                        # referral contains: source_url, source_id, source_type, headline, body, media_type, image_url, video_url, thumbnail_url, ctwa_clid
+                        ad_source = ad_source or referral_data.get("source_id") or referral_data.get("headline") or "meta_ad"
+                        utm_content = utm_content or referral_data.get("source_id", "")
+                        logger.info(f"CRM: Message from Meta Ad - source_id: {referral_data.get('source_id')}, headline: {referral_data.get('headline')}")
+                    
+                    # Also check context for referral (some API versions send it here)
+                    if msg.get("context", {}).get("referred_product"):
+                        referral_data = referral_data or {}
+                        referral_data["referred_product"] = msg.get("context", {}).get("referred_product")
+                        ad_source = ad_source or "product_ad"
 
                     # Find or create CRM lead for this line
                     crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": line_id})
@@ -3279,9 +3296,12 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                     
                     # Update ad_source if lead exists but doesn't have ad tracking
                     if crm_lead and ad_source and not crm_lead.get("ad_source"):
+                        update_data = {"ad_source": ad_source, "utm_content": utm_content, "click_id": click_id}
+                        if referral_data:
+                            update_data["referral"] = referral_data
                         await db.crm_leads.update_one(
                             {"id": crm_lead["id"]},
-                            {"$set": {"ad_source": ad_source, "utm_content": utm_content, "click_id": click_id}}
+                            {"$set": update_data}
                         )
                     
                     if not crm_lead:
@@ -3300,6 +3320,7 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                             "ad_source": ad_source,
                             "utm_content": utm_content,
                             "click_id": click_id,
+                            "referral": referral_data,  # Store full referral data from Meta Ads
                             "metadata": {
                                 "phone_number_id": phone_number_id,
                                 "display_phone": display_phone,
@@ -3314,7 +3335,7 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                             "meta_events_sent": [],
                         }
                         await db.crm_leads.insert_one(crm_lead)
-                        logger.info(f"CRM: Created new lead for {from_phone} on line {line['name']}{' from ad: ' + ad_source if ad_source else ''}")
+                        logger.info(f"CRM: Created new lead for {from_phone} on line {line['name']}{' from ad: ' + str(ad_source) if ad_source else ''}")
                         
                         # Send Contact event to Meta if line has credentials
                         if line.get("meta_access_token") and line.get("meta_pixel_id"):
