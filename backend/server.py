@@ -3258,6 +3258,20 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                             utm_content = wa_click.get("utm_content", "")
                             ad_source = utm_content if utm_content else None
                     
+                    # Also check for (AD:xxx) format from external landings
+                    ad_match = re.search(r'\(AD:([^\)]+)\)', text, re.IGNORECASE)
+                    if ad_match and not ad_source:
+                        ad_source = ad_match.group(1).strip()
+                        utm_content = ad_source
+                        logger.info(f"CRM: Detected ad source from message: {ad_source}")
+                    
+                    # Also check for (REF:xxx) format
+                    ref_match = re.search(r'\(REF:([^\)]+)\)', text, re.IGNORECASE)
+                    if ref_match and not ad_source:
+                        ad_source = ref_match.group(1).strip()
+                        utm_content = ad_source
+                        logger.info(f"CRM: Detected ref source from message: {ad_source}")
+                    
                     # Check for Meta Ads referral data (Click-to-WhatsApp ads)
                     # Meta sends this when user clicks on a CTWA ad
                     if msg.get("referral"):
