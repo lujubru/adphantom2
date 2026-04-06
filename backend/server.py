@@ -2746,7 +2746,7 @@ async def wa_landing_track(request: Request):
 
 @api_router.post("/wa-landings/track-wa")
 async def wa_landing_track_wa(request: Request):
-    """Track WhatsApp button click and send Lead event via Conversions API"""
+    """Track WhatsApp button click and send Lead/Contact events via Conversions API"""
     try:
         body = await request.json()
         landing_code = body.get("landing_code")
@@ -2788,23 +2788,52 @@ async def wa_landing_track_wa(request: Request):
                 {"_id": 0}
             )
             if click:
+                lead_data = {
+                    "id": click.get("id", ""),
+                    "ip_address": click.get("ip", ""),
+                    "user_agent": click.get("user_agent", ""),
+                    "fbp": click.get("fbp", ""),
+                    "fbc": click.get("fbc", ""),
+                    "phone": "",  # No phone at this stage
+                    "click_id": click_id,
+                }
+                custom_data = {"content_name": landing.get("name", "WA Landing")}
+                
+                # Get pixel_events from landing to know which events to send
+                pixel_events = landing.get("pixel_events", ["PageView", "Lead"])
+                
                 # Send Lead event via Conversions API
-                await send_meta_conversion_event(
-                    event_name="Lead",
-                    lead_data={
-                        "id": click.get("id", ""),
-                        "ip_address": click.get("ip", ""),
-                        "user_agent": click.get("user_agent", ""),
-                        "fbp": click.get("fbp", ""),
-                        "fbc": click.get("fbc", ""),
-                        "phone": "",  # No phone at this stage
-                        "click_id": click_id,
-                    },
-                    custom_data={"content_name": landing.get("name", "WA Landing")},
-                    access_token=access_token,
-                    pixel_id=pixel_id
-                )
-                logger.info(f"Lead event sent via Conversions API for landing {landing_code}")
+                if "Lead" in pixel_events:
+                    await send_meta_conversion_event(
+                        event_name="Lead",
+                        lead_data=lead_data,
+                        custom_data=custom_data,
+                        access_token=access_token,
+                        pixel_id=pixel_id
+                    )
+                    logger.info(f"Lead event sent via Conversions API for landing {landing_code}")
+                
+                # Send Contact event via Conversions API
+                if "Contact" in pixel_events:
+                    await send_meta_conversion_event(
+                        event_name="Contact",
+                        lead_data=lead_data,
+                        custom_data=custom_data,
+                        access_token=access_token,
+                        pixel_id=pixel_id
+                    )
+                    logger.info(f"Contact event sent via Conversions API for landing {landing_code}")
+                
+                # Send InitiateCheckout event via Conversions API
+                if "InitiateCheckout" in pixel_events:
+                    await send_meta_conversion_event(
+                        event_name="InitiateCheckout",
+                        lead_data=lead_data,
+                        custom_data=custom_data,
+                        access_token=access_token,
+                        pixel_id=pixel_id
+                    )
+                    logger.info(f"InitiateCheckout event sent via Conversions API for landing {landing_code}")
         else:
             logger.warning(f"Landing {landing_code} has no Meta Pixel configured (neither in landing nor in associated line)")
     except Exception as e:
