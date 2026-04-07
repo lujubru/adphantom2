@@ -1,6 +1,6 @@
 import React from 'react';
 import { Navigate, Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Target, LogOut, BarChart, Globe, Users, UserCog, Sun, Moon, Sparkles } from 'lucide-react';
+import { LayoutDashboard, Target, LogOut, BarChart, Globe, Users, UserCog, Sun, Moon, Sparkles, Activity } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useTheme } from '@/contexts/ThemeContext';
 
@@ -13,6 +13,7 @@ const ALL_NAV_ITEMS = [
   { path: '/analytics', label: 'Analytics', icon: BarChart, roles: ['admin'] },
   { path: '/ai-generator', label: 'AI Tools', icon: Sparkles, roles: ['admin'] },
   { path: '/user-management', label: 'Usuarios', icon: UserCog, roles: ['admin'] },
+  { path: '/meta-diagnostics', label: 'Meta CAPI', icon: Activity, roles: ['admin'] },
 ];
 
 // Rutas que el cajero NO puede visitar
@@ -21,6 +22,7 @@ const ADMIN_ONLY_PATHS = [
   '/analytics', '/ai-intelligence', '/ai-generator',
   '/click-forensics', '/whatsapp-crm', '/wa-landings', '/wa-landing-forensics',
   '/user-management',
+  '/meta-diagnostics',
 ];
 
 const Layout = () => {

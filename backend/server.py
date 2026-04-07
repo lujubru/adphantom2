@@ -4602,6 +4602,96 @@ async def crm_meta_integration_status(current_user=Depends(get_current_user)):
     }
 
 
+@api_router.get("/crm/meta/diagnostics")
+async def crm_meta_diagnostics(
+    limit: int = Query(50, ge=1, le=200),
+    line_id: str = Query(None),
+    event_type: str = Query(None),
+    current_user=Depends(get_current_user)
+):
+    """
+    Full Meta CAPI diagnostics panel.
+    Returns recent events, success rates, and line configuration.
+    """
+    # 1. Lines config
+    lines = await db.crm_lines.find({}, {"_id": 0}).to_list(100)
+    lines_map = {l["id"]: l for l in lines}
+    lines_config = []
+    for line in lines:
+        has_token = bool(line.get("meta_access_token"))
+        has_pixel = bool(line.get("meta_pixel_id"))
+        lines_config.append({
+            "line_id": line["id"],
+            "line_name": line.get("name", "N/A"),
+            "configured": has_token and has_pixel,
+            "has_token": has_token,
+            "has_pixel_id": has_pixel,
+            "pixel_id_preview": line.get("meta_pixel_id", "")[:12] + "..." if line.get("meta_pixel_id") else None,
+            "token_preview": line.get("meta_access_token", "")[:12] + "..." if line.get("meta_access_token") else None,
+        })
+
+    # 2. Aggregate recent events from leads
+    match_query = {"meta_events_sent": {"$exists": True, "$ne": []}}
+    if line_id:
+        match_query["line_id"] = line_id
+
+    leads_with_events = await db.crm_leads.find(
+        match_query,
+        {"_id": 0, "id": 1, "name": 1, "phone": 1, "line_id": 1, "meta_events_sent": 1, "status": 1}
+    ).sort("updated_at", -1).limit(200).to_list(200)
+
+    all_events = []
+    for lead in leads_with_events:
+        for ev in lead.get("meta_events_sent", []):
+            if event_type and ev.get("event") != event_type:
+                continue
+            all_events.append({
+                "lead_id": lead["id"],
+                "lead_name": lead.get("name", ""),
+                "lead_phone": lead.get("phone", ""),
+                "lead_status": lead.get("status", ""),
+                "line_id": lead.get("line_id", ""),
+                "line_name": ev.get("line") or lines_map.get(lead.get("line_id", ""), {}).get("name", "N/A"),
+                "event": ev.get("event", ""),
+                "timestamp": ev.get("timestamp", ""),
+                "value": ev.get("value"),
+                "currency": ev.get("currency", ""),
+                "event_id": ev.get("event_id"),
+                "success": ev.get("success", False),
+                "pixel_id": ev.get("pixel_id", ""),
+            })
+
+    # Sort by timestamp desc
+    all_events.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+    all_events = all_events[:limit]
+
+    # 3. Stats
+    total_events = len(all_events)
+    success_count = sum(1 for e in all_events if e.get("success"))
+    fail_count = total_events - success_count
+    total_value = sum(float(e.get("value") or 0) for e in all_events if e.get("event") == "Purchase")
+
+    event_type_counts = {}
+    for e in all_events:
+        et = e.get("event", "Unknown")
+        event_type_counts[et] = event_type_counts.get(et, 0) + 1
+
+    return {
+        "lines_config": lines_config,
+        "total_configured_lines": sum(1 for l in lines_config if l["configured"]),
+        "total_lines": len(lines_config),
+        "events": all_events,
+        "stats": {
+            "total_events": total_events,
+            "success": success_count,
+            "failed": fail_count,
+            "success_rate": round((success_count / total_events * 100), 1) if total_events else 0,
+            "total_purchase_value": round(total_value, 2),
+            "event_type_counts": event_type_counts,
+        }
+    }
+
+
 
 # ─── Health & Root ─────────────────────────────────────────────────
 

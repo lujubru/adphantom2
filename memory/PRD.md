@@ -78,6 +78,7 @@ Aplicacion AdPhantom - CRM de WhatsApp con tracking de conversiones para Meta Pi
 - **FIX**: Manual conversion endpoint checked `cliente_real` instead of `valido` — corrected
 - **FIX**: Old classify endpoint hardcoded `value: 0` — now uses `charge_amount`
 - **FIX P1**: Verified Landing Page Lead/Contact CAPI events include fbp, fbc, client_ip, user_agent
+- **NEW**: Panel "Diagnostico Meta" — dashboard en tiempo real de eventos CAPI con stats, config de lineas, filtros y auto-refresh
 
 ## Prioritized Backlog
 ### P1 (High)
