@@ -1924,9 +1924,9 @@ async def wa_webhook_receive(request: Request):
                         
                         # Send Contact event to Meta if line has credentials
                         if crm_line and crm_line.get("meta_access_token") and crm_line.get("meta_pixel_id"):
-                            await send_meta_conversion_event(
+                            contact_result = await send_meta_conversion_event(
                                 event_name="Contact",
-                                lead_data=crm_lead.get("metadata", {}),
+                                lead_data=crm_lead,
                                 custom_data={"content_name": "WhatsApp Contact"},
                                 access_token=crm_line["meta_access_token"],
                                 pixel_id=crm_line["meta_pixel_id"]
@@ -1937,7 +1937,8 @@ async def wa_webhook_receive(request: Request):
                                 {"$push": {"meta_events_sent": {
                                     "event": "Contact",
                                     "timestamp": now,
-                                    "success": True
+                                    "event_id": contact_result.get("event_id"),
+                                    "success": contact_result.get("success", False)
                                 }}}
                             )
                     else:
@@ -2148,7 +2149,7 @@ async def wa_classify_contact(phone: str, data: WAClassify, current_user=Depends
                     charge = float(crm_lead.get("charge_amount", 0) or 0)
                     meta_result = await send_meta_conversion_event(
                         event_name="Purchase",
-                        lead_data=crm_lead.get("metadata", {}),
+                        lead_data=crm_lead,
                         custom_data={"currency": "USD", "value": charge, "content_type": "product"},
                         access_token=line["meta_access_token"],
                         pixel_id=line["meta_pixel_id"]
@@ -2158,7 +2159,7 @@ async def wa_classify_contact(phone: str, data: WAClassify, current_user=Depends
                     # Send LowQualityLead event
                     meta_result = await send_meta_conversion_event(
                         event_name="LowQualityLead",
-                        lead_data=crm_lead.get("metadata", {}),
+                        lead_data=crm_lead,
                         custom_data={"lead_quality": data.classification},
                         access_token=line["meta_access_token"],
                         pixel_id=line["meta_pixel_id"]
@@ -3407,9 +3408,9 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                         
                         # Send Contact event to Meta if line has credentials
                         if line.get("meta_access_token") and line.get("meta_pixel_id"):
-                            await send_meta_conversion_event(
+                            contact_result = await send_meta_conversion_event(
                                 event_name="Contact",
-                                lead_data=crm_lead.get("metadata", {}),
+                                lead_data=crm_lead,
                                 custom_data={"content_name": "WhatsApp Contact", "line": line["name"]},
                                 access_token=line["meta_access_token"],
                                 pixel_id=line["meta_pixel_id"]
@@ -3419,8 +3420,9 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                                 {"$push": {"meta_events_sent": {
                                     "event": "Contact",
                                     "timestamp": now,
+                                    "event_id": contact_result.get("event_id"),
                                     "line": line["name"],
-                                    "success": True
+                                    "success": contact_result.get("success", False)
                                 }}}
                             )
                     else:
