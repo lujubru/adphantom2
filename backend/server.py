@@ -2144,11 +2144,12 @@ async def wa_classify_contact(phone: str, data: WAClassify, current_user=Depends
             line = await db.crm_lines.find_one({"id": crm_lead["line_id"]})
             if line and line.get("meta_access_token") and line.get("meta_pixel_id"):
                 if data.classification == "human":
-                    # Send Purchase event
+                    # Send Purchase event (value from charge_amount if available)
+                    charge = float(crm_lead.get("charge_amount", 0) or 0)
                     meta_result = await send_meta_conversion_event(
                         event_name="Purchase",
                         lead_data=crm_lead.get("metadata", {}),
-                        custom_data={"currency": "USD", "value": 0},
+                        custom_data={"currency": "USD", "value": charge, "content_type": "product"},
                         access_token=line["meta_access_token"],
                         pixel_id=line["meta_pixel_id"]
                     )
@@ -2936,11 +2937,12 @@ async def send_meta_conversion_event(
     Send conversion event to Meta Conversions API
     
     Events:
-    - Purchase: Cliente válido (conversión positiva)
+    - Purchase: Cliente válido (conversión positiva) — requires value + currency in custom_data
     - Lead: Lead interesado
+    - Contact: Contacto inicial
     - Other: Eventos custom
     
-    Uses line-specific token/pixel if provided, otherwise falls back to defaults
+    Uses line-specific token/pixel only (no env fallbacks)
     """
     token = access_token
     pixel = pixel_id
@@ -2951,8 +2953,9 @@ async def send_meta_conversion_event(
     
     try:
         import time
+        import hashlib
         
-        url = f"https://graph.facebook.com/v18.0/{pixel}/events"
+        url = f"https://graph.facebook.com/v21.0/{pixel}/events"
         
         # Try to get click data for better matching
         click_data = {}
@@ -2996,32 +2999,28 @@ async def send_meta_conversion_event(
         # Phone (required - hash it)
         phone = lead_data.get("phone")
         if phone:
-            import hashlib
-            # Clean phone: remove all non-digits, keep last 10-11 digits
             phone_clean = re.sub(r'\D', '', phone)
-            # Try different formats for better matching
             user_data["ph"] = [hashlib.sha256(phone_clean.encode()).hexdigest()]
         
         # Email if available
         email = lead_data.get("email")
         if email:
-            import hashlib
             user_data["em"] = [hashlib.sha256(email.lower().strip().encode()).hexdigest()]
         
         # External ID (lead ID for deduplication)
         if lead_data.get("id"):
-            import hashlib
             user_data["external_id"] = [hashlib.sha256(lead_data["id"].encode()).hexdigest()]
         
         # Country code (helps with matching)
         user_data["country"] = [hashlib.sha256("ar".encode()).hexdigest()]  # Argentina
         
-        # Log what we're sending for debugging
-        logger.info(f"Meta event user_data keys: {list(user_data.keys())}, has_fbp: {bool(fbp)}, has_fbc: {bool(fbc)}, has_phone: {bool(phone)}")
+        # Generate unique event_id for deduplication
+        event_id = f"{event_name}_{lead_data.get('id', 'unknown')}_{int(time.time())}"
         
         event_data = {
             "event_name": event_name,
             "event_time": int(time.time()),
+            "event_id": event_id,
             "action_source": "website",
             "user_data": user_data,
         }
@@ -3030,24 +3029,50 @@ async def send_meta_conversion_event(
         if click_data.get("landing_url") or click_data.get("referrer"):
             event_data["event_source_url"] = click_data.get("landing_url") or click_data.get("referrer")
         
+        # Handle custom_data — ensure Purchase events have proper value/currency
         if custom_data:
+            # For Purchase events, ensure value is a proper float number
+            if event_name == "Purchase":
+                raw_value = custom_data.get("value", 0)
+                custom_data["value"] = float(raw_value) if raw_value else 0.0
+                custom_data["currency"] = custom_data.get("currency", "USD")
+                # Add content_type for better optimization
+                if "content_type" not in custom_data:
+                    custom_data["content_type"] = "product"
             event_data["custom_data"] = custom_data
+        elif event_name == "Purchase":
+            # Purchase MUST have custom_data with value/currency
+            event_data["custom_data"] = {
+                "value": 0.0,
+                "currency": "USD",
+                "content_type": "product"
+            }
         
         payload = {
             "data": [event_data],
             "access_token": token,
         }
         
+        # Detailed logging for debugging
+        log_custom = event_data.get("custom_data", {})
+        logger.info(
+            f"Meta CAPI >> Sending '{event_name}' | lead={lead_data.get('id', '?')} | "
+            f"value={log_custom.get('value', 'N/A')} {log_custom.get('currency', '')} | "
+            f"event_id={event_id} | pixel={pixel[:10]}... | "
+            f"user_data_keys={list(user_data.keys())} | "
+            f"fbp={'YES' if fbp else 'NO'} fbc={'YES' if fbc else 'NO'} phone={'YES' if phone else 'NO'}"
+        )
+        
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload)
             result = response.json()
             
             if response.status_code == 200:
-                logger.info(f"Meta event '{event_name}' sent successfully for lead {lead_data.get('id', 'unknown')}")
-                return {"success": True, "result": result}
+                logger.info(f"Meta CAPI << '{event_name}' OK | lead={lead_data.get('id', 'unknown')} | response={result}")
+                return {"success": True, "result": result, "event_id": event_id}
             else:
-                logger.error(f"Meta API error: {result}")
-                return {"success": False, "error": result}
+                logger.error(f"Meta CAPI << '{event_name}' ERROR {response.status_code} | response={result}")
+                return {"success": False, "error": result, "event_id": event_id}
                 
     except Exception as e:
         logger.error(f"Meta Conversions API error: {e}")
@@ -3881,10 +3906,14 @@ async def crm_classify_lead(
     if data.send_to_meta and line_token and line_pixel:
         if data.status == "valido":
             # Send Purchase event for valid customers
+            purchase_value = float(data.conversion_value) if data.conversion_value else 0.0
+            purchase_currency = data.currency or "USD"
             custom_data = {
-                "currency": data.currency or "USD",
-                "value": data.conversion_value or 0,
+                "currency": purchase_currency,
+                "value": purchase_value,
+                "content_type": "product",
             }
+            logger.info(f"Purchase event for lead {lead_id}: value={purchase_value}, currency={purchase_currency}")
             meta_result = await send_meta_conversion_event(
                 event_name="Purchase",
                 lead_data=lead,
@@ -3898,8 +3927,9 @@ async def crm_classify_lead(
             update_data["meta_events_sent"] = lead.get("meta_events_sent", []) + [{
                 "event": "Purchase",
                 "timestamp": now,
-                "value": data.conversion_value,
-                "currency": data.currency or "USD",
+                "value": purchase_value,
+                "currency": purchase_currency,
+                "event_id": meta_result.get("event_id"),
                 "line": line_name,
                 "pixel_id": use_pixel[:8] + "..." if use_pixel else None,
                 "success": meta_result.get("success", False)
@@ -4486,10 +4516,10 @@ async def crm_send_conversion_to_meta(
     if not lead:
         raise HTTPException(status_code=404, detail="Lead no encontrado")
     
-    if lead.get("status") != "cliente_real":
+    if lead.get("status") != "valido":
         raise HTTPException(
             status_code=400,
-            detail="Solo se pueden enviar conversiones para leads con status 'cliente_real'"
+            detail="Solo se pueden enviar conversiones para leads con status 'valido'"
         )
     
     # Get the line's Meta credentials
@@ -4510,10 +4540,15 @@ async def crm_send_conversion_to_meta(
             detail=f"La línea '{line.get('name', 'N/A')}' no tiene configurado Meta Pixel. Configura meta_access_token y meta_pixel_id en la línea."
         )
     
+    purchase_value = float(value) if value else 0.0
+    purchase_currency = currency or "USD"
     custom_data = {
-        "currency": currency,
-        "value": value,
+        "currency": purchase_currency,
+        "value": purchase_value,
+        "content_type": "product",
     }
+    
+    logger.info(f"Manual Purchase event for lead {lead_id}: value={purchase_value}, currency={purchase_currency}")
     
     result = await send_meta_conversion_event(
         event_name="Purchase",
@@ -4531,8 +4566,9 @@ async def crm_send_conversion_to_meta(
             "meta_events_sent": {
                 "event": "Purchase",
                 "timestamp": now,
-                "value": value,
-                "currency": currency,
+                "value": purchase_value,
+                "currency": purchase_currency,
+                "event_id": result.get("event_id"),
                 "line": line.get("name"),
                 "success": result.get("success", False)
             }
