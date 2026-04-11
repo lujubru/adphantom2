@@ -3070,12 +3070,39 @@ async def send_meta_conversion_event(
             response = await client.post(url, json=payload)
             result = response.json()
             
-            if response.status_code == 200:
+            success = response.status_code == 200
+            if success:
                 logger.info(f"Meta CAPI << '{event_name}' OK | lead={lead_data.get('id', 'unknown')} | response={result}")
-                return {"success": True, "result": result, "event_id": event_id}
             else:
                 logger.error(f"Meta CAPI << '{event_name}' ERROR {response.status_code} | response={result}")
-                return {"success": False, "error": result, "event_id": event_id}
+            
+            # Centralized event log — every CAPI event gets recorded
+            try:
+                await db.meta_events_log.insert_one({
+                    "event_name": event_name,
+                    "event_id": event_id,
+                    "event_time": event_data["event_time"],
+                    "lead_id": lead_data.get("id"),
+                    "lead_name": lead_data.get("name"),
+                    "lead_phone": lead_data.get("phone"),
+                    "line_id": lead_data.get("line_id"),
+                    "pixel_id": pixel[:12] + "..." if pixel else None,
+                    "value": log_custom.get("value"),
+                    "currency": log_custom.get("currency"),
+                    "success": success,
+                    "has_fbp": bool(fbp),
+                    "has_fbc": bool(fbc),
+                    "has_phone": bool(phone),
+                    "user_data_keys": list(user_data.keys()),
+                    "source": lead_data.get("source", ""),
+                    "landing_code": lead_data.get("landing_code") or click_data.get("landing_code"),
+                    "meta_response": result if not success else {"events_received": result.get("events_received")},
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception as log_err:
+                logger.warning(f"Failed to log CAPI event: {log_err}")
+            
+            return {"success": success, "result": result, "event_id": event_id} if success else {"success": False, "error": result, "event_id": event_id}
                 
     except Exception as e:
         logger.error(f"Meta Conversions API error: {e}")
@@ -4638,36 +4665,39 @@ async def crm_meta_diagnostics(
             "token_preview": line.get("meta_access_token", "")[:12] + "..." if line.get("meta_access_token") else None,
         })
 
-    # 2. Aggregate recent events from leads
-    match_query = {"meta_events_sent": {"$exists": True, "$ne": []}}
+    # 2. Read from centralized meta_events_log (captures ALL events including landing Lead/Contact)
+    log_query = {}
     if line_id:
-        match_query["line_id"] = line_id
+        log_query["line_id"] = line_id
+    if event_type:
+        log_query["event_name"] = event_type
 
-    leads_with_events = await db.crm_leads.find(
-        match_query,
-        {"_id": 0, "id": 1, "name": 1, "phone": 1, "line_id": 1, "meta_events_sent": 1, "status": 1}
-    ).sort("updated_at", -1).limit(200).to_list(200)
+    event_logs = await db.meta_events_log.find(
+        log_query, {"_id": 0}
+    ).sort("created_at", -1).limit(limit).to_list(limit)
 
     all_events = []
-    for lead in leads_with_events:
-        for ev in lead.get("meta_events_sent", []):
-            if event_type and ev.get("event") != event_type:
-                continue
-            all_events.append({
-                "lead_id": lead["id"],
-                "lead_name": lead.get("name", ""),
-                "lead_phone": lead.get("phone", ""),
-                "lead_status": lead.get("status", ""),
-                "line_id": lead.get("line_id", ""),
-                "line_name": ev.get("line") or lines_map.get(lead.get("line_id", ""), {}).get("name", "N/A"),
-                "event": ev.get("event", ""),
-                "timestamp": ev.get("timestamp", ""),
-                "value": ev.get("value"),
-                "currency": ev.get("currency", ""),
-                "event_id": ev.get("event_id"),
-                "success": ev.get("success", False),
-                "pixel_id": ev.get("pixel_id", ""),
-            })
+    for ev in event_logs:
+        all_events.append({
+            "lead_id": ev.get("lead_id", ""),
+            "lead_name": ev.get("lead_name", ""),
+            "lead_phone": ev.get("lead_phone", ""),
+            "lead_status": "",
+            "line_id": ev.get("line_id", ""),
+            "line_name": lines_map.get(ev.get("line_id", ""), {}).get("name", ""),
+            "event": ev.get("event_name", ""),
+            "timestamp": ev.get("created_at", ""),
+            "value": ev.get("value"),
+            "currency": ev.get("currency", ""),
+            "event_id": ev.get("event_id"),
+            "success": ev.get("success", False),
+            "pixel_id": ev.get("pixel_id", ""),
+            "has_fbp": ev.get("has_fbp", False),
+            "has_fbc": ev.get("has_fbc", False),
+            "has_phone": ev.get("has_phone", False),
+            "landing_code": ev.get("landing_code"),
+            "source": ev.get("source", ""),
+        })
 
     # Sort by timestamp desc
     all_events.sort(key=lambda x: x.get("timestamp", ""), reverse=True)

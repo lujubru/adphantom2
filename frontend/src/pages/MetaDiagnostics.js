@@ -251,12 +251,14 @@ const MetaDiagnostics = () => {
                     <div className={`px-4 pb-3 ml-5 grid grid-cols-2 md:grid-cols-4 gap-3 text-xs ${muted}`}>
                       <Detail label="Lead ID" value={ev.lead_id} />
                       <Detail label="Telefono" value={ev.lead_phone} />
-                      <Detail label="Estado" value={ev.lead_status} />
                       <Detail label="Linea" value={ev.line_name} />
-                      <Detail label="Event ID" value={ev.event_id || 'Sin event_id'} />
                       <Detail label="Pixel" value={ev.pixel_id || 'N/A'} />
-                      <Detail label="Timestamp" value={ev.timestamp ? new Date(ev.timestamp).toLocaleString() : '-'} />
+                      <Detail label="Event ID" value={ev.event_id || 'Sin event_id'} />
+                      <Detail label="Landing" value={ev.landing_code || '-'} />
+                      <Detail label="fbp / fbc" value={`${ev.has_fbp ? 'SI' : 'NO'} / ${ev.has_fbc ? 'SI' : 'NO'}`} highlight={ev.has_fbp && ev.has_fbc ? 'green' : 'red'} />
                       <Detail label="Resultado" value={ev.success ? 'OK (200)' : 'ERROR'} highlight={ev.success ? 'green' : 'red'} />
+                      <Detail label="Timestamp" value={ev.timestamp ? new Date(ev.timestamp).toLocaleString() : '-'} />
+                      {ev.source && <Detail label="Fuente" value={ev.source} />}
                     </div>
                   )}
                 </div>
