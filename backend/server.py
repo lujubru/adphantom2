@@ -1938,6 +1938,8 @@ async def wa_webhook_receive(request: Request):
                                     "event": "Contact",
                                     "timestamp": now,
                                     "event_id": contact_result.get("event_id"),
+                                    "pixel_id": crm_line.get("meta_pixel_id", "")[:8] + "..." if crm_line.get("meta_pixel_id") else None,
+                                    "line": crm_line.get("name"),
                                     "success": contact_result.get("success", False)
                                 }}}
                             )
@@ -3421,6 +3423,7 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                                     "event": "Contact",
                                     "timestamp": now,
                                     "event_id": contact_result.get("event_id"),
+                                    "pixel_id": line.get("meta_pixel_id", "")[:8] + "..." if line.get("meta_pixel_id") else None,
                                     "line": line["name"],
                                     "success": contact_result.get("success", False)
                                 }}}
@@ -4254,6 +4257,9 @@ async def crm_send_message(
                     "meta_events_sent": {
                         "event": "Contact",
                         "timestamp": now,
+                        "event_id": meta_result.get("event_id"),
+                        "pixel_id": line.get("meta_pixel_id", "")[:8] + "..." if line.get("meta_pixel_id") else None,
+                        "line": line.get("name"),
                         "success": meta_result.get("success", False)
                     }
                 }}
