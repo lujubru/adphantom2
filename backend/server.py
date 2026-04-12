@@ -3005,6 +3005,16 @@ async def send_meta_conversion_event(
             phone_clean = re.sub(r'\D', '', phone)
             user_data["ph"] = [hashlib.sha256(phone_clean.encode()).hexdigest()]
         
+        # First name / Last name (improves EMQ score)
+        name = lead_data.get("name", "")
+        if name and name.strip() and not name.startswith("Lead "):
+            parts = name.strip().split()
+            fn = parts[0].lower()
+            ln = parts[-1].lower() if len(parts) > 1 else ""
+            user_data["fn"] = [hashlib.sha256(fn.encode()).hexdigest()]
+            if ln:
+                user_data["ln"] = [hashlib.sha256(ln.encode()).hexdigest()]
+        
         # Email if available
         email = lead_data.get("email")
         if email:
@@ -4639,7 +4649,7 @@ async def crm_meta_integration_status(current_user=Depends(get_current_user)):
 
 @api_router.get("/crm/meta/diagnostics")
 async def crm_meta_diagnostics(
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(500, ge=1, le=5000),
     line_id: str = Query(None),
     event_type: str = Query(None),
     current_user=Depends(get_current_user)
@@ -4703,16 +4713,30 @@ async def crm_meta_diagnostics(
     all_events.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
     all_events = all_events[:limit]
 
-    # 3. Stats
-    total_events = len(all_events)
-    success_count = sum(1 for e in all_events if e.get("success"))
-    fail_count = total_events - success_count
-    total_value = sum(float(e.get("value") or 0) for e in all_events if e.get("event") == "Purchase")
+    # 3. Stats — calculated from ALL events in DB, not just the limited page
+    stats_query = {}
+    if line_id:
+        stats_query["line_id"] = line_id
+    if event_type:
+        stats_query["event_name"] = event_type
 
-    event_type_counts = {}
-    for e in all_events:
-        et = e.get("event", "Unknown")
-        event_type_counts[et] = event_type_counts.get(et, 0) + 1
+    total_events = await db.meta_events_log.count_documents(stats_query)
+    success_count = await db.meta_events_log.count_documents({**stats_query, "success": True})
+    fail_count = total_events - success_count
+
+    # Total purchase value from ALL purchase events
+    purchase_agg = await db.meta_events_log.aggregate([
+        {"$match": {**stats_query, "event_name": "Purchase", "value": {"$gt": 0}}},
+        {"$group": {"_id": None, "total": {"$sum": "$value"}}}
+    ]).to_list(1)
+    total_value = round(purchase_agg[0]["total"], 2) if purchase_agg else 0
+
+    # Event type counts from ALL events
+    type_agg = await db.meta_events_log.aggregate([
+        {"$match": stats_query},
+        {"$group": {"_id": "$event_name", "count": {"$sum": 1}}}
+    ]).to_list(50)
+    event_type_counts = {r["_id"]: r["count"] for r in type_agg if r["_id"]}
 
     return {
         "lines_config": lines_config,

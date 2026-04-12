@@ -21,7 +21,7 @@ const MetaDiagnostics = () => {
       const params = {};
       if (filterLine) params.line_id = filterLine;
       if (filterEvent) params.event_type = filterEvent;
-      params.limit = 100;
+      params.limit = 500;
       const { data: d } = await api.get('/crm/meta/diagnostics', { params });
       setData(d);
     } catch (e) { console.error('Error loading diagnostics', e); }
