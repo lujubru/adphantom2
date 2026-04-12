@@ -2729,6 +2729,7 @@ async def wa_landing_track(request: Request):
             "utm_content": body.get("utm_content", ""),
             "utm_campaign": body.get("utm_campaign", ""),
             "referrer": referrer,
+            "landing_url": body.get("landing_url", ""),
             "wa_clicked": False,
             "device": device,
             "os": os_name,
@@ -3038,9 +3039,21 @@ async def send_meta_conversion_event(
             "user_data": user_data,
         }
         
-        # Add event_source_url if we have landing info
-        if click_data.get("landing_url") or click_data.get("referrer"):
-            event_data["event_source_url"] = click_data.get("landing_url") or click_data.get("referrer")
+        # Add event_source_url — critical for Meta matching quality
+        source_url = click_data.get("landing_url") or click_data.get("referrer")
+        if not source_url and click_data.get("landing_code"):
+            # Build URL from landing code
+            landing = await db.wa_landings.find_one({"code": click_data["landing_code"]}, {"_id": 0, "code": 1})
+            if landing:
+                app_url = os.environ.get("APP_URL", "")
+                if app_url:
+                    source_url = f"{app_url}/l/{landing['code']}"
+        if not source_url and lead_data.get("landing_code"):
+            app_url = os.environ.get("APP_URL", "")
+            if app_url:
+                source_url = f"{app_url}/l/{lead_data['landing_code']}"
+        if source_url:
+            event_data["event_source_url"] = source_url
         
         # Handle custom_data — ensure Purchase events have proper value/currency
         if custom_data:
