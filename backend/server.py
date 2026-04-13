@@ -2006,6 +2006,18 @@ async def wa_webhook_receive(request: Request):
                                     "utm_campaign": click_data.get("utm_campaign", ""),
                                 }}
                             )
+                            # Also propagate fbc/fbp/click_id to crm_lead so Purchase events can use them
+                            await db.crm_leads.update_one(
+                                {"phone": from_phone},
+                                {"$set": {
+                                    "click_id": click_id,
+                                    "landing_code": click_data.get("landing_code", ""),
+                                    "fbp": click_data.get("fbp", ""),
+                                    "fbc": click_data.get("fbc", ""),
+                                    "ip_address": click_data.get("ip", ""),
+                                    "user_agent": click_data.get("user_agent", ""),
+                                }}
+                            )
 
                     # Auto-reply for new contacts
                     settings = await get_wa_settings()
@@ -2152,7 +2164,7 @@ async def wa_classify_contact(phone: str, data: WAClassify, current_user=Depends
                     meta_result = await send_meta_conversion_event(
                         event_name="Purchase",
                         lead_data=crm_lead,
-                        custom_data={"currency": "USD", "value": charge, "content_type": "product"},
+                        custom_data={"currency": "ARS", "value": charge, "content_type": "product"},
                         access_token=line["meta_access_token"],
                         pixel_id=line["meta_pixel_id"]
                     )
@@ -3000,10 +3012,13 @@ async def send_meta_conversion_event(
         if fbc:
             user_data["fbc"] = fbc
         
-        # Phone (required - hash it)
+        # Phone (required - hash it, normalized to E.164 for Argentina)
         phone = lead_data.get("phone")
         if phone:
             phone_clean = re.sub(r'\D', '', phone)
+            # Normalize to E.164: Argentine numbers must start with 54
+            if phone_clean and not phone_clean.startswith("54"):
+                phone_clean = "54" + phone_clean
             user_data["ph"] = [hashlib.sha256(phone_clean.encode()).hexdigest()]
         
         # First name / Last name (improves EMQ score)
@@ -3030,19 +3045,10 @@ async def send_meta_conversion_event(
         
         # Generate unique event_id for deduplication
         event_id = f"{event_name}_{lead_data.get('id', 'unknown')}_{int(time.time())}"
-        
-        event_data = {
-            "event_name": event_name,
-            "event_time": int(time.time()),
-            "event_id": event_id,
-            "action_source": "website",
-            "user_data": user_data,
-        }
-        
-        # Add event_source_url — critical for Meta matching quality
+
+        # Resolve event_source_url BEFORE building event_data (needed for action_source)
         source_url = click_data.get("landing_url") or click_data.get("referrer")
         if not source_url and click_data.get("landing_code"):
-            # Build URL from landing code
             landing = await db.wa_landings.find_one({"code": click_data["landing_code"]}, {"_id": 0, "code": 1})
             if landing:
                 app_url = os.environ.get("APP_URL", "")
@@ -3052,6 +3058,16 @@ async def send_meta_conversion_event(
             app_url = os.environ.get("APP_URL", "")
             if app_url:
                 source_url = f"{app_url}/l/{lead_data['landing_code']}"
+
+        event_data = {
+            "event_name": event_name,
+            "event_time": int(time.time()),
+            "event_id": event_id,
+            # If we have a landing URL it's a website action; otherwise it's a WhatsApp/CRM event
+            "action_source": "website" if source_url else "other",
+            "user_data": user_data,
+        }
+
         if source_url:
             event_data["event_source_url"] = source_url
         
@@ -3061,7 +3077,7 @@ async def send_meta_conversion_event(
             if event_name == "Purchase":
                 raw_value = custom_data.get("value", 0)
                 custom_data["value"] = float(raw_value) if raw_value else 0.0
-                custom_data["currency"] = custom_data.get("currency", "USD")
+                custom_data["currency"] = custom_data.get("currency", "ARS")
                 # Add content_type for better optimization
                 if "content_type" not in custom_data:
                     custom_data["content_type"] = "product"
@@ -3070,7 +3086,7 @@ async def send_meta_conversion_event(
             # Purchase MUST have custom_data with value/currency
             event_data["custom_data"] = {
                 "value": 0.0,
-                "currency": "USD",
+                "currency": "ARS",
                 "content_type": "product"
             }
         
