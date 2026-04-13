@@ -895,7 +895,7 @@ const AdminLeadModal = ({ lead, lines, onClose, onUpdate }) => {
               await api.post(`/crm/leads/${leadId}/classify`, {
                 status, send_to_meta: true,
                 conversion_value: conversionValue,
-                currency: 'USD'
+                currency: 'ARS'
               });
               toast.success(`✅ ${STATUS_CONFIG[status]?.label}`);
               onUpdate();
@@ -1048,7 +1048,7 @@ export default function LeadsCRM() {
       await api.post(`/crm/leads/${leadId}/classify`, {
         status, send_to_meta: true,
         conversion_value: conversionValue,
-        currency: 'USD'
+        currency: 'ARS'
       });
       toast.success(`✅ ${STATUS_CONFIG[status]?.label}`);
       setLeads(prev => prev.map(l => l.id === leadId ? { ...l, status } : l));
