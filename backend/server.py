@@ -2955,14 +2955,14 @@ class CRMMessageCreate(BaseModel):
 class CRMReceiptValidation(BaseModel):
     status: str  # "approved" or "rejected"
     amount: Optional[float] = None
-    currency: Optional[str] = "USD"
+    currency: Optional[str] = "ARS"
     admin_notes: Optional[str] = ""
 
 class CRMLeadClassify(BaseModel):
     status: str  # basura, curioso, interesado, potencial, cliente_real
     send_to_meta: bool = True
     conversion_value: Optional[float] = None
-    currency: Optional[str] = "USD"
+    currency: Optional[str] = "ARS"
 
 # ─── Meta Conversions API Helper ───────────────────────────────────
 
@@ -4002,7 +4002,7 @@ async def crm_classify_lead(
         if data.status == "valido":
             # Send Purchase event for valid customers
             purchase_value = float(data.conversion_value) if data.conversion_value else 0.0
-            purchase_currency = data.currency or "USD"
+            purchase_currency = data.currency or "ARS"
             custom_data = {
                 "currency": purchase_currency,
                 "value": purchase_value,
@@ -4602,7 +4602,7 @@ async def crm_leads_by_source(current_user=Depends(get_current_user)):
 async def crm_send_conversion_to_meta(
     lead_id: str,
     value: float = Query(0, description="Conversion value"),
-    currency: str = Query("USD", description="Currency code"),
+    currency: str = Query("ARS", description="Currency code"),
     current_user=Depends(get_current_user)
 ):
     """
@@ -4639,7 +4639,7 @@ async def crm_send_conversion_to_meta(
         )
     
     purchase_value = float(value) if value else 0.0
-    purchase_currency = currency or "USD"
+    purchase_currency = currency or "ARS"
     custom_data = {
         "currency": purchase_currency,
         "value": purchase_value,
