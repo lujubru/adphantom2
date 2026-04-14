@@ -254,11 +254,35 @@ def generate_short_code(length=7) -> str:
 def get_client_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
+        # x-forwarded-for can carry multiple IPs; take the first (original client)
         return forwarded.split(",")[0].strip()
     real_ip = request.headers.get("x-real-ip")
     if real_ip:
         return real_ip
+    # cf-connecting-ipv6 is sent by Cloudflare when client connects over IPv6
+    cf_ipv6 = request.headers.get("cf-connecting-ipv6")
+    if cf_ipv6:
+        return cf_ipv6
     return request.client.host if request.client else "0.0.0.0"
+
+def normalize_ip_for_meta(ip: str) -> str:
+    """
+    Meta prefers IPv6. If we have a plain IPv4 address, map it to
+    IPv4-mapped IPv6 notation (::ffff:x.x.x.x) so Meta can use it for
+    better event matching. Pure IPv6 addresses are returned unchanged.
+    """
+    if not ip or ip in ("0.0.0.0", "unknown"):
+        return ip
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(ip)
+        if isinstance(addr, ipaddress.IPv4Address):
+            # Map to IPv4-mapped IPv6: ::ffff:x.x.x.x
+            return str(ipaddress.IPv6Address(f"::ffff:{ip}"))
+        # Already IPv6
+        return str(addr)
+    except ValueError:
+        return ip
 
 SAFE_PAGE_HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Página No Encontrada</title>
 <style>body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#1e293b;color:white;}
@@ -2999,7 +3023,7 @@ async def send_meta_conversion_event(
         ua = click_data.get("user_agent") or lead_data.get("user_agent") or lead_data.get("metadata", {}).get("user_agent", "")
         
         if ip:
-            user_data["client_ip_address"] = ip
+            user_data["client_ip_address"] = normalize_ip_for_meta(ip)
         if ua:
             user_data["client_user_agent"] = ua
         
