@@ -2806,11 +2806,15 @@ async def wa_landing_track_wa(request: Request):
         body = await request.json()
         landing_code = body.get("landing_code")
         click_id = body.get("click_id")
+        email = body.get("email", "").strip().lower()
         
-        # Update click record
+        # Update click record — save email if provided
+        update_set = {"wa_clicked": True, "wa_clicked_at": datetime.now(timezone.utc).isoformat()}
+        if email and "@" in email:
+            update_set["email"] = email
         await db.wa_clicks.update_one(
             {"landing_code": landing_code, "click_id": click_id},
-            {"$set": {"wa_clicked": True, "wa_clicked_at": datetime.now(timezone.utc).isoformat()}}
+            {"$set": update_set}
         )
         await db.wa_landings.update_one({"code": landing_code}, {"$inc": {"total_wa_clicks": 1}})
         
@@ -3046,6 +3050,9 @@ _MALE_NAMES = {
     'maximiliano','maxi','lautaro','enzo','thiago','valentino','bruno','leonardo',
     'sebastian','cristian','ezequiel','raul','emiliano','facundo','ignacio','nacho',
     'ivan','damian','hernan','julio','alan','kevin','brian','axel','abel',
+    'franco','joaquin','federico','rodrigo','bautista','santino','benicio','ciro',
+    'benjamin','tobias','gael','dylan','nahuel','braian','jonathan','walter',
+    'ruben','omar','alfredo','victor','cesar','rolando','gerardo','dario',
 }
 _FEMALE_NAMES = {
     'maria','ana','laura','carolina','patricia','andrea','gabriela','claudia','silvia',
@@ -3055,6 +3062,10 @@ _FEMALE_NAMES = {
     'sofia','martina','catalina','virginia','mariana','paola','julia','marta',
     'susana','rosa','elena','alejandra','liliana','graciela','norma','alicia',
     'beatriz','miriam','carmen','celeste','morena','luz','brenda','carina',
+    'valentina','abril','candela','delfina','renata','emilia','alma','bianca',
+    'lara','mia','isabella','josefina','guadalupe','priscila','melina','tamara',
+    'silvana','viviana','noelia','gisela','yanina','karen','jessica','daiana',
+    'yamila','ludmila','oriana','jazmín','jazmin','mailen','ailén','ailen',
 }
 
 def infer_gender_from_name(name: str) -> Optional[str]:
@@ -3180,15 +3191,14 @@ async def send_meta_conversion_event(
             if ln:
                 user_data["ln"] = [hashlib.sha256(ln.encode()).hexdigest()]
         
-        # Email if available — auto-extract from chat messages if not on lead
-        email = lead_data.get("email")
+        # Email — from lead, from click data, or auto-extract from chat as last resort
+        email = lead_data.get("email") or click_data.get("email")
         if not email and lead_data.get("id"):
             email = await extract_email_from_messages(lead_data["id"])
-            if email:
-                # Persist it on the lead for future events
-                await db.crm_leads.update_one({"id": lead_data["id"]}, {"$set": {"email": email}})
-                logger.info(f"Meta CAPI: Auto-detected email '{email}' from chat for lead {lead_data.get('id')}")
         if email:
+            if lead_data.get("id") and not lead_data.get("email"):
+                await db.crm_leads.update_one({"id": lead_data["id"]}, {"$set": {"email": email}})
+                logger.info(f"Meta CAPI: Email '{email}' resolved for lead {lead_data.get('id')}")
             user_data["em"] = [hashlib.sha256(email.lower().strip().encode()).hexdigest()]
         
         # External ID (lead ID for deduplication)
@@ -3748,23 +3758,25 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                     
                     # ── Propagate fingerprint/click data to lead for Meta matching ──
                     # This ensures geo-resolution works when Purchase/LowQuality events fire
-                    if click_id and wa_click and crm_lead and not crm_lead.get("ip_address"):
+                    if click_id and wa_click and crm_lead:
                         fingerprint_data = {}
-                        if wa_click.get("ip"):
+                        if wa_click.get("ip") and not crm_lead.get("ip_address"):
                             fingerprint_data["ip_address"] = wa_click["ip"]
-                        if wa_click.get("user_agent"):
+                        if wa_click.get("user_agent") and not crm_lead.get("user_agent"):
                             fingerprint_data["user_agent"] = wa_click["user_agent"]
-                        if wa_click.get("fbp"):
+                        if wa_click.get("fbp") and not crm_lead.get("fbp"):
                             fingerprint_data["fbp"] = wa_click["fbp"]
-                        if wa_click.get("fbc"):
+                        if wa_click.get("fbc") and not crm_lead.get("fbc"):
                             fingerprint_data["fbc"] = wa_click["fbc"]
-                        if wa_click.get("landing_code"):
+                        if wa_click.get("landing_code") and not crm_lead.get("landing_code"):
                             fingerprint_data["landing_code"] = wa_click["landing_code"]
-                        if wa_click.get("fingerprint_hash"):
+                        if wa_click.get("fingerprint_hash") and not crm_lead.get("fingerprint_hash"):
                             fingerprint_data["fingerprint_hash"] = wa_click["fingerprint_hash"]
+                        if wa_click.get("email") and not crm_lead.get("email"):
+                            fingerprint_data["email"] = wa_click["email"]
                         if fingerprint_data:
                             await db.crm_leads.update_one({"id": crm_lead["id"]}, {"$set": fingerprint_data})
-                            logger.info(f"CRM: Propagated click fingerprint to lead {crm_lead['id']}: {list(fingerprint_data.keys())}")
+                            logger.info(f"CRM: Propagated click data to lead {crm_lead['id']}: {list(fingerprint_data.keys())}")
                     
                     # Add message to CRM lead chat
                     # Add message to CRM lead chat (with deduplication)
