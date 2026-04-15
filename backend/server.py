@@ -2588,7 +2588,7 @@ def build_landing_html(landing: dict, base_url: str = "") -> str:
     pixel_pageview = ""
     pixel_wa_click = ""
     if pixel_id:
-        pixel_script = f'''<!-- Meta Pixel Code -->
+        pixel_script = f'''<!-- Meta Pixel Code with Advanced Matching -->
 <script>
 !function(f,b,e,v,n,t,s)
 {{if(f.fbq)return;n=f.fbq=function(){{n.callMethod?
@@ -2598,7 +2598,8 @@ n.queue=[];t=b.createElement(e);t.async=!0;
 t.src=v;s=b.getElementsByTagName(e)[0];
 s.parentNode.insertBefore(t,s)}}(window, document,'script',
 'https://connect.facebook.net/en_US/fbevents.js');
-fbq('init', '{pixel_id}');
+fbq('init', '{pixel_id}', {{}});
+fbq('set', 'autoConfig', true, '{pixel_id}');
 </script>
 <noscript><img height="1" width="1" style="display:none"
 src="https://www.facebook.com/tr?id={pixel_id}&ev=PageView&noscript=1"/></noscript>
@@ -2608,14 +2609,14 @@ src="https://www.facebook.com/tr?id={pixel_id}&ev=PageView&noscript=1"/></noscri
         if "PageView" in pixel_events:
             pixel_pageview = f"fbq('track', 'PageView');"
         
-        # Lead/Contact event (fires on WhatsApp click)
+        # Lead/Contact event (fires on WhatsApp click) — with eventID for CAPI deduplication
         pixel_wa_click_events = []
         if "Lead" in pixel_events:
-            pixel_wa_click_events.append("fbq('track', 'Lead');")
+            pixel_wa_click_events.append("fbq('track', 'Lead', {{}}, {{eventID: 'Lead_'+clickId+'_'+Math.floor(Date.now()/1000)}});")
         if "Contact" in pixel_events:
-            pixel_wa_click_events.append("fbq('track', 'Contact');")
+            pixel_wa_click_events.append("fbq('track', 'Contact', {{}}, {{eventID: 'Contact_'+clickId+'_'+Math.floor(Date.now()/1000)}});")
         if "InitiateCheckout" in pixel_events:
-            pixel_wa_click_events.append("fbq('track', 'InitiateCheckout');")
+            pixel_wa_click_events.append("fbq('track', 'InitiateCheckout', {{}}, {{eventID: 'InitiateCheckout_'+clickId+'_'+Math.floor(Date.now()/1000)}});")
         pixel_wa_click = "\n".join(pixel_wa_click_events)
 
     reviews_html = ""
