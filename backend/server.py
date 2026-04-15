@@ -5058,6 +5058,129 @@ async def crm_meta_diagnostics(
 
 
 
+# ─── Event Match Quality (EMQ) Dashboard ───────────────────────────
+
+# Meta's approximate weighting for matching parameters
+EMQ_WEIGHTS = {
+    "fbp": 15, "fbc": 15,          # Facebook cookies — highest value
+    "ph": 12,                        # Phone
+    "em": 12,                        # Email
+    "fb_login_id": 10,              # Facebook Login ID
+    "client_ip_address": 8,         # IP address
+    "client_user_agent": 5,         # User agent
+    "fn": 5, "ln": 5,              # First/last name
+    "external_id": 4,              # External ID
+    "ct": 3, "st": 3, "zp": 3,    # City, state, zip
+    "country": 2,                   # Country
+    "ge": 2, "db": 2,             # Gender, DOB
+}
+EMQ_MAX_SCORE = sum(EMQ_WEIGHTS.values())  # 106
+
+def calculate_emq_score(user_data_keys: list) -> dict:
+    """Calculate estimated Event Match Quality score from user_data_keys"""
+    score = sum(EMQ_WEIGHTS.get(k, 0) for k in user_data_keys)
+    pct = round((score / EMQ_MAX_SCORE) * 100) if EMQ_MAX_SCORE > 0 else 0
+    if pct >= 80:
+        quality = "Excelente"
+    elif pct >= 60:
+        quality = "Buena"
+    elif pct >= 40:
+        quality = "Normal"
+    else:
+        quality = "Baja"
+    missing = [k for k, w in sorted(EMQ_WEIGHTS.items(), key=lambda x: -x[1]) if k not in user_data_keys]
+    return {"score": pct, "quality": quality, "params_sent": len(user_data_keys), "missing_params": missing[:5]}
+
+@api_router.get("/crm/emq/dashboard")
+async def crm_emq_dashboard(
+    days: int = Query(30, ge=1, le=90),
+    line_id: Optional[str] = None,
+    current_user=Depends(get_current_user)
+):
+    """Event Match Quality dashboard — shows matching quality for Meta CAPI events"""
+    date_from = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    query = {"created_at": {"$gte": date_from}}
+    if line_id:
+        query["line_id"] = line_id
+
+    # Overall stats
+    total_events = await db.meta_events_log.count_documents(query)
+    success_events = await db.meta_events_log.count_documents({**query, "success": True})
+
+    # Aggregate by event type
+    type_pipeline = [
+        {"$match": query},
+        {"$group": {
+            "_id": "$event_name",
+            "count": {"$sum": 1},
+            "success": {"$sum": {"$cond": [{"$eq": ["$success", True]}, 1, 0]}},
+            "avg_params": {"$avg": "$matching_params_count"},
+            "with_fbp": {"$sum": {"$cond": [{"$eq": ["$has_fbp", True]}, 1, 0]}},
+            "with_fbc": {"$sum": {"$cond": [{"$eq": ["$has_fbc", True]}, 1, 0]}},
+            "with_phone": {"$sum": {"$cond": [{"$eq": ["$has_phone", True]}, 1, 0]}},
+            "with_email": {"$sum": {"$cond": [{"$eq": ["$has_email", True]}, 1, 0]}},
+        }},
+        {"$sort": {"count": -1}},
+    ]
+    by_type = []
+    async for r in db.meta_events_log.aggregate(type_pipeline):
+        total = r["count"]
+        by_type.append({
+            "event": r["_id"],
+            "count": total,
+            "success": r["success"],
+            "success_rate": round(r["success"] / total * 100) if total > 0 else 0,
+            "avg_params": round(r["avg_params"] or 0, 1),
+            "fbp_rate": round(r["with_fbp"] / total * 100) if total > 0 else 0,
+            "fbc_rate": round(r["with_fbc"] / total * 100) if total > 0 else 0,
+            "phone_rate": round(r["with_phone"] / total * 100) if total > 0 else 0,
+            "email_rate": round(r["with_email"] / total * 100) if total > 0 else 0,
+        })
+
+    # Recent events with EMQ score
+    recent = await db.meta_events_log.find(query, {"_id": 0}).sort("created_at", -1).limit(20).to_list(20)
+    recent_with_emq = []
+    for ev in recent:
+        emq = calculate_emq_score(ev.get("user_data_keys", []))
+        recent_with_emq.append({
+            "event": ev.get("event_name"),
+            "lead_name": ev.get("lead_name"),
+            "lead_phone": ev.get("lead_phone"),
+            "success": ev.get("success"),
+            "emq_score": emq["score"],
+            "emq_quality": emq["quality"],
+            "params_sent": emq["params_sent"],
+            "missing": emq["missing_params"],
+            "value": ev.get("value"),
+            "currency": ev.get("currency"),
+            "created_at": ev.get("created_at"),
+        })
+
+    # Average EMQ across all events
+    all_keys_pipeline = [
+        {"$match": query},
+        {"$project": {"user_data_keys": 1}},
+    ]
+    all_scores = []
+    async for ev in db.meta_events_log.aggregate(all_keys_pipeline):
+        keys = ev.get("user_data_keys", [])
+        if keys:
+            emq = calculate_emq_score(keys)
+            all_scores.append(emq["score"])
+    avg_emq = round(sum(all_scores) / len(all_scores)) if all_scores else 0
+
+    return {
+        "period_days": days,
+        "total_events": total_events,
+        "success_events": success_events,
+        "success_rate": round(success_events / total_events * 100) if total_events > 0 else 0,
+        "avg_emq_score": avg_emq,
+        "avg_emq_quality": "Excelente" if avg_emq >= 80 else "Buena" if avg_emq >= 60 else "Normal" if avg_emq >= 40 else "Baja",
+        "by_event_type": by_type,
+        "recent_events": recent_with_emq,
+    }
+
+
 # ─── Health & Root ─────────────────────────────────────────────────
 
 @api_router.get("/health")
