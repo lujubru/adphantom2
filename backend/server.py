@@ -1914,11 +1914,29 @@ async def wa_webhook_receive(request: Request):
                             crm_line = line
                             break
                     
-                    # Find or create CRM lead
-                    crm_lead = await db.crm_leads.find_one({"phone": from_phone})
+                    # Find or create CRM lead — per line, so same phone can exist on multiple lines
+                    target_line_id = crm_line["id"] if crm_line else None
+                    
+                    if target_line_id:
+                        # First try to find lead already assigned to this specific line
+                        crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": target_line_id})
+                        if not crm_lead:
+                            # Check for unassigned lead
+                            crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": None})
+                            if crm_lead:
+                                # Assign unassigned lead to this line
+                                await db.crm_leads.update_one(
+                                    {"id": crm_lead["id"]},
+                                    {"$set": {"line_id": target_line_id, "updated_at": now}}
+                                )
+                                crm_lead["line_id"] = target_line_id
+                            # If lead exists on a DIFFERENT line, crm_lead stays None → new lead created below
+                    else:
+                        # No line matched — find any lead with this phone
+                        crm_lead = await db.crm_leads.find_one({"phone": from_phone})
                     
                     if not crm_lead:
-                        # Create new lead in CRM
+                        # Create new lead in CRM (one per line)
                         lead_id = str(uuid.uuid4())
                         crm_lead = {
                             "id": lead_id,
@@ -1928,7 +1946,7 @@ async def wa_webhook_receive(request: Request):
                             "status": "nuevo",
                             "score": 50,
                             "source": "whatsapp",
-                            "line_id": crm_line["id"] if crm_line else None,
+                            "line_id": target_line_id,
                             "charge_amount": 0.0,
                             "metadata": {
                                 "phone_number_id": phone_number_id,
@@ -1955,7 +1973,6 @@ async def wa_webhook_receive(request: Request):
                                 access_token=crm_line["meta_access_token"],
                                 pixel_id=crm_line["meta_pixel_id"]
                             )
-                            # Log event
                             await db.crm_leads.update_one(
                                 {"id": lead_id},
                                 {"$push": {"meta_events_sent": {
@@ -1975,12 +1992,9 @@ async def wa_webhook_receive(request: Request):
                         }
                         if sender_name and not crm_lead.get("name"):
                             update_fields["name"] = sender_name
-                        # If lead has no line but we found one, assign it
-                        if not crm_lead.get("line_id") and crm_line:
-                            update_fields["line_id"] = crm_line["id"]
                         
                         await db.crm_leads.update_one(
-                            {"phone": from_phone},
+                            {"id": crm_lead["id"]},
                             {"$set": update_fields}
                         )
                     
@@ -2947,6 +2961,13 @@ class CRMLeadUpdate(BaseModel):
     notes: Optional[str] = None
     tags: Optional[List[str]] = None
     charge_amount: Optional[float] = None  # Monto de carga
+    # Meta matching fields
+    city: Optional[str] = None       # ct - ciudad
+    state: Optional[str] = None      # st - provincia/estado
+    zip_code: Optional[str] = None   # zp - código postal
+    gender: Optional[str] = None     # ge - 'm' o 'f'
+    dob: Optional[str] = None        # db - fecha nacimiento YYYYMMDD
+    fb_login_id: Optional[str] = None  # Facebook Login ID
 
 class CRMMessageCreate(BaseModel):
     content: str
@@ -2965,6 +2986,92 @@ class CRMLeadClassify(BaseModel):
     currency: Optional[str] = "ARS"
 
 # ─── Meta Conversions API Helper ───────────────────────────────────
+
+# ── Auto-resolve geo data from IP ───────────────────────────────────
+
+_geo_cache = {}  # Simple in-memory cache for IP geo lookups
+
+async def resolve_geo_from_ip(ip: str) -> dict:
+    """Resolve city, state, zip, country from IP using ip-api.com (free, no key needed)"""
+    if not ip or ip in ("0.0.0.0", "unknown", "127.0.0.1", "::1"):
+        return {}
+    # Check cache first
+    if ip in _geo_cache:
+        return _geo_cache[ip]
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            resp = await c.get(f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,region,regionName,city,zip")
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "success":
+                    result = {
+                        "city": data.get("city", ""),
+                        "state": data.get("regionName", ""),
+                        "state_code": data.get("region", ""),
+                        "zip": data.get("zip", ""),
+                        "country_code": data.get("countryCode", "").lower(),
+                    }
+                    _geo_cache[ip] = result
+                    return result
+    except Exception as e:
+        logger.debug(f"Geo resolve failed for {ip}: {e}")
+    return {}
+
+# ── Auto-extract email from chat messages ───────────────────────────
+
+async def extract_email_from_messages(lead_id: str) -> Optional[str]:
+    """Scan lead's chat messages for email patterns"""
+    messages = await db.crm_messages.find(
+        {"lead_id": lead_id, "sender": "lead"},
+        {"_id": 0, "content": 1}
+    ).sort("created_at", -1).limit(50).to_list(50)
+    
+    email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            match = email_pattern.search(content)
+            if match:
+                return match.group(0).lower().strip()
+    return None
+
+# ── Auto-infer gender from first name (Spanish common names) ────────
+
+_MALE_NAMES = {
+    'juan','carlos','jose','luis','jorge','pedro','miguel','angel','rafael','francisco',
+    'daniel','mario','david','fernando','ricardo','eduardo','pablo','andres','sergio',
+    'diego','alejandro','roberto','gabriel','nicolas','martin','santiago','gonzalo',
+    'matias','marcos','lucas','tomas','agustin','leandro','mauro','ariel','fabian',
+    'ramon','hector','alberto','oscar','hugo','gustavo','nestor','marcelo','claudio',
+    'maximiliano','maxi','lautaro','enzo','thiago','valentino','bruno','leonardo',
+    'sebastian','cristian','ezequiel','raul','emiliano','facundo','ignacio','nacho',
+    'ivan','damian','hernan','julio','alan','kevin','brian','axel','abel',
+}
+_FEMALE_NAMES = {
+    'maria','ana','laura','carolina','patricia','andrea','gabriela','claudia','silvia',
+    'monica','cecilia','florencia','valeria','fernanda','daniela','paula','lucia',
+    'romina','natalia','vanesa','vanessa','lorena','marina','soledad','julieta',
+    'camila','micaela','agustina','victoria','sol','rocio','milagros','pilar',
+    'sofia','martina','catalina','virginia','mariana','paola','julia','marta',
+    'susana','rosa','elena','alejandra','liliana','graciela','norma','alicia',
+    'beatriz','miriam','carmen','celeste','morena','luz','brenda','carina',
+}
+
+def infer_gender_from_name(name: str) -> Optional[str]:
+    """Try to infer gender from first name using common Argentine/Spanish names"""
+    if not name or name.startswith("Lead "):
+        return None
+    first_name = name.strip().split()[0].lower()
+    # Remove accents for matching
+    import unicodedata
+    first_name = ''.join(
+        c for c in unicodedata.normalize('NFD', first_name) if unicodedata.category(c) != 'Mn'
+    )
+    if first_name in _MALE_NAMES:
+        return 'm'
+    if first_name in _FEMALE_NAMES:
+        return 'f'
+    return None
 
 async def send_meta_conversion_event(
     event_name: str,
@@ -3015,6 +3122,24 @@ async def send_meta_conversion_event(
             if wa_click:
                 click_data = wa_click
         
+        # Fallback: try wa_contacts which also stores click/fingerprint data
+        if not click_data and lead_data.get("phone"):
+            phone_clean = re.sub(r'\D', '', lead_data["phone"])[-10:]
+            wa_contact = await db.wa_contacts.find_one(
+                {"phone": {"$regex": phone_clean}},
+                {"_id": 0},
+                sort=[("created_at", -1)]
+            )
+            if wa_contact:
+                # wa_contacts may have click_ip, fbp, fbc from fingerprint tracking
+                click_data = {
+                    "ip": wa_contact.get("click_ip") or wa_contact.get("ip"),
+                    "user_agent": wa_contact.get("user_agent", ""),
+                    "fbp": wa_contact.get("fbp", ""),
+                    "fbc": wa_contact.get("fbc", ""),
+                    "landing_code": wa_contact.get("landing_code", ""),
+                }
+        
         # Build user data with all available info
         user_data = {}
         
@@ -3055,8 +3180,14 @@ async def send_meta_conversion_event(
             if ln:
                 user_data["ln"] = [hashlib.sha256(ln.encode()).hexdigest()]
         
-        # Email if available
+        # Email if available — auto-extract from chat messages if not on lead
         email = lead_data.get("email")
+        if not email and lead_data.get("id"):
+            email = await extract_email_from_messages(lead_data["id"])
+            if email:
+                # Persist it on the lead for future events
+                await db.crm_leads.update_one({"id": lead_data["id"]}, {"$set": {"email": email}})
+                logger.info(f"Meta CAPI: Auto-detected email '{email}' from chat for lead {lead_data.get('id')}")
         if email:
             user_data["em"] = [hashlib.sha256(email.lower().strip().encode()).hexdigest()]
         
@@ -3064,8 +3195,65 @@ async def send_meta_conversion_event(
         if lead_data.get("id"):
             user_data["external_id"] = [hashlib.sha256(lead_data["id"].encode()).hexdigest()]
         
-        # Country code (helps with matching)
-        user_data["country"] = [hashlib.sha256("ar".encode()).hexdigest()]  # Argentina
+        # ── AUTO-RESOLVE GEO DATA FROM IP (city, state, zip, country) ──
+        # This runs automatically so cajeros don't need to fill anything
+        geo_data = {}
+        if ip:
+            geo_data = await resolve_geo_from_ip(ip)
+        
+        # Country — use geo-resolved or fallback to "ar" (Argentina)
+        country_code = lead_data.get("country_code") or geo_data.get("country_code") or "ar"
+        user_data["country"] = [hashlib.sha256(country_code.lower().encode()).hexdigest()]
+        
+        # fb_login_id — NOT hashed, sent as-is
+        fb_login_id = lead_data.get("fb_login_id") or click_data.get("fb_login_id")
+        if fb_login_id:
+            user_data["fb_login_id"] = fb_login_id
+        
+        # City (ct) — from lead, or auto-resolved from IP
+        city = lead_data.get("city") or geo_data.get("city")
+        if city:
+            user_data["ct"] = [hashlib.sha256(city.lower().strip().encode()).hexdigest()]
+        
+        # State (st) — from lead, or auto-resolved from IP
+        state = lead_data.get("state") or geo_data.get("state")
+        if state:
+            user_data["st"] = [hashlib.sha256(state.lower().strip().encode()).hexdigest()]
+        
+        # Zip code (zp) — from lead, or auto-resolved from IP
+        zip_code = lead_data.get("zip_code") or geo_data.get("zip")
+        if zip_code:
+            user_data["zp"] = [hashlib.sha256(str(zip_code).strip().encode()).hexdigest()]
+        
+        # Gender (ge) — from lead, or auto-inferred from name
+        gender = lead_data.get("gender")
+        if not gender:
+            gender = infer_gender_from_name(lead_data.get("name", ""))
+        if gender and gender.lower() in ('m', 'f', 'male', 'female'):
+            ge = 'm' if gender.lower() in ('m', 'male') else 'f'
+            user_data["ge"] = [hashlib.sha256(ge.encode()).hexdigest()]
+        
+        # Date of birth (db) — from lead only (can't auto-detect)
+        dob = lead_data.get("dob")
+        if dob:
+            dob_clean = str(dob).replace("-", "").strip()
+            if len(dob_clean) == 8 and dob_clean.isdigit():
+                user_data["db"] = [hashlib.sha256(dob_clean.encode()).hexdigest()]
+        
+        # Persist auto-resolved data on the lead for future events
+        if lead_data.get("id"):
+            auto_update = {}
+            if city and not lead_data.get("city"):
+                auto_update["city"] = city
+            if state and not lead_data.get("state"):
+                auto_update["state"] = state
+            if zip_code and not lead_data.get("zip_code"):
+                auto_update["zip_code"] = str(zip_code)
+            if gender and not lead_data.get("gender"):
+                auto_update["gender"] = gender
+            if auto_update:
+                await db.crm_leads.update_one({"id": lead_data["id"]}, {"$set": auto_update})
+                logger.info(f"Meta CAPI: Auto-resolved for lead {lead_data.get('id')}: {list(auto_update.keys())}")
         
         # Generate unique event_id for deduplication
         event_id = f"{event_name}_{lead_data.get('id', 'unknown')}_{int(time.time())}"
@@ -3156,6 +3344,9 @@ async def send_meta_conversion_event(
                     "has_fbp": bool(fbp),
                     "has_fbc": bool(fbc),
                     "has_phone": bool(phone),
+                    "has_email": bool(email),
+                    "has_fb_login_id": bool(fb_login_id),
+                    "matching_params_count": len(user_data),
                     "user_data_keys": list(user_data.keys()),
                     "source": lead_data.get("source", ""),
                     "landing_code": lead_data.get("landing_code") or click_data.get("landing_code"),
@@ -3399,7 +3590,7 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                     click_match = re.search(r'\(ID:\s*([A-Z0-9]+)\)', text)
                     if click_match:
                         click_id = click_match.group(1)
-                        # Find the wa_click to get utm_content (ad source)
+                        # Find the wa_click to get utm_content (ad source) and fingerprint data
                         wa_click = await db.wa_clicks.find_one({"click_id": click_id})
                         if wa_click:
                             utm_content = wa_click.get("utm_content", "")
@@ -3421,49 +3612,73 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                     
                     # Check for Meta Ads referral data (Click-to-WhatsApp ads)
                     # Meta sends this when user clicks on a CTWA ad
+                    ctwa_clid = None
+                    fb_login_id = None
                     if msg.get("referral"):
                         referral_data = msg.get("referral", {})
                         # referral contains: source_url, source_id, source_type, headline, body, media_type, image_url, video_url, thumbnail_url, ctwa_clid
                         ad_source = ad_source or referral_data.get("source_id") or referral_data.get("headline") or "meta_ad"
                         utm_content = utm_content or referral_data.get("source_id", "")
-                        logger.info(f"CRM: Message from Meta Ad - source_id: {referral_data.get('source_id')}, headline: {referral_data.get('headline')}")
+                        ctwa_clid = referral_data.get("ctwa_clid")
+                        # fb_login_id may come in referral or context
+                        fb_login_id = referral_data.get("fb_login_id")
+                        logger.info(f"CRM: Message from Meta Ad - source_id: {referral_data.get('source_id')}, headline: {referral_data.get('headline')}, ctwa_clid: {ctwa_clid}")
                     
-                    # Also check context for referral (some API versions send it here)
-                    if msg.get("context", {}).get("referred_product"):
+                    # Also check context for fb_login_id and referral
+                    msg_context = msg.get("context", {})
+                    if msg_context.get("referred_product"):
                         referral_data = referral_data or {}
-                        referral_data["referred_product"] = msg.get("context", {}).get("referred_product")
+                        referral_data["referred_product"] = msg_context.get("referred_product")
                         ad_source = ad_source or "product_ad"
+                    if msg_context.get("fb_login_id") and not fb_login_id:
+                        fb_login_id = msg_context.get("fb_login_id")
 
-                    # Find or create CRM lead for this line
+                    # Find or create CRM lead for this SPECIFIC line
+                    # Each line has its own independent lead/conversation per phone number
                     crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": line_id})
                     
                     if not crm_lead:
-                        # Also check if lead exists without line assignment
-                        crm_lead = await db.crm_leads.find_one({"phone": from_phone})
+                        # Check if there's an unassigned lead (no line_id) we can claim
+                        unassigned_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": None})
                         
-                        if crm_lead and not crm_lead.get("line_id"):
-                            # Assign existing lead to this line
+                        if unassigned_lead:
+                            # Assign existing unassigned lead to this line
                             update_fields = {"line_id": line_id, "updated_at": now}
-                            # Also update ad_source if not set and we have one
-                            if ad_source and not crm_lead.get("ad_source"):
+                            if ad_source and not unassigned_lead.get("ad_source"):
                                 update_fields["ad_source"] = ad_source
                                 update_fields["utm_content"] = utm_content
                                 update_fields["click_id"] = click_id
                             await db.crm_leads.update_one(
-                                {"id": crm_lead["id"]},
+                                {"id": unassigned_lead["id"]},
                                 {"$set": update_fields}
                             )
+                            crm_lead = unassigned_lead
                             crm_lead["line_id"] = line_id
+                        # NOTE: If lead exists on a DIFFERENT line, crm_lead stays None
+                        # so a NEW lead will be created for THIS line below
                     
                     # Update ad_source if lead exists but doesn't have ad tracking
                     if crm_lead and ad_source and not crm_lead.get("ad_source"):
                         update_data = {"ad_source": ad_source, "utm_content": utm_content, "click_id": click_id}
                         if referral_data:
                             update_data["referral"] = referral_data
+                        if ctwa_clid:
+                            update_data["ctwa_clid"] = ctwa_clid
+                        if fb_login_id:
+                            update_data["fb_login_id"] = fb_login_id
                         await db.crm_leads.update_one(
                             {"id": crm_lead["id"]},
                             {"$set": update_data}
                         )
+                    # Also update fb_login_id/ctwa_clid even if ad_source already set
+                    elif crm_lead and (fb_login_id or ctwa_clid):
+                        fb_update = {}
+                        if fb_login_id and not crm_lead.get("fb_login_id"):
+                            fb_update["fb_login_id"] = fb_login_id
+                        if ctwa_clid and not crm_lead.get("ctwa_clid"):
+                            fb_update["ctwa_clid"] = ctwa_clid
+                        if fb_update:
+                            await db.crm_leads.update_one({"id": crm_lead["id"]}, {"$set": fb_update})
                     
                     if not crm_lead:
                         # Create new lead
@@ -3481,6 +3696,8 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                             "ad_source": ad_source,
                             "utm_content": utm_content,
                             "click_id": click_id,
+                            "ctwa_clid": ctwa_clid,
+                            "fb_login_id": fb_login_id,
                             "referral": referral_data,  # Store full referral data from Meta Ads
                             "metadata": {
                                 "phone_number_id": phone_number_id,
@@ -3528,6 +3745,26 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                             update_fields["name"] = sender_name
                         
                         await db.crm_leads.update_one({"id": crm_lead["id"]}, {"$set": update_fields})
+                    
+                    # ── Propagate fingerprint/click data to lead for Meta matching ──
+                    # This ensures geo-resolution works when Purchase/LowQuality events fire
+                    if click_id and wa_click and crm_lead and not crm_lead.get("ip_address"):
+                        fingerprint_data = {}
+                        if wa_click.get("ip"):
+                            fingerprint_data["ip_address"] = wa_click["ip"]
+                        if wa_click.get("user_agent"):
+                            fingerprint_data["user_agent"] = wa_click["user_agent"]
+                        if wa_click.get("fbp"):
+                            fingerprint_data["fbp"] = wa_click["fbp"]
+                        if wa_click.get("fbc"):
+                            fingerprint_data["fbc"] = wa_click["fbc"]
+                        if wa_click.get("landing_code"):
+                            fingerprint_data["landing_code"] = wa_click["landing_code"]
+                        if wa_click.get("fingerprint_hash"):
+                            fingerprint_data["fingerprint_hash"] = wa_click["fingerprint_hash"]
+                        if fingerprint_data:
+                            await db.crm_leads.update_one({"id": crm_lead["id"]}, {"$set": fingerprint_data})
+                            logger.info(f"CRM: Propagated click fingerprint to lead {crm_lead['id']}: {list(fingerprint_data.keys())}")
                     
                     # Add message to CRM lead chat
                     # Add message to CRM lead chat (with deduplication)
@@ -5132,6 +5369,7 @@ async def startup():
     await db.crm_leads.create_index("status")
     await db.crm_leads.create_index("created_at")
     await db.crm_leads.create_index("phone")
+    await db.crm_leads.create_index([("phone", 1), ("line_id", 1)])
     await db.crm_messages.create_index("lead_id")
     await db.crm_messages.create_index("created_at")
     await db.crm_receipts.create_index("id", unique=True)
