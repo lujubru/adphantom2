@@ -2612,11 +2612,11 @@ src="https://www.facebook.com/tr?id={pixel_id}&ev=PageView&noscript=1"/></noscri
         # Lead/Contact event (fires on WhatsApp click) — with eventID for CAPI deduplication
         pixel_wa_click_events = []
         if "Lead" in pixel_events:
-            pixel_wa_click_events.append("fbq('track', 'Lead', {{}}, {{eventID: 'Lead_'+clickId+'_'+Math.floor(Date.now()/1000)}});")
+            pixel_wa_click_events.append("fbq('track','Lead',{},{eventID:'Lead_'+clickId+'_'+Math.floor(Date.now()/1000)});")
         if "Contact" in pixel_events:
-            pixel_wa_click_events.append("fbq('track', 'Contact', {{}}, {{eventID: 'Contact_'+clickId+'_'+Math.floor(Date.now()/1000)}});")
+            pixel_wa_click_events.append("fbq('track','Contact',{},{eventID:'Contact_'+clickId+'_'+Math.floor(Date.now()/1000)});")
         if "InitiateCheckout" in pixel_events:
-            pixel_wa_click_events.append("fbq('track', 'InitiateCheckout', {{}}, {{eventID: 'InitiateCheckout_'+clickId+'_'+Math.floor(Date.now()/1000)}});")
+            pixel_wa_click_events.append("fbq('track','InitiateCheckout',{},{eventID:'InitiateCheckout_'+clickId+'_'+Math.floor(Date.now()/1000)});")
         pixel_wa_click = "\n".join(pixel_wa_click_events)
 
     reviews_html = ""
