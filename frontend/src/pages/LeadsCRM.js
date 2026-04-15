@@ -643,16 +643,6 @@ const ChatPanel = ({ lead, onStatusChange, onClose, showCloseButton = false, use
   const [sending, setSending] = useState(false);
   const [conversionValue, setConversionValue] = useState('');
   const [showConversionInput, setShowConversionInput] = useState(false);
-  const [showMetaFields, setShowMetaFields] = useState(false);
-  const [metaFields, setMetaFields] = useState({
-    email: lead.email || '',
-    city: lead.city || '',
-    state: lead.state || '',
-    zip_code: lead.zip_code || '',
-    gender: lead.gender || '',
-    dob: lead.dob || '',
-  });
-  const [savingMeta, setSavingMeta] = useState(false);
   const messagesEndRef = useRef(null);
 
   const loadMessages = useCallback(async () => {
@@ -740,23 +730,6 @@ Le envio nuestros datos de cuenta 👇`;
     } catch { toast.error('Error enviando datos de usuario'); }
   };
 
-  const saveMetaFields = async () => {
-    setSavingMeta(true);
-    try {
-      const payload = {};
-      if (metaFields.email) payload.email = metaFields.email;
-      if (metaFields.city) payload.city = metaFields.city;
-      if (metaFields.state) payload.state = metaFields.state;
-      if (metaFields.zip_code) payload.zip_code = metaFields.zip_code;
-      if (metaFields.gender) payload.gender = metaFields.gender;
-      if (metaFields.dob) payload.dob = metaFields.dob;
-      await api.put(`/crm/leads/${lead.id}`, payload);
-      toast.success('Datos de matching guardados');
-      setShowMetaFields(false);
-    } catch { toast.error('Error guardando datos'); }
-    finally { setSavingMeta(false); }
-  };
-
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
@@ -799,53 +772,6 @@ Le envio nuestros datos de cuenta 👇`;
           <Button size="sm" variant="outline" onClick={() => { setShowConversionInput(false); setConversionValue(''); }} className="border-slate-600 h-8 text-xs">Cancelar</Button>
         </div>
       )}
-
-      {/* Meta Matching Data - Auto-detected info display */}
-      <div className="border-b border-slate-800">
-        <button
-          onClick={() => setShowMetaFields(o => !o)}
-          className="w-full px-4 py-1.5 flex items-center justify-between hover:bg-slate-800/30 transition-colors"
-          data-testid="meta-matching-toggle"
-        >
-          <span className="text-[10px] text-slate-500 flex items-center gap-1.5">
-            <Zap className="w-3 h-3" /> Datos Meta (auto)
-            {(lead.email || lead.city || lead.fb_login_id) && <Check className="w-3 h-3 text-emerald-400" />}
-          </span>
-          <ChevronDown className={`w-3 h-3 text-slate-500 transition-transform ${showMetaFields ? 'rotate-180' : ''}`} />
-        </button>
-        {showMetaFields && (
-          <div className="px-4 pb-3 space-y-2" data-testid="meta-matching-panel">
-            <p className="text-[10px] text-slate-500">Se resuelven del IP y chat al clasificar. Podés corregir manualmente:</p>
-            <div className="grid grid-cols-2 gap-2">
-              <Input placeholder="Email" value={metaFields.email} onChange={e => setMetaFields({...metaFields, email: e.target.value})}
-                className="bg-slate-800 border-slate-700 text-white text-xs h-7" data-testid="meta-email" />
-              <Input placeholder="Ciudad" value={metaFields.city} onChange={e => setMetaFields({...metaFields, city: e.target.value})}
-                className="bg-slate-800 border-slate-700 text-white text-xs h-7" data-testid="meta-city" />
-            </div>
-            <div className="grid grid-cols-3 gap-2">
-              <Input placeholder="Provincia" value={metaFields.state} onChange={e => setMetaFields({...metaFields, state: e.target.value})}
-                className="bg-slate-800 border-slate-700 text-white text-xs h-7" data-testid="meta-state" />
-              <Input placeholder="Cód. Postal" value={metaFields.zip_code} onChange={e => setMetaFields({...metaFields, zip_code: e.target.value})}
-                className="bg-slate-800 border-slate-700 text-white text-xs h-7" data-testid="meta-zip" />
-              <select value={metaFields.gender} onChange={e => setMetaFields({...metaFields, gender: e.target.value})}
-                className="bg-slate-800 border border-slate-700 rounded-md px-2 text-white text-xs h-7" data-testid="meta-gender">
-                <option value="">Género</option>
-                <option value="m">Masculino</option>
-                <option value="f">Femenino</option>
-              </select>
-            </div>
-            <div className="flex items-center gap-2">
-              <Button size="sm" onClick={saveMetaFields} disabled={savingMeta} className="bg-blue-600 hover:bg-blue-700 text-xs h-7 px-3" data-testid="meta-save-btn">
-                {savingMeta ? '...' : 'Guardar'}
-              </Button>
-              <span className="text-[10px] text-slate-500 flex-1">Solo si necesitás corregir datos auto-detectados</span>
-            </div>
-            {lead.fb_login_id && (
-              <p className="text-[10px] text-emerald-400 flex items-center gap-1"><Check className="w-3 h-3" /> fb_login_id detectado</p>
-            )}
-          </div>
-        )}
-      </div>
 
       {/* Bienvenida button bar */}
       <div className="px-4 py-2 border-b border-slate-800 bg-slate-800/30 flex items-center gap-2">
