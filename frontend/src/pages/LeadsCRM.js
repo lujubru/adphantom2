@@ -1334,10 +1334,9 @@ export default function LeadsCRM() {
 
       {/* Main content */}
       <div className="max-w-[1800px] mx-auto flex gap-6">
-        {/* Sidebar - Lines + Ad Performance */}
+        {/* Sidebar - Lines */}
         <div className="w-80 flex-shrink-0 space-y-4">
           <LinesManager lines={lines} onRefresh={loadLines} onSelectLine={setSelectedLineId} selectedLineId={selectedLineId} />
-          <AdPerformanceDashboard lineId={selectedLineId} />
         </div>
 
         {/* Kanban */}

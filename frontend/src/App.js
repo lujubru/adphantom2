@@ -18,6 +18,7 @@ import WALandingForensics from '@/pages/WALandingForensics';
 import LeadsCRM from '@/pages/LeadsCRM';
 import UserManagement from '@/pages/UserManagement';
 import MetaDiagnostics from '@/pages/MetaDiagnostics';
+import MetaInsights from '@/pages/MetaInsights';
 import '@/App.css';
 
 function App() {
@@ -43,6 +44,7 @@ function App() {
               <Route path="leads-crm" element={<LeadsCRM />} />
               <Route path="user-management" element={<UserManagement />} />
               <Route path="meta-diagnostics" element={<MetaDiagnostics />} />
+              <Route path="meta-insights" element={<MetaInsights />} />
             </Route>
           </Routes>
         </BrowserRouter>
