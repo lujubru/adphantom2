@@ -2021,12 +2021,14 @@ async def wa_webhook_receive(request: Request):
                     
                     # ═══════════════════════════════════════════════════════════════
 
-                    # Try to correlate click_id from message text
+                    # Try to correlate click_id from message text (tolerant regex)
+                    # Accepts: "(ID: ABC12)", "(id:abc12)", "ID: ABC12", "id abc12", etc.
                     import re as re_mod
-                    id_match = re_mod.search(r'\(ID:\s*([A-Z0-9]{5})\)', text)
-                    id_match = re_mod.search(r'\(ID:\s*([A-Z0-9]{5})\)', text)
+                    id_match = re_mod.search(
+                        r'(?i)ID[:\s]*([A-Z0-9]{5,8})', text
+                    )
                     if id_match:
-                        click_id = id_match.group(1)
+                        click_id = id_match.group(1).upper()
                         click_data = await db.wa_clicks.find_one({"click_id": click_id}, {"_id": 0})
                         if click_data:
                             await db.wa_contacts.update_one(
@@ -2055,6 +2057,50 @@ async def wa_webhook_receive(request: Request):
                                     "ip_address": click_data.get("ip", ""),
                                     "user_agent": click_data.get("user_agent", ""),
                                 }}
+                            )
+
+                    # ═══ Meta Click-to-WhatsApp Ads referral capture ═══
+                    # When user comes from a CTWA Ad, msg.referral contains:
+                    # source_url, source_id, source_type, headline, body, ctwa_clid
+                    # This data PERSISTS even if user deletes the prefilled message.
+                    referral_data = msg.get("referral")
+                    msg_context = msg.get("context", {}) or {}
+                    ctwa_clid = None
+                    ad_source = None
+                    utm_content = None
+                    fb_login_id = None
+                    if referral_data:
+                        ctwa_clid = referral_data.get("ctwa_clid")
+                        ad_source = referral_data.get("source_id") or referral_data.get("headline") or "meta_ad"
+                        utm_content = referral_data.get("source_id", "")
+                        fb_login_id = referral_data.get("fb_login_id")
+                        logger.info(
+                            f"WA webhook (legacy): CTWA ad referral captured | phone={from_phone} | "
+                            f"source_id={referral_data.get('source_id')} | ctwa_clid={ctwa_clid}"
+                        )
+                    if msg_context.get("fb_login_id") and not fb_login_id:
+                        fb_login_id = msg_context.get("fb_login_id")
+
+                    if ctwa_clid or ad_source or fb_login_id or referral_data:
+                        lead_fb_update = {}
+                        if ctwa_clid:
+                            lead_fb_update["ctwa_clid"] = ctwa_clid
+                        if ad_source:
+                            lead_fb_update["ad_source"] = ad_source
+                        if utm_content:
+                            lead_fb_update["utm_content"] = utm_content
+                        if fb_login_id:
+                            lead_fb_update["fb_login_id"] = fb_login_id
+                        if referral_data:
+                            lead_fb_update["referral"] = referral_data
+                        if lead_fb_update:
+                            await db.crm_leads.update_one(
+                                {"phone": from_phone},
+                                {"$set": lead_fb_update}
+                            )
+                            await db.wa_contacts.update_one(
+                                {"phone": from_phone},
+                                {"$set": lead_fb_update}
                             )
 
                     # Auto-reply for new contacts
@@ -3168,6 +3214,13 @@ async def send_meta_conversion_event(
         fbp = click_data.get("fbp") or lead_data.get("fbp")
         fbc = click_data.get("fbc") or lead_data.get("fbc")
         
+        # If no fbc available, build one from ctwa_clid (Meta Click-to-WhatsApp Ads)
+        # Meta recommends: fbc = "fb.1.{timestamp_ms}.{ctwa_clid}"
+        ctwa_clid = lead_data.get("ctwa_clid") or click_data.get("ctwa_clid")
+        if not fbc and ctwa_clid:
+            fbc = f"fb.1.{int(time.time() * 1000)}.{ctwa_clid}"
+            logger.info(f"Meta CAPI: built fbc from ctwa_clid for lead {lead_data.get('id')}")
+        
         if fbp:
             user_data["fbp"] = fbp
         if fbc:
@@ -3300,7 +3353,16 @@ async def send_meta_conversion_event(
             if event_name == "Purchase":
                 raw_value = custom_data.get("value", 0)
                 custom_data["value"] = float(raw_value) if raw_value else 0.0
-                custom_data["currency"] = custom_data.get("currency", "ARS")
+                # FORCE currency=ARS for all Purchase events regardless of payload.
+                # This guarantees no stale frontend cache or external webhook can
+                # send Purchase in USD/MXN/etc. Single source of truth.
+                incoming_currency = custom_data.get("currency")
+                if incoming_currency and incoming_currency != "ARS":
+                    logger.warning(
+                        f"Meta CAPI >> Overriding Purchase currency '{incoming_currency}' -> 'ARS' "
+                        f"| lead={lead_data.get('id', '?')}"
+                    )
+                custom_data["currency"] = "ARS"
                 # Add content_type for better optimization
                 if "content_type" not in custom_data:
                     custom_data["content_type"] = "product"
@@ -3361,6 +3423,9 @@ async def send_meta_conversion_event(
                     "user_data_keys": list(user_data.keys()),
                     "source": lead_data.get("source", ""),
                     "landing_code": lead_data.get("landing_code") or click_data.get("landing_code"),
+                    "ctwa_clid": lead_data.get("ctwa_clid") or click_data.get("ctwa_clid"),
+                    "ad_source": lead_data.get("ad_source"),
+                    "utm_content": lead_data.get("utm_content") or click_data.get("utm_content"),
                     "meta_response": result if not success else {"events_received": result.get("events_received")},
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 })
@@ -3598,9 +3663,10 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                     referral_data = None
                     
                     import re
-                    click_match = re.search(r'\(ID:\s*([A-Z0-9]+)\)', text)
+                    # Tolerant: "(ID: ABC12)", "ID:abc12", "id abc12", etc.
+                    click_match = re.search(r'(?i)ID[:\s]*([A-Z0-9]{5,8})', text)
                     if click_match:
-                        click_id = click_match.group(1)
+                        click_id = click_match.group(1).upper()
                         # Find the wa_click to get utm_content (ad source) and fingerprint data
                         wa_click = await db.wa_clicks.find_one({"click_id": click_id})
                         if wa_click:
@@ -4109,6 +4175,18 @@ async def crm_get_all_leads(
             lead["line_name"] = line["name"] if line else None
             lead["line_type"] = line["line_type"] if line else None
         lead["has_unread_messages"] = lead.get("unread_count", 0) > 0
+        # Attribution flags for quick display in kanban/list (Kommo-style)
+        referral = lead.get("referral") or {}
+        has_ctwa = bool(lead.get("ctwa_clid") or referral.get("ctwa_clid"))
+        has_landing = bool(lead.get("landing_code"))
+        has_utm = bool(lead.get("ad_source") or lead.get("utm_content"))
+        lead["has_ad_attribution"] = has_ctwa or has_landing or has_utm
+        if has_ctwa:
+            lead["ad_badge"] = {"label": "Anuncio Meta", "color": "blue", "source": "ctwa"}
+        elif has_landing:
+            lead["ad_badge"] = {"label": f"Landing {lead.get('landing_code')}", "color": "emerald", "source": "landing"}
+        elif has_utm:
+            lead["ad_badge"] = {"label": lead.get("ad_source") or lead.get("utm_content"), "color": "amber", "source": "utm"}
 
     return {
         "leads": leads,
@@ -4154,6 +4232,102 @@ async def crm_get_lead(lead_id: str, current_user=Depends(get_current_user)):
     if not lead:
         raise HTTPException(status_code=404, detail="Lead no encontrado")
     return lead
+
+@api_router.get("/crm/leads/{lead_id}/ad-preview")
+async def crm_get_lead_ad_preview(lead_id: str, current_user=Depends(get_current_user)):
+    """
+    Returns a normalized ad/landing preview for a lead so the frontend can show
+    Kommo-style ad preview card above the chat.
+
+    Sources (in priority order):
+    1. Meta CTWA referral data (msg.referral from Click-to-WhatsApp Ads)
+    2. Our own landing (wa_landings) matched via landing_code
+    3. UTM tracking data (ad_source/utm_content) as fallback
+    4. None if no attribution available
+    """
+    lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead no encontrado")
+
+    referral = lead.get("referral") or {}
+    landing_code = lead.get("landing_code")
+    ad_source = lead.get("ad_source")
+    utm_content = lead.get("utm_content")
+    ctwa_clid = lead.get("ctwa_clid")
+
+    # 1. Meta CTWA Ad referral — richest source (image, headline, body, etc.)
+    if referral and (referral.get("headline") or referral.get("source_id") or referral.get("image_url") or referral.get("video_url")):
+        media_type = referral.get("media_type") or ("video" if referral.get("video_url") else "image")
+        return {
+            "has_preview": True,
+            "source": "meta_ctwa_ad",
+            "headline": referral.get("headline") or "Anuncio de Meta",
+            "body": referral.get("body") or "",
+            "image_url": referral.get("image_url") or referral.get("thumbnail_url"),
+            "video_url": referral.get("video_url"),
+            "thumbnail_url": referral.get("thumbnail_url"),
+            "media_type": media_type,
+            "source_url": referral.get("source_url"),
+            "source_id": referral.get("source_id"),
+            "ctwa_clid": ctwa_clid,
+            "ad_source": ad_source or referral.get("source_id"),
+            "badge_label": "Click-to-WhatsApp Ad",
+            "badge_color": "blue",
+        }
+
+    # 2. Own landing — use wa_landings config for preview
+    if landing_code:
+        landing = await db.wa_landings.find_one({"code": landing_code}, {"_id": 0})
+        if landing:
+            app_url = os.environ.get("APP_URL", "")
+            preview_url = f"{app_url}/l/{landing_code}" if app_url else None
+            # Pick a representative image — try logo_url, hero_image, bonus_image
+            image_url = (
+                landing.get("logo_url")
+                or landing.get("hero_image")
+                or landing.get("bonus_image")
+                or landing.get("image_url")
+            )
+            headline = landing.get("title") or landing.get("headline") or f"Landing: {landing_code}"
+            body = landing.get("subtitle") or landing.get("description") or landing.get("bonus_text") or ""
+            return {
+                "has_preview": True,
+                "source": "own_landing",
+                "headline": headline,
+                "body": body,
+                "image_url": image_url,
+                "video_url": None,
+                "thumbnail_url": image_url,
+                "media_type": "image",
+                "source_url": preview_url,
+                "source_id": landing_code,
+                "ctwa_clid": ctwa_clid,
+                "ad_source": ad_source or utm_content,
+                "badge_label": f"Landing · {landing_code}",
+                "badge_color": "emerald",
+            }
+
+    # 3. UTM / ad_source fallback — no visual preview, just a badge
+    if ad_source or utm_content or ctwa_clid:
+        return {
+            "has_preview": True,
+            "source": "utm_tracking",
+            "headline": ad_source or utm_content or "Origen de anuncio",
+            "body": "",
+            "image_url": None,
+            "video_url": None,
+            "thumbnail_url": None,
+            "media_type": None,
+            "source_url": None,
+            "source_id": ad_source or utm_content,
+            "ctwa_clid": ctwa_clid,
+            "ad_source": ad_source or utm_content,
+            "badge_label": "Campaña rastreada",
+            "badge_color": "amber",
+        }
+
+    # 4. No attribution
+    return {"has_preview": False}
 
 @api_router.put("/crm/leads/{lead_id}")
 async def crm_update_lead(lead_id: str, data: CRMLeadUpdate, current_user=Depends(get_current_user)):
@@ -4252,7 +4426,8 @@ async def crm_classify_lead(
         if data.status == "valido":
             # Send Purchase event for valid customers
             purchase_value = float(data.conversion_value) if data.conversion_value else 0.0
-            purchase_currency = data.currency or "ARS"
+            # FORCE ARS regardless of payload — single source of truth
+            purchase_currency = "ARS"
             custom_data = {
                 "currency": purchase_currency,
                 "value": purchase_value,
@@ -4889,7 +5064,8 @@ async def crm_send_conversion_to_meta(
         )
     
     purchase_value = float(value) if value else 0.0
-    purchase_currency = currency or "ARS"
+    # FORCE ARS regardless of payload — single source of truth
+    purchase_currency = "ARS"
     custom_data = {
         "currency": purchase_currency,
         "value": purchase_value,
@@ -5009,6 +5185,9 @@ async def crm_meta_diagnostics(
             "has_fbc": ev.get("has_fbc", False),
             "has_phone": ev.get("has_phone", False),
             "landing_code": ev.get("landing_code"),
+            "ctwa_clid": ev.get("ctwa_clid"),
+            "ad_source": ev.get("ad_source"),
+            "utm_content": ev.get("utm_content"),
             "source": ev.get("source", ""),
         })
 
