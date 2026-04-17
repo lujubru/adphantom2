@@ -255,6 +255,8 @@ const MetaDiagnostics = () => {
                       <Detail label="Pixel" value={ev.pixel_id || 'N/A'} />
                       <Detail label="Event ID" value={ev.event_id || 'Sin event_id'} />
                       <Detail label="Landing" value={ev.landing_code || '-'} />
+                      <Detail label="Ad Source" value={ev.ad_source || ev.utm_content || '-'} highlight={ev.ad_source ? 'green' : null} />
+                      <Detail label="CTWA clid" value={ev.ctwa_clid ? (ev.ctwa_clid.slice(0, 14) + '...') : '-'} highlight={ev.ctwa_clid ? 'green' : null} />
                       <Detail label="fbp / fbc" value={`${ev.has_fbp ? 'SI' : 'NO'} / ${ev.has_fbc ? 'SI' : 'NO'}`} highlight={ev.has_fbp && ev.has_fbc ? 'green' : 'red'} />
                       <Detail label="Resultado" value={ev.success ? 'OK (200)' : 'ERROR'} highlight={ev.success ? 'green' : 'red'} />
                       <Detail label="Timestamp" value={ev.timestamp ? new Date(ev.timestamp).toLocaleString() : '-'} />

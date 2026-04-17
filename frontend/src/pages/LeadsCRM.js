@@ -4,7 +4,8 @@ import {
   Check, X, Trash2, RefreshCw,
   DollarSign, UserCheck, AlertTriangle,
   GripVertical, Eye, Settings, Smartphone,
-  ArrowRight, BarChart3, Zap, Copy, ChevronDown, User, Target
+  ArrowRight, BarChart3, Zap, Copy, ChevronDown, User, Target,
+  Megaphone, ExternalLink, PlayCircle
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -635,6 +636,103 @@ const ChatMessage = ({ message }) => {
   );
 };
 
+// ─── Ad Preview Card (Kommo-style, above chat) ─────────────────────
+
+const BADGE_COLORS = {
+  blue:    { bg: 'bg-blue-500/15',    border: 'border-blue-500/40',    text: 'text-blue-300',    icon: 'text-blue-400',    dot: 'bg-blue-400' },
+  emerald: { bg: 'bg-emerald-500/15', border: 'border-emerald-500/40', text: 'text-emerald-300', icon: 'text-emerald-400', dot: 'bg-emerald-400' },
+  amber:   { bg: 'bg-amber-500/15',   border: 'border-amber-500/40',   text: 'text-amber-300',   icon: 'text-amber-400',   dot: 'bg-amber-400' },
+};
+
+const AdPreviewCard = ({ preview, collapsed, onToggle }) => {
+  if (!preview || !preview.has_preview) return null;
+  const color = BADGE_COLORS[preview.badge_color] || BADGE_COLORS.blue;
+  const isVideo = preview.media_type === 'video' && preview.video_url;
+  const mediaUrl = preview.image_url || preview.thumbnail_url;
+
+  return (
+    <div
+      data-testid="ad-preview-card"
+      className={`mx-3 my-2 rounded-lg border ${color.border} ${color.bg} overflow-hidden shadow-sm`}
+    >
+      {/* Header strip — always visible, clickable to collapse */}
+      <button
+        type="button"
+        onClick={onToggle}
+        className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-white/5 transition-colors"
+        data-testid="ad-preview-toggle"
+      >
+        <Megaphone className={`w-4 h-4 shrink-0 ${color.icon}`} />
+        <span className={`text-[11px] font-bold uppercase tracking-wide ${color.text}`}>
+          {preview.badge_label}
+        </span>
+        <span className={`w-1.5 h-1.5 rounded-full ${color.dot} animate-pulse`} />
+        <span className="text-[11px] text-slate-400 truncate flex-1">
+          {preview.headline}
+        </span>
+        <ChevronDown
+          className={`w-3.5 h-3.5 text-slate-400 transition-transform ${collapsed ? '-rotate-90' : ''}`}
+        />
+      </button>
+
+      {/* Body — collapsible */}
+      {!collapsed && (
+        <div className="px-3 pb-3 pt-1">
+          <div className="flex gap-3">
+            {/* Media */}
+            {mediaUrl && (
+              <div className="relative w-20 h-20 shrink-0 rounded-md overflow-hidden bg-slate-800 border border-slate-700">
+                <img
+                  src={mediaUrl}
+                  alt="ad preview"
+                  className="w-full h-full object-cover"
+                  onError={(e) => { e.target.style.display = 'none'; }}
+                  data-testid="ad-preview-image"
+                />
+                {isVideo && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/40">
+                    <PlayCircle className="w-8 h-8 text-white drop-shadow-lg" />
+                  </div>
+                )}
+              </div>
+            )}
+            {/* Copy */}
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-semibold text-white leading-snug mb-1 line-clamp-2">
+                {preview.headline}
+              </p>
+              {preview.body && (
+                <p className="text-[11px] text-slate-400 leading-relaxed line-clamp-3">
+                  {preview.body}
+                </p>
+              )}
+              <div className="mt-2 flex items-center gap-2 flex-wrap">
+                {preview.source_url && (
+                  <a
+                    href={preview.source_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className={`inline-flex items-center gap-1 text-[11px] font-medium ${color.text} hover:underline`}
+                    data-testid="ad-preview-source-link"
+                  >
+                    <ExternalLink className="w-3 h-3" />
+                    {preview.source === 'meta_ctwa_ad' ? 'Ver anuncio' : preview.source === 'own_landing' ? 'Abrir landing' : 'Abrir'}
+                  </a>
+                )}
+                {preview.ad_source && preview.ad_source !== preview.headline && (
+                  <span className="text-[10px] text-slate-500 font-mono truncate">
+                    {preview.ad_source}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ─── Chat Panel (shared between cajero and admin modal) ────────────
 
 const ChatPanel = ({ lead, onStatusChange, onClose, showCloseButton = false, userMessages = {} }) => {
@@ -643,6 +741,8 @@ const ChatPanel = ({ lead, onStatusChange, onClose, showCloseButton = false, use
   const [sending, setSending] = useState(false);
   const [conversionValue, setConversionValue] = useState('');
   const [showConversionInput, setShowConversionInput] = useState(false);
+  const [adPreview, setAdPreview] = useState(null);
+  const [adCollapsed, setAdCollapsed] = useState(false);
   const messagesEndRef = useRef(null);
 
   const loadMessages = useCallback(async () => {
@@ -652,11 +752,20 @@ const ChatPanel = ({ lead, onStatusChange, onClose, showCloseButton = false, use
     } catch { /* silent */ }
   }, [lead.id]);
 
+  const loadAdPreview = useCallback(async () => {
+    try {
+      const { data } = await api.get(`/crm/leads/${lead.id}/ad-preview`);
+      setAdPreview(data);
+    } catch { setAdPreview(null); }
+  }, [lead.id]);
+
   useEffect(() => {
     loadMessages();
+    loadAdPreview();
+    setAdCollapsed(false);
     const interval = setInterval(loadMessages, 5000);
     return () => clearInterval(interval);
-  }, [loadMessages]);
+  }, [loadMessages, loadAdPreview]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -773,6 +882,13 @@ Le envio nuestros datos de cuenta 👇`;
         </div>
       )}
 
+      {/* Ad Preview — Kommo-style banner when lead came from an ad/landing */}
+      <AdPreviewCard
+        preview={adPreview}
+        collapsed={adCollapsed}
+        onToggle={() => setAdCollapsed(v => !v)}
+      />
+
       {/* Bienvenida button bar */}
       <div className="px-4 py-2 border-b border-slate-800 bg-slate-800/30 flex items-center gap-2">
         <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
@@ -828,6 +944,8 @@ const LeadCard = ({ lead, onClick, onDragStart }) => {
   const config = STATUS_CONFIG[lead.status] || STATUS_CONFIG.nuevo;
   const Icon = config.icon;
   const hasNewMessage = lead.has_unread_messages || lead.unread_count > 0;
+  const adBadge = lead.ad_badge;
+  const adColor = adBadge ? (BADGE_COLORS[adBadge.color] || BADGE_COLORS.blue) : null;
   return (
     <div draggable onDragStart={e => onDragStart(e, lead)} onClick={() => onClick(lead)}
       className={`flex-shrink-0 w-[200px] p-3 rounded-lg border ${config.color} cursor-pointer hover:scale-[1.02] transition-all group relative`}>
@@ -841,10 +959,22 @@ const LeadCard = ({ lead, onClick, onDragStart }) => {
         </div>
         <Icon className="w-4 h-4 opacity-70" />
       </div>
+      {adBadge && (
+        <div
+          className={`mb-1.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded border ${adColor.border} ${adColor.bg} max-w-full`}
+          data-testid={`lead-card-ad-badge-${lead.id}`}
+          title={adBadge.label}
+        >
+          <Megaphone className={`w-2.5 h-2.5 shrink-0 ${adColor.icon}`} />
+          <span className={`text-[9px] font-semibold truncate ${adColor.text}`}>
+            {adBadge.label}
+          </span>
+        </div>
+      )}
       <div className="text-xs text-slate-400 space-y-1">
         <div className="flex items-center gap-1"><Phone className="w-3 h-3" /><span className="truncate">{lead.phone}</span></div>
         {lead.line_name && <div className="flex items-center gap-1"><Smartphone className="w-3 h-3" /><span className="truncate">{lead.line_name}</span></div>}
-        {lead.ad_source && <div className="flex items-center gap-1 text-purple-400"><Target className="w-3 h-3" /><span className="truncate text-[10px]">{lead.ad_source}</span></div>}
+        {lead.ad_source && !adBadge && <div className="flex items-center gap-1 text-purple-400"><Target className="w-3 h-3" /><span className="truncate text-[10px]">{lead.ad_source}</span></div>}
         {lead.charge_amount > 0 && <div className="flex items-center gap-1 text-emerald-400"><DollarSign className="w-3 h-3" />${lead.charge_amount.toLocaleString()}</div>}
         {lead.messages_count > 0 && (
           <div className={`flex items-center gap-1 ${hasNewMessage ? 'text-red-400 font-medium' : ''}`}>
