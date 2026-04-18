@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useTheme } from '@/contexts/ThemeContext';
-import { Activity, CheckCircle, XCircle, AlertTriangle, DollarSign, Wifi, WifiOff, RefreshCw, ChevronDown, ChevronUp, Filter } from 'lucide-react';
+import { Activity, CheckCircle, XCircle, AlertTriangle, DollarSign, Wifi, WifiOff, RefreshCw, ChevronDown, ChevronUp, Filter, Sparkles } from 'lucide-react';
 import axios from 'axios';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || '';
@@ -15,6 +15,30 @@ const MetaDiagnostics = () => {
   const [filterEvent, setFilterEvent] = useState('');
   const [expandedEvent, setExpandedEvent] = useState(null);
   const [autoRefresh, setAutoRefresh] = useState(false);
+  const [enriching, setEnriching] = useState(false);
+
+  const runEnrich = useCallback(async () => {
+    if (enriching) return;
+    if (!window.confirm('Esto va a escanear hasta 500 leads y completar datos faltantes (apellido, ciudad, estado, sexo, email) para mejorar el EMQ score de los próximos eventos enviados a Meta. ¿Continuar?')) return;
+    setEnriching(true);
+    try {
+      const { data: res } = await api.post('/crm/leads/enrich', null, { params: { limit: 500 } });
+      const s = res?.stats || {};
+      alert(
+        `✅ Enrichment completo\n\n` +
+        `Leads escaneados: ${s.scanned || 0}\n` +
+        `Apellidos nuevos: ${s.name_enriched || 0}\n` +
+        `Sexo inferido: ${s.gender_enriched || 0}\n` +
+        `Ciudad/Estado: ${s.geo_enriched || 0}\n` +
+        `Emails extraídos: ${s.email_enriched || 0}\n\n` +
+        `Los próximos eventos Meta tendrán más cobertura.`
+      );
+    } catch (e) {
+      alert('Error ejecutando enrichment: ' + (e.response?.data?.detail || e.message));
+    } finally {
+      setEnriching(false);
+    }
+  }, [enriching]);
 
   const loadDiagnostics = useCallback(async () => {
     try {
@@ -86,6 +110,18 @@ const MetaDiagnostics = () => {
           >
             <span className={`w-2 h-2 rounded-full ${autoRefresh ? 'bg-emerald-400 animate-pulse' : (d ? 'bg-slate-600' : 'bg-gray-400')}`} />
             {autoRefresh ? 'LIVE' : 'Auto'}
+          </button>
+          <button
+            data-testid="enrich-leads-btn"
+            onClick={runEnrich}
+            disabled={enriching}
+            title="Enriquecer leads existentes con datos faltantes (apellido, ciudad, sexo, email) para mejorar cobertura EMQ en próximos eventos"
+            className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all disabled:opacity-60 ${
+              d ? 'bg-purple-500/15 text-purple-300 border border-purple-500/30 hover:bg-purple-500/25' : 'bg-purple-100 text-purple-700 border border-purple-300 hover:bg-purple-200'
+            }`}
+          >
+            <Sparkles className={`w-4 h-4 ${enriching ? 'animate-spin' : ''}`} />
+            {enriching ? 'Enriqueciendo...' : 'Enriquecer leads'}
           </button>
           <button
             data-testid="refresh-button"
