@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { 
-  Users, Plus, Search, Phone, MessageCircle, Send, 
+import {
+  Users, Plus, Search, Phone, MessageCircle,
   Check, X, Trash2, RefreshCw,
   DollarSign, UserCheck, AlertTriangle,
   GripVertical, Eye, Settings, Smartphone,
-  ArrowRight, BarChart3, Zap, Copy, ChevronDown, User, Target,
-  Megaphone, ExternalLink, PlayCircle
+  ArrowRight, BarChart3, Zap, Copy, User, Target,
+  Megaphone, Radio,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -13,89 +13,12 @@ import { toast } from 'sonner';
 import api from '@/utils/api';
 import { useTheme } from '@/contexts/ThemeContext';
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || '';
-
-// ─── Status config ─────────────────────────────────────────────────
-
-const STATUS_CONFIG = {
-  nuevo:     { label: 'Nuevo',     color: 'bg-blue-500/20 text-blue-400 border-blue-500/30',    bgColumn: 'bg-blue-950/30',    dot: 'bg-blue-400',    icon: Users },
-  spam:      { label: 'Spam',      color: 'bg-red-500/20 text-red-400 border-red-500/30',       bgColumn: 'bg-red-950/30',     dot: 'bg-red-400',     icon: Trash2 },
-  consultas: { label: 'Consultas', color: 'bg-amber-500/20 text-amber-400 border-amber-500/30', bgColumn: 'bg-amber-950/30',   dot: 'bg-amber-400',   icon: MessageCircle },
-  valido:    { label: 'Válido',    color: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30', bgColumn: 'bg-emerald-950/30', dot: 'bg-emerald-400', icon: DollarSign },
-};
-
-const LINE_TYPE_CONFIG = {
-  publi:     { label: 'Publicidad', color: 'bg-blue-500/20 text-blue-400' },
-  principal: { label: 'Principal',  color: 'bg-emerald-500/20 text-emerald-400' },
-  spam:      { label: 'Spam',       color: 'bg-red-500/20 text-red-400' },
-};
-
-const STATUS_ORDER = ['nuevo', 'spam', 'consultas', 'valido'];
-
-// ─── Helpers ───────────────────────────────────────────────────────
-
-function formatTime(dateStr) {
-  if (!dateStr) return '';
-  try {
-    const d = new Date(dateStr);
-    const now = new Date();
-    const diff = now - d;
-    if (diff < 86400000) return d.toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit' });
-    if (diff < 604800000) return d.toLocaleDateString('es', { weekday: 'short', hour: '2-digit', minute: '2-digit' });
-    return d.toLocaleDateString('es', { day: '2-digit', month: 'short' });
-  } catch { return ''; }
-}
-
-// ─── Status Badge ──────────────────────────────────────────────────
-
-const StatusBadge = ({ status }) => {
-  const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.nuevo;
-  return (
-    <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${cfg.color}`}>
-      {cfg.label}
-    </span>
-  );
-};
-
-// ─── Status Selector dropdown ──────────────────────────────────────
-
-const StatusSelector = ({ currentStatus, onSelect, disabled }) => {
-  const [open, setOpen] = useState(false);
-  const ref = useRef(null);
-
-  useEffect(() => {
-    const handler = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, []);
-
-  const cfg = STATUS_CONFIG[currentStatus] || STATUS_CONFIG.nuevo;
-
-  return (
-    <div className="relative" ref={ref}>
-      <button
-        onClick={() => !disabled && setOpen(o => !o)}
-        className={`flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border transition-all ${cfg.color} ${disabled ? 'opacity-50 cursor-not-allowed' : 'hover:opacity-80'}`}
-      >
-        <span className={`w-1.5 h-1.5 rounded-full ${cfg.dot}`} />
-        {cfg.label}
-        <ChevronDown className="w-3 h-3" />
-      </button>
-      {open && (
-        <div className="absolute right-0 top-full mt-1 bg-slate-800 border border-slate-700 rounded-lg shadow-xl z-50 min-w-[140px] overflow-hidden">
-          {Object.entries(STATUS_CONFIG).map(([key, val]) => (
-            <button key={key} onClick={() => { onSelect(key); setOpen(false); }}
-              className={`w-full flex items-center gap-2 px-3 py-2 text-xs hover:bg-slate-700 transition-colors ${currentStatus === key ? 'bg-slate-700/50' : ''}`}>
-              <span className={`w-2 h-2 rounded-full ${val.dot}`} />
-              <span className="text-white">{val.label}</span>
-              {currentStatus === key && <Check className="w-3 h-3 text-emerald-400 ml-auto" />}
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-};
+import { STATUS_CONFIG, LINE_TYPE_CONFIG, STATUS_ORDER, BADGE_COLORS, BACKEND_URL } from './leads-crm/constants';
+import { formatTime } from './leads-crm/utils';
+import { StatusBadge } from './leads-crm/StatusSelector';
+import { ChatPanel } from './leads-crm/ChatPanel';
+import { BroadcastModal } from './leads-crm/BroadcastModal';
+import { ChatListItem } from './leads-crm/ChatListItem';
 
 // ─── Funnel (admin only) ───────────────────────────────────────────
 
@@ -111,20 +34,20 @@ const FunnelDisplay = ({ funnel, conversionRates, totals, period, onFilterChange
     conversionRates?.clicks_to_chats   || 0,
     conversionRates?.chats_to_cargas   || 0,
   ];
-  
+
   const [showDatePicker, setShowDatePicker] = useState(false);
   const [customStart, setCustomStart] = useState(startDate || '');
   const [customEnd, setCustomEnd] = useState(endDate || '');
-  
+
   return (
     <div className="bg-slate-900/50 rounded-xl p-4 border border-slate-800">
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
         <h3 className="text-sm font-medium text-slate-400 flex items-center gap-2">
           <BarChart3 className="w-4 h-4" /> Embudo de Conversión
           {period && <span className="text-xs text-slate-500">({period})</span>}
         </h3>
         {onFilterChange && (
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <select
               value={filterType || '30'}
               onChange={(e) => {
@@ -148,26 +71,13 @@ const FunnelDisplay = ({ funnel, conversionRates, totals, period, onFilterChange
             </select>
             {showDatePicker && (
               <div className="flex items-center gap-2">
-                <input
-                  type="date"
-                  value={customStart}
-                  onChange={(e) => setCustomStart(e.target.value)}
-                  className="bg-slate-800 border border-slate-700 text-white text-xs rounded-lg px-2 py-1"
-                />
+                <input type="date" value={customStart} onChange={(e) => setCustomStart(e.target.value)}
+                  className="bg-slate-800 border border-slate-700 text-white text-xs rounded-lg px-2 py-1" />
                 <span className="text-slate-500 text-xs">a</span>
-                <input
-                  type="date"
-                  value={customEnd}
-                  onChange={(e) => setCustomEnd(e.target.value)}
-                  className="bg-slate-800 border border-slate-700 text-white text-xs rounded-lg px-2 py-1"
-                />
-                <Button 
-                  size="sm" 
-                  onClick={() => onFilterChange('custom', customStart, customEnd)}
-                  className="bg-teal-600 hover:bg-teal-700 text-xs h-7"
-                >
-                  Aplicar
-                </Button>
+                <input type="date" value={customEnd} onChange={(e) => setCustomEnd(e.target.value)}
+                  className="bg-slate-800 border border-slate-700 text-white text-xs rounded-lg px-2 py-1" />
+                <Button size="sm" onClick={() => onFilterChange('custom', customStart, customEnd)}
+                  className="bg-teal-600 hover:bg-teal-700 text-xs h-7">Aplicar</Button>
               </div>
             )}
           </div>
@@ -179,15 +89,15 @@ const FunnelDisplay = ({ funnel, conversionRates, totals, period, onFilterChange
           return (
             <React.Fragment key={step.key}>
               <div className="flex flex-col items-center">
-                <div className={`w-16 h-16 rounded-xl flex items-center justify-center ${idx === steps.length - 1 ? 'bg-emerald-500/20' : 'bg-slate-800'}`}>
-                  <Icon className={`w-6 h-6 ${idx === steps.length - 1 ? 'text-emerald-400' : 'text-slate-400'}`} />
+                <div className={`w-12 h-12 sm:w-16 sm:h-16 rounded-xl flex items-center justify-center ${idx === steps.length - 1 ? 'bg-emerald-500/20' : 'bg-slate-800'}`}>
+                  <Icon className={`w-5 h-5 sm:w-6 sm:h-6 ${idx === steps.length - 1 ? 'text-emerald-400' : 'text-slate-400'}`} />
                 </div>
-                <span className="text-xl font-bold text-white mt-2">{step.value.toLocaleString()}</span>
+                <span className="text-base sm:text-xl font-bold text-white mt-2">{step.value.toLocaleString()}</span>
                 <span className="text-xs text-slate-400">{step.label}</span>
               </div>
               {idx < steps.length - 1 && (
-                <div className="flex flex-col items-center px-2">
-                  <ArrowRight className="w-5 h-5 text-slate-600" />
+                <div className="flex flex-col items-center px-1 sm:px-2">
+                  <ArrowRight className="w-4 h-4 sm:w-5 sm:h-5 text-slate-600" />
                   <span className="text-xs text-slate-500 mt-1">{rates[idx]}%</span>
                 </div>
               )}
@@ -196,7 +106,7 @@ const FunnelDisplay = ({ funnel, conversionRates, totals, period, onFilterChange
         })}
       </div>
       {totals && (
-        <div className="mt-4 pt-4 border-t border-slate-700 flex justify-between text-sm">
+        <div className="mt-4 pt-4 border-t border-slate-700 flex justify-between text-sm flex-wrap gap-2">
           <span className="text-slate-400">Total Leads: <span className="text-white font-medium">{totals.leads}</span></span>
           <span className="text-slate-400">Monto: <span className="text-emerald-400 font-medium">${(totals.monto_cargas || 0).toLocaleString()}</span></span>
           <span className="text-slate-400">Promedio: <span className="text-white font-medium">${(totals.promedio_carga || 0).toLocaleString()}</span></span>
@@ -258,18 +168,14 @@ const AdPerformanceDashboard = ({ lineId }) => {
         <h3 className="text-sm font-medium text-slate-400 flex items-center gap-2">
           <Target className="w-4 h-4 text-purple-400" /> Rendimiento por Anuncio
         </h3>
-        <select
-          value={days}
-          onChange={(e) => setDays(parseInt(e.target.value))}
-          className="bg-slate-800 border border-slate-700 text-white text-xs rounded-lg px-2 py-1"
-        >
+        <select value={days} onChange={(e) => setDays(parseInt(e.target.value))}
+          className="bg-slate-800 border border-slate-700 text-white text-xs rounded-lg px-2 py-1">
           <option value="7">7 días</option>
           <option value="30">30 días</option>
           <option value="90">90 días</option>
         </select>
       </div>
 
-      {/* Summary */}
       <div className="grid grid-cols-3 gap-3 mb-4">
         <div className="bg-slate-800/50 rounded-lg p-3 text-center">
           <p className="text-2xl font-bold text-white">{totalLeads}</p>
@@ -285,7 +191,6 @@ const AdPerformanceDashboard = ({ lineId }) => {
         </div>
       </div>
 
-      {/* Ad list */}
       <div className="space-y-2 max-h-[300px] overflow-y-auto">
         {adStats.map((ad, idx) => (
           <div key={ad.ad_source || idx} className="bg-slate-800/30 rounded-lg p-3 border border-slate-700/50">
@@ -306,12 +211,9 @@ const AdPerformanceDashboard = ({ lineId }) => {
               </span>
               <span className="text-amber-400 font-medium">${ad.monto_total.toLocaleString()}</span>
             </div>
-            {/* Progress bar */}
             <div className="mt-2 h-1.5 bg-slate-700 rounded-full overflow-hidden">
-              <div 
-                className="h-full bg-gradient-to-r from-purple-500 to-emerald-500 rounded-full transition-all"
-                style={{ width: `${Math.min((ad.leads / totalLeads) * 100, 100)}%` }}
-              />
+              <div className="h-full bg-gradient-to-r from-purple-500 to-emerald-500 rounded-full transition-all"
+                style={{ width: `${Math.min((ad.leads / totalLeads) * 100, 100)}%` }} />
             </div>
           </div>
         ))}
@@ -326,17 +228,14 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
   const [showCreate, setShowCreate] = useState(false);
   const [editingLine, setEditingLine] = useState(null);
   const [saving, setSaving] = useState(false);
-  const [form, setForm] = useState({
+  const emptyForm = {
     name: '', line_type: 'publi', whatsapp_number: '',
     whatsapp_token: '', phone_number_id: '', verify_token: '',
     meta_access_token: '', meta_pixel_id: '', description: ''
-  });
+  };
+  const [form, setForm] = useState(emptyForm);
 
-  const resetForm = () => setForm({
-    name: '', line_type: 'publi', whatsapp_number: '',
-    whatsapp_token: '', phone_number_id: '', verify_token: '',
-    meta_access_token: '', meta_pixel_id: '', description: ''
-  });
+  const resetForm = () => setForm(emptyForm);
 
   const editLine = (line) => {
     setForm({
@@ -391,8 +290,8 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
         <form onSubmit={saveLine} className="p-4 border-b border-slate-700 bg-slate-800/50 space-y-3">
           <h4 className="text-sm font-medium text-white mb-2">{editingLine ? 'Editar Línea' : 'Nueva Línea'}</h4>
           <div className="grid grid-cols-2 gap-3">
-            <Input placeholder="Nombre de la línea" value={form.name} onChange={e => setForm({...form, name: e.target.value})} className="bg-slate-700 border-slate-600" />
-            <select value={form.line_type} onChange={e => setForm({...form, line_type: e.target.value})} className="bg-slate-700 border border-slate-600 rounded-md px-3 text-white text-sm">
+            <Input placeholder="Nombre de la línea" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} className="bg-slate-700 border-slate-600" />
+            <select value={form.line_type} onChange={e => setForm({ ...form, line_type: e.target.value })} className="bg-slate-700 border border-slate-600 rounded-md px-3 text-white text-sm">
               <option value="publi">Publicidad</option>
               <option value="principal">Principal</option>
               <option value="spam">Spam</option>
@@ -400,18 +299,18 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
           </div>
           <div className="pt-2 border-t border-slate-600">
             <p className="text-xs text-slate-400 mb-2">📱 WhatsApp Business API</p>
-            <Input placeholder="Número WhatsApp (ej: 5491155554444)" value={form.whatsapp_number} onChange={e => setForm({...form, whatsapp_number: e.target.value})} className="bg-slate-700 border-slate-600 mb-2" />
+            <Input placeholder="Número WhatsApp (ej: 5491155554444)" value={form.whatsapp_number} onChange={e => setForm({ ...form, whatsapp_number: e.target.value })} className="bg-slate-700 border-slate-600 mb-2" />
             <div className="grid grid-cols-2 gap-2">
-              <Input placeholder="WhatsApp Token" value={form.whatsapp_token} onChange={e => setForm({...form, whatsapp_token: e.target.value})} className="bg-slate-700 border-slate-600 text-xs" />
-              <Input placeholder="Phone Number ID" value={form.phone_number_id} onChange={e => setForm({...form, phone_number_id: e.target.value})} className="bg-slate-700 border-slate-600 text-xs" />
+              <Input placeholder="WhatsApp Token" value={form.whatsapp_token} onChange={e => setForm({ ...form, whatsapp_token: e.target.value })} className="bg-slate-700 border-slate-600 text-xs" />
+              <Input placeholder="Phone Number ID" value={form.phone_number_id} onChange={e => setForm({ ...form, phone_number_id: e.target.value })} className="bg-slate-700 border-slate-600 text-xs" />
             </div>
-            <Input placeholder="Verify Token (webhook)" value={form.verify_token} onChange={e => setForm({...form, verify_token: e.target.value})} className="bg-slate-700 border-slate-600 text-xs mt-2" />
+            <Input placeholder="Verify Token (webhook)" value={form.verify_token} onChange={e => setForm({ ...form, verify_token: e.target.value })} className="bg-slate-700 border-slate-600 text-xs mt-2" />
           </div>
           <div className="pt-2 border-t border-slate-600">
             <p className="text-xs text-slate-400 mb-2">📊 Meta Pixel</p>
             <div className="grid grid-cols-2 gap-2">
-              <Input placeholder="Meta Access Token" value={form.meta_access_token} onChange={e => setForm({...form, meta_access_token: e.target.value})} className="bg-slate-700 border-slate-600 text-xs" />
-              <Input placeholder="Meta Pixel ID" value={form.meta_pixel_id} onChange={e => setForm({...form, meta_pixel_id: e.target.value})} className="bg-slate-700 border-slate-600 text-xs" />
+              <Input placeholder="Meta Access Token" value={form.meta_access_token} onChange={e => setForm({ ...form, meta_access_token: e.target.value })} className="bg-slate-700 border-slate-600 text-xs" />
+              <Input placeholder="Meta Pixel ID" value={form.meta_pixel_id} onChange={e => setForm({ ...form, meta_pixel_id: e.target.value })} className="bg-slate-700 border-slate-600 text-xs" />
             </div>
           </div>
           <div className="flex gap-2 pt-2">
@@ -468,477 +367,7 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
   );
 };
 
-// ─── Image Lightbox ────────────────────────────────────────────────
-
-const ImageLightbox = ({ src, onClose }) => {
-  useEffect(() => {
-    const handler = (e) => { if (e.key === 'Escape') onClose(); };
-    document.addEventListener('keydown', handler);
-    return () => document.removeEventListener('keydown', handler);
-  }, [onClose]);
-
-  return (
-    <div
-      className="fixed inset-0 bg-black/90 z-[100] flex items-center justify-center p-4"
-      onClick={onClose}
-    >
-      <button
-        onClick={onClose}
-        className="absolute top-4 right-4 p-2 rounded-full bg-slate-800/80 text-white hover:bg-slate-700 transition-colors"
-      >
-        <X className="w-5 h-5" />
-      </button>
-      <img
-        src={src}
-        alt="Comprobante"
-        className="max-w-full max-h-[90vh] rounded-xl object-contain shadow-2xl"
-        onClick={e => e.stopPropagation()}
-      />
-      <a
-        href={src}
-        download="comprobante.jpg"
-        className="absolute bottom-4 right-4 px-3 py-2 rounded-lg bg-slate-800/80 text-white text-xs hover:bg-slate-700 transition-colors flex items-center gap-1.5"
-        onClick={e => e.stopPropagation()}
-      >
-        ↓ Descargar
-      </a>
-    </div>
-  );
-};
-
-// ─── Chat Message ──────────────────────────────────────────────────
-
-const ChatMessage = ({ message }) => {
-  const isAdmin = message.sender === 'admin';
-  const [imgSrc, setImgSrc] = useState(null);
-  const [loadingImg, setLoadingImg] = useState(false);
-  const [lightboxOpen, setLightboxOpen] = useState(false);
-  const [docSrc, setDocSrc] = useState(null);
-  const [loadingDoc, setLoadingDoc] = useState(false);
-  const [audioSrc, setAudioSrc] = useState(null);
-  const [loadingAudio, setLoadingAudio] = useState(false);
-
-  const loadImage = useCallback(async () => {
-    if (imgSrc || loadingImg) return;
-    setLoadingImg(true);
-    try {
-      const { data } = await api.get(`/crm/messages/${message.id}/image`);
-      setImgSrc(`data:${data.mime_type};base64,${data.image_base64}`);
-    } catch { /* silent */ }
-    finally { setLoadingImg(false); }
-  }, [message.id, imgSrc, loadingImg]);
-
-  const loadDocument = useCallback(async () => {
-    if (docSrc || loadingDoc) return;
-    setLoadingDoc(true);
-    try {
-      const { data } = await api.get(`/crm/messages/${message.id}/document`);
-      const mime = data.mime_type || 'application/pdf';
-      setDocSrc({ url: `data:${mime};base64,${data.image_base64}`, mime, filename: data.filename || 'documento.pdf' });
-    } catch { /* silent */ }
-    finally { setLoadingDoc(false); }
-  }, [message.id, docSrc, loadingDoc]);
-
-  const loadAudio = useCallback(async () => {
-    if (audioSrc || loadingAudio) return;
-    setLoadingAudio(true);
-    try {
-      const { data } = await api.get(`/crm/messages/${message.id}/audio`);
-      setAudioSrc(`data:${data.mime_type};base64,${data.audio_base64}`);
-    } catch { /* silent */ }
-    finally { setLoadingAudio(false); }
-  }, [message.id, audioSrc, loadingAudio]);
-
-  useEffect(() => {
-    if (message.message_type === 'image' && message.media_id) loadImage();
-    if (message.message_type === 'document' && message.media_id) loadDocument();
-    if (message.message_type === 'audio' && message.media_id) loadAudio();
-  }, [message.id]);
-
-  const handleDocDownload = () => {
-    if (!docSrc) return;
-    const a = document.createElement('a');
-    a.href = docSrc.url;
-    a.download = docSrc.filename;
-    a.click();
-  };
-
-  let displayContent = message.content;
-  if (typeof displayContent === 'object' && displayContent !== null) displayContent = JSON.stringify(displayContent, null, 2);
-  if (!displayContent) displayContent = '[Mensaje vacío]';
-
-  return (
-    <>
-      {lightboxOpen && imgSrc && (
-        <ImageLightbox src={imgSrc} onClose={() => setLightboxOpen(false)} />
-      )}
-      <div className={`flex ${isAdmin ? 'justify-end' : 'justify-start'}`}>
-        <div className={`max-w-[75%] px-3 py-2 rounded-2xl text-sm shadow-sm ${isAdmin ? 'bg-emerald-600 text-white rounded-br-sm' : 'bg-slate-700 text-slate-100 rounded-bl-sm'}`}>
-          {message.message_type === 'image' ? (
-            loadingImg ? <div className="flex items-center gap-2 text-xs opacity-70"><RefreshCw className="w-3 h-3 animate-spin" />Cargando...</div>
-            : imgSrc ? (
-              <div className="relative group cursor-zoom-in" onClick={() => setLightboxOpen(true)}>
-                <img src={imgSrc} alt="img" className="max-w-[220px] rounded-lg" />
-                <div className="absolute inset-0 bg-black/0 group-hover:bg-black/30 transition-colors rounded-lg flex items-center justify-center">
-                  <span className="opacity-0 group-hover:opacity-100 transition-opacity text-white text-xs font-medium bg-black/60 px-2 py-1 rounded-full">
-                    🔍 Ver comprobante
-                  </span>
-                </div>
-              </div>
-            )
-            : <span className="text-xs opacity-60">[Imagen no disponible]</span>
-          ) : message.message_type === 'document' ? (
-            loadingDoc ? (
-              <div className="flex items-center gap-2 text-xs opacity-70"><RefreshCw className="w-3 h-3 animate-spin" />Cargando documento...</div>
-            ) : docSrc ? (
-              <button
-                onClick={handleDocDownload}
-                className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl bg-black/20 hover:bg-black/30 transition-colors text-left w-full"
-              >
-                <span className="text-2xl shrink-0">📄</span>
-                <div className="min-w-0">
-                  <p className="text-xs font-semibold truncate">{docSrc.filename}</p>
-                  <p className="text-[10px] opacity-60 mt-0.5">PDF · Toca para descargar</p>
-                </div>
-                <span className="ml-auto text-lg shrink-0">⬇️</span>
-              </button>
-            ) : (
-              <div className="flex items-center gap-2 text-xs opacity-60">
-                <span>📄</span> Documento no disponible
-              </div>
-            )
-          ) : message.message_type === 'audio' ? (
-            loadingAudio ? (
-              <div className="flex items-center gap-2 text-xs opacity-70"><RefreshCw className="w-3 h-3 animate-spin" />Cargando audio...</div>
-            ) : audioSrc ? (
-              <div className="flex items-center gap-2 min-w-[200px]">
-                <span className="text-lg">🎤</span>
-                <audio controls className="h-10 max-w-[250px]" preload="metadata">
-                  <source src={audioSrc} type={message.mime_type || 'audio/ogg'} />
-                  Tu navegador no soporta audio
-                </audio>
-              </div>
-            ) : (
-              <div className="flex items-center gap-2 text-xs opacity-60">
-                <span>🎤</span> Audio no disponible
-              </div>
-            )
-          ) : (
-            <p className="whitespace-pre-wrap break-words">{displayContent}</p>
-          )}
-          <p className={`text-[10px] mt-1 ${isAdmin ? 'text-emerald-200/60 text-right' : 'text-slate-400'}`}>
-            {message.sender_name && <span>{message.sender_name} · </span>}
-            {formatTime(message.created_at)}
-          </p>
-        </div>
-      </div>
-    </>
-  );
-};
-
-// ─── Ad Preview Card (Kommo-style, above chat) ─────────────────────
-
-const BADGE_COLORS = {
-  blue:    { bg: 'bg-blue-500/15',    border: 'border-blue-500/40',    text: 'text-blue-300',    icon: 'text-blue-400',    dot: 'bg-blue-400' },
-  emerald: { bg: 'bg-emerald-500/15', border: 'border-emerald-500/40', text: 'text-emerald-300', icon: 'text-emerald-400', dot: 'bg-emerald-400' },
-  amber:   { bg: 'bg-amber-500/15',   border: 'border-amber-500/40',   text: 'text-amber-300',   icon: 'text-amber-400',   dot: 'bg-amber-400' },
-};
-
-const AdPreviewCard = ({ preview, collapsed, onToggle }) => {
-  if (!preview || !preview.has_preview) return null;
-  const color = BADGE_COLORS[preview.badge_color] || BADGE_COLORS.blue;
-  const isVideo = preview.media_type === 'video' && preview.video_url;
-  const mediaUrl = preview.image_url || preview.thumbnail_url;
-
-  return (
-    <div
-      data-testid="ad-preview-card"
-      className={`mx-3 my-2 rounded-lg border ${color.border} ${color.bg} overflow-hidden shadow-sm`}
-    >
-      {/* Header strip — always visible, clickable to collapse */}
-      <button
-        type="button"
-        onClick={onToggle}
-        className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-white/5 transition-colors"
-        data-testid="ad-preview-toggle"
-      >
-        <Megaphone className={`w-4 h-4 shrink-0 ${color.icon}`} />
-        <span className={`text-[11px] font-bold uppercase tracking-wide ${color.text}`}>
-          {preview.badge_label}
-        </span>
-        <span className={`w-1.5 h-1.5 rounded-full ${color.dot} animate-pulse`} />
-        <span className="text-[11px] text-slate-400 truncate flex-1">
-          {preview.headline}
-        </span>
-        <ChevronDown
-          className={`w-3.5 h-3.5 text-slate-400 transition-transform ${collapsed ? '-rotate-90' : ''}`}
-        />
-      </button>
-
-      {/* Body — collapsible */}
-      {!collapsed && (
-        <div className="px-3 pb-3 pt-1">
-          <div className="flex gap-3">
-            {/* Media */}
-            {mediaUrl && (
-              <div className="relative w-20 h-20 shrink-0 rounded-md overflow-hidden bg-slate-800 border border-slate-700">
-                <img
-                  src={mediaUrl}
-                  alt="ad preview"
-                  className="w-full h-full object-cover"
-                  onError={(e) => { e.target.style.display = 'none'; }}
-                  data-testid="ad-preview-image"
-                />
-                {isVideo && (
-                  <div className="absolute inset-0 flex items-center justify-center bg-black/40">
-                    <PlayCircle className="w-8 h-8 text-white drop-shadow-lg" />
-                  </div>
-                )}
-              </div>
-            )}
-            {/* Copy */}
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-semibold text-white leading-snug mb-1 line-clamp-2">
-                {preview.headline}
-              </p>
-              {preview.body && (
-                <p className="text-[11px] text-slate-400 leading-relaxed line-clamp-3">
-                  {preview.body}
-                </p>
-              )}
-              <div className="mt-2 flex items-center gap-2 flex-wrap">
-                {preview.source_url && (
-                  <a
-                    href={preview.source_url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className={`inline-flex items-center gap-1 text-[11px] font-medium ${color.text} hover:underline`}
-                    data-testid="ad-preview-source-link"
-                  >
-                    <ExternalLink className="w-3 h-3" />
-                    {preview.source === 'meta_ctwa_ad' ? 'Ver anuncio' : preview.source === 'own_landing' ? 'Abrir landing' : 'Abrir'}
-                  </a>
-                )}
-                {preview.ad_source && preview.ad_source !== preview.headline && (
-                  <span className="text-[10px] text-slate-500 font-mono truncate">
-                    {preview.ad_source}
-                  </span>
-                )}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-// ─── Chat Panel (shared between cajero and admin modal) ────────────
-
-const ChatPanel = ({ lead, onStatusChange, onClose, showCloseButton = false, userMessages = {} }) => {
-  const [messages, setMessages] = useState([]);
-  const [newMessage, setNewMessage] = useState('');
-  const [sending, setSending] = useState(false);
-  const [conversionValue, setConversionValue] = useState('');
-  const [showConversionInput, setShowConversionInput] = useState(false);
-  const [adPreview, setAdPreview] = useState(null);
-  const [adCollapsed, setAdCollapsed] = useState(false);
-  const messagesEndRef = useRef(null);
-
-  const loadMessages = useCallback(async () => {
-    try {
-      const { data } = await api.get(`/crm/leads/${lead.id}/messages`);
-      setMessages(data.messages || []);
-    } catch { /* silent */ }
-  }, [lead.id]);
-
-  const loadAdPreview = useCallback(async () => {
-    try {
-      const { data } = await api.get(`/crm/leads/${lead.id}/ad-preview`);
-      setAdPreview(data);
-    } catch { setAdPreview(null); }
-  }, [lead.id]);
-
-  useEffect(() => {
-    loadMessages();
-    loadAdPreview();
-    setAdCollapsed(false);
-    const interval = setInterval(loadMessages, 5000);
-    return () => clearInterval(interval);
-  }, [loadMessages, loadAdPreview]);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
-  const sendMessage = async (sender = 'admin') => {
-    if (!newMessage.trim()) return;
-    setSending(true);
-    try {
-      await api.post(`/crm/leads/${lead.id}/messages`, { content: newMessage, sender });
-      setNewMessage('');
-      loadMessages();
-    } catch { toast.error('Error enviando mensaje'); }
-    finally { setSending(false); }
-  };
-
-  const handleStatusChange = async (status) => {
-    if (status === 'valido') {
-      setShowConversionInput(true);
-      return;
-    }
-    await onStatusChange(lead.id, status, null);
-  };
-
-  const confirmValido = async () => {
-    await onStatusChange(lead.id, 'valido', conversionValue ? parseFloat(conversionValue) : null);
-    setShowConversionInput(false);
-    setConversionValue('');
-  };
-
-  const sendBienvenida = async () => {
-    // Use custom user message or default
-    const mensaje = userMessages.welcome_message || `¡Buenas!👋 Trabajamos con las plataformas MÁS COMPLETAS del país!  
-💟 ¡GANAMOS! 💟 💜 GANAMOSvip 💜 🥇 OROPURO 🥇  
-ℹ MINIMOS: $2000 Acreditación // $5000 Retiro. 
-🏦 Retiras tus ganancias UNA vez cada 24hs! 
-⛔ No abonamos ni trabajamos con Ruletas 
-🎁B0N0 ¡Beneficio de bienvenida activado! B0N0🎁  
-✨¡Decime tu nombre para generar el usuario!✨`;
-    try {
-      await api.post(`/crm/leads/${lead.id}/messages`, { content: mensaje, sender: 'admin' });
-      loadMessages();
-      toast.success('Bienvenida enviada');
-    } catch { toast.error('Error enviando bienvenida'); }
-  };
-
-  const sendUsuario = async () => {
-    let clipboardText = '';
-    try {
-      clipboardText = await navigator.clipboard.readText();
-    } catch {
-      clipboardText = '[usuario]';
-    }
-    // Use custom user message or default, replace [CLIPBOARD] with clipboard content
-    const defaultMsg = `¡Te dejo tus datos de acceso!:
-👤Usuario: [CLIPBOARD]
-🔑Contraseña: hola123
-🌐Link de acceso: https://ganamosnet.org
-🌐Link de acceso: https://oropuro.net
-🌐Link de acceso: https://1ganamos.vip
-¡Te dejo el CBU para que puedas cargar! 
-Le envio nuestros datos de cuenta 👇`;
-    const template = userMessages.user_message || defaultMsg;
-    const mensaje = template.replace(/\[CLIPBOARD\]/g, clipboardText);
-    try {
-      await api.post(`/crm/leads/${lead.id}/messages`, { content: mensaje, sender: 'admin' });
-      loadMessages();
-      toast.success('Datos de usuario enviados');
-      // Copy clipboard text to make it easier to paste
-      await navigator.clipboard.writeText(clipboardText);
-    } catch { toast.error('Error enviando datos de usuario'); }
-  };
-
-  return (
-    <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="px-4 py-3 border-b border-slate-700 bg-slate-900/60 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-3">
-          <div className="relative">
-            <div className="w-9 h-9 rounded-full bg-slate-700 flex items-center justify-center">
-              <User className="w-4 h-4 text-slate-400" />
-            </div>
-            <span className={`absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-slate-900 ${STATUS_CONFIG[lead.status]?.dot || 'bg-blue-400'}`} />
-          </div>
-          <div>
-            <p className="text-sm font-semibold text-white leading-tight">{lead.name || lead.phone}</p>
-            <p className="text-xs text-slate-400">{lead.phone}{lead.line_name ? ` · ${lead.line_name}` : ''}</p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <StatusSelector currentStatus={lead.status} onSelect={handleStatusChange} />
-          {showCloseButton && (
-            <button onClick={onClose} className="p-1 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800">
-              <X className="w-4 h-4" />
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* Conversion value input (shown when selecting "válido") */}
-      {showConversionInput && (
-        <div className="px-4 py-3 border-b border-slate-700 bg-emerald-950/30 flex items-center gap-2">
-          <DollarSign className="w-4 h-4 text-emerald-400 shrink-0" />
-          <Input
-            type="number"
-            placeholder="Monto de venta (ej: 1500)"
-            value={conversionValue}
-            onChange={e => setConversionValue(e.target.value)}
-            className="bg-slate-800 border-slate-600 text-white text-sm h-8 flex-1"
-            autoFocus
-          />
-          <Button size="sm" onClick={confirmValido} className="bg-emerald-600 hover:bg-emerald-700 h-8 text-xs">Confirmar</Button>
-          <Button size="sm" variant="outline" onClick={() => { setShowConversionInput(false); setConversionValue(''); }} className="border-slate-600 h-8 text-xs">Cancelar</Button>
-        </div>
-      )}
-
-      {/* Ad Preview — Kommo-style banner when lead came from an ad/landing */}
-      <AdPreviewCard
-        preview={adPreview}
-        collapsed={adCollapsed}
-        onToggle={() => setAdCollapsed(v => !v)}
-      />
-
-      {/* Bienvenida button bar */}
-      <div className="px-4 py-2 border-b border-slate-800 bg-slate-800/30 flex items-center gap-2">
-        <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-        <span className="text-xs text-slate-400 flex-1">Chat en tiempo real</span>
-        <Button onClick={sendBienvenida} size="sm" className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3 h-7">
-          👋 Bienvenida
-        </Button>
-        <Button onClick={sendUsuario} size="sm" className="bg-blue-600 hover:bg-blue-500 text-white text-xs px-3 h-7">
-          👤 Usuario
-        </Button>
-        <Button onClick={loadMessages} variant="ghost" size="sm" className="text-slate-400 hover:text-white h-7 w-7 p-0">
-          <RefreshCw className="w-3.5 h-3.5" />
-        </Button>
-      </div>
-
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-2">
-        {messages.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-32 text-slate-600">
-            <MessageCircle className="w-8 h-8 mb-2 opacity-20" />
-            <p className="text-xs">Sin mensajes aún</p>
-          </div>
-        ) : messages.map(msg => <ChatMessage key={msg.id} message={msg} />)}
-        <div ref={messagesEndRef} />
-      </div>
-
-      {/* Input */}
-      <div className="p-3 border-t border-slate-800 bg-slate-900/60 shrink-0">
-        <div className="flex gap-2">
-          <Input
-            placeholder="Escribe un mensaje..."
-            value={newMessage}
-            onChange={e => setNewMessage(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendMessage('admin')}
-            className="flex-1 bg-slate-800 border-slate-600 text-white text-sm"
-            disabled={sending}
-          />
-          <Button onClick={() => sendMessage('lead')} disabled={sending || !newMessage.trim()} variant="outline" className="border-slate-600" title="Registrar como mensaje del lead">
-            <Users className="w-4 h-4" />
-          </Button>
-          <Button onClick={() => sendMessage('admin')} disabled={sending || !newMessage.trim()} className="bg-blue-600 hover:bg-blue-700">
-            <Send className="w-4 h-4" />
-          </Button>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-// ─── Lead Card (Kanban, admin only) ───────────────────────────────
+// ─── Kanban (admin only) ───────────────────────────────────────────
 
 const LeadCard = ({ lead, onClick, onDragStart }) => {
   const config = STATUS_CONFIG[lead.status] || STATUS_CONFIG.nuevo;
@@ -960,15 +389,10 @@ const LeadCard = ({ lead, onClick, onDragStart }) => {
         <Icon className="w-4 h-4 opacity-70" />
       </div>
       {adBadge && (
-        <div
-          className={`mb-1.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded border ${adColor.border} ${adColor.bg} max-w-full`}
-          data-testid={`lead-card-ad-badge-${lead.id}`}
-          title={adBadge.label}
-        >
+        <div className={`mb-1.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded border ${adColor.border} ${adColor.bg} max-w-full`}
+          data-testid={`lead-card-ad-badge-${lead.id}`} title={adBadge.label}>
           <Megaphone className={`w-2.5 h-2.5 shrink-0 ${adColor.icon}`} />
-          <span className={`text-[9px] font-semibold truncate ${adColor.text}`}>
-            {adBadge.label}
-          </span>
+          <span className={`text-[9px] font-semibold truncate ${adColor.text}`}>{adBadge.label}</span>
         </div>
       )}
       <div className="text-xs text-slate-400 space-y-1">
@@ -986,8 +410,6 @@ const LeadCard = ({ lead, onClick, onDragStart }) => {
     </div>
   );
 };
-
-// ─── Kanban Column (admin only) ───────────────────────────────────
 
 const KanbanColumn = ({ status, leads, onLeadClick, onDragStart, onDrop, onDragOver }) => {
   const config = STATUS_CONFIG[status];
@@ -1014,10 +436,10 @@ const KanbanColumn = ({ status, leads, onLeadClick, onDragStart, onDrop, onDragO
 
 // ─── Admin Lead Modal (Kanban click → chat) ───────────────────────
 
-const AdminLeadModal = ({ lead, lines, onClose, onUpdate }) => {
+const AdminLeadModal = ({ lead, onClose, onUpdate }) => {
   return (
-    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-      <div className="bg-slate-900 rounded-xl w-full max-w-2xl h-[85vh] flex flex-col border border-slate-700">
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center sm:p-4">
+      <div className="bg-slate-900 w-full h-full sm:rounded-xl sm:max-w-2xl sm:h-[85vh] flex flex-col sm:border sm:border-slate-700 overflow-hidden">
         <ChatPanel
           lead={lead}
           onStatusChange={async (leadId, status, conversionValue) => {
@@ -1025,7 +447,7 @@ const AdminLeadModal = ({ lead, lines, onClose, onUpdate }) => {
               await api.post(`/crm/leads/${leadId}/classify`, {
                 status, send_to_meta: true,
                 conversion_value: conversionValue,
-                currency: 'ARS'
+                currency: 'USD'
               });
               toast.success(`✅ ${STATUS_CONFIG[status]?.label}`);
               onUpdate();
@@ -1049,22 +471,77 @@ export default function LeadsCRM() {
   const [lines, setLines] = useState([]);
   const [funnel, setFunnel] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [selectedLead, setSelectedLead] = useState(null);   // for chat (cajero) or modal (admin)
+  const [selectedLead, setSelectedLead] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterStatus, setFilterStatus] = useState('all');
   const [draggedLead, setDraggedLead] = useState(null);
   const [selectedLineId, setSelectedLineId] = useState(null);
   const [showFunnelModal, setShowFunnelModal] = useState(false);
-  
-  // Funnel filter state
   const [funnelFilter, setFunnelFilter] = useState({ type: '30', startDate: null, endDate: null });
 
   const isAdmin = !currentUser?.role || currentUser?.role === 'admin';
 
+  // ── PWA install prompt ─────────────────────────────────────────
+  const [pwaPrompt, setPwaPrompt] = useState(null);
+  const [pwaInstalled, setPwaInstalled] = useState(false);
+  const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.innerWidth < 768);
+
+  useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  const [broadcastOpen, setBroadcastOpen] = useState(false);
+
+  useEffect(() => {
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
+    const check = () => setPwaInstalled(
+      window.matchMedia('(display-mode: standalone)').matches ||
+      window.navigator.standalone === true
+    );
+    check();
+    const listener = (e) => {
+      e.preventDefault();
+      setPwaPrompt(e);
+    };
+    window.addEventListener('beforeinstallprompt', listener);
+    window.addEventListener('appinstalled', () => { setPwaPrompt(null); setPwaInstalled(true); });
+    return () => window.removeEventListener('beforeinstallprompt', listener);
+  }, []);
+
+  const installPWA = useCallback(async () => {
+    if (!pwaPrompt) return;
+    pwaPrompt.prompt();
+    const choice = await pwaPrompt.userChoice;
+    if (choice.outcome === 'accepted') setPwaInstalled(true);
+    setPwaPrompt(null);
+  }, [pwaPrompt]);
+
   // ── Notification sound ─────────────────────────────────────────
-  const prevUnreadIds = useRef(new Set());
+  const prevUnreadMap = useRef(new Map());
+  const firstLoadDone = useRef(false);
   const audioCtxRef = useRef(null);
-  const [soundEnabled, setSoundEnabled] = useState(false);
+  const [soundEnabled, setSoundEnabled] = useState(() => {
+    try { return localStorage.getItem('crm_sound_enabled') === '1'; } catch { return false; }
+  });
+  const [notifyEnabled, setNotifyEnabled] = useState(() => {
+    try {
+      return localStorage.getItem('crm_notify_enabled') === '1'
+        && typeof Notification !== 'undefined'
+        && Notification.permission === 'granted';
+    } catch { return false; }
+  });
+  const leadsRef = useRef([]);
+
+  useEffect(() => {
+    try { localStorage.setItem('crm_sound_enabled', soundEnabled ? '1' : '0'); } catch { /* silent */ }
+  }, [soundEnabled]);
+  useEffect(() => {
+    try { localStorage.setItem('crm_notify_enabled', notifyEnabled ? '1' : '0'); } catch { /* silent */ }
+  }, [notifyEnabled]);
 
   const getAudioCtx = useCallback(() => {
     if (!audioCtxRef.current) {
@@ -1073,20 +550,42 @@ export default function LeadsCRM() {
     return audioCtxRef.current;
   }, []);
 
+  const playChime = (ctx) => {
+    const now = ctx.currentTime;
+    const master = ctx.createGain();
+    master.gain.value = 0.22;
+    master.connect(ctx.destination);
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 4500;
+    filter.Q.value = 0.8;
+    filter.connect(master);
+    const tones = [
+      { freq: 523.25, gain: 0.55, decay: 1.4 },
+      { freq: 783.99, gain: 0.28, decay: 1.2 },
+      { freq: 1046.5, gain: 0.35, decay: 1.0 },
+    ];
+    tones.forEach(({ freq, gain, decay }) => {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      osc.connect(g);
+      g.connect(filter);
+      g.gain.setValueAtTime(0, now);
+      g.gain.linearRampToValueAtTime(gain, now + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + decay);
+      osc.start(now);
+      osc.stop(now + decay + 0.05);
+    });
+  };
+
   const enableSound = useCallback(() => {
     try {
       const ctx = getAudioCtx();
-      // Resume context on user gesture (required by browsers)
       ctx.resume().then(() => {
         setSoundEnabled(true);
-        // Play a quick test tone so user confirms it works
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain); gain.connect(ctx.destination);
-        osc.type = 'sine'; osc.frequency.value = 780;
-        gain.gain.setValueAtTime(0.15, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.2);
-        osc.start(); osc.stop(ctx.currentTime + 0.2);
+        playChime(ctx);
       });
     } catch { /* silent */ }
   }, [getAudioCtx]);
@@ -1095,25 +594,181 @@ export default function LeadsCRM() {
     if (!soundEnabled) return;
     try {
       const ctx = getAudioCtx();
-      if (ctx.state === 'suspended') return;
-      const play = (freq, startAt, duration, gain = 0.18) => {
-        const osc = ctx.createOscillator();
-        const gainNode = ctx.createGain();
-        osc.connect(gainNode); gainNode.connect(ctx.destination);
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(freq, ctx.currentTime + startAt);
-        gainNode.gain.setValueAtTime(0, ctx.currentTime + startAt);
-        gainNode.gain.linearRampToValueAtTime(gain, ctx.currentTime + startAt + 0.01);
-        gainNode.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + startAt + duration);
-        osc.start(ctx.currentTime + startAt);
-        osc.stop(ctx.currentTime + startAt + duration);
-      };
-      play(520, 0,    0.12);
-      play(780, 0.13, 0.18);
+      if (ctx.state === 'suspended') {
+        ctx.resume().then(() => playChime(ctx)).catch(() => {});
+      } else {
+        playChime(ctx);
+      }
     } catch { /* silent */ }
   }, [soundEnabled, getAudioCtx]);
 
-  // Load current user
+  // ── Browser push notifications ────────────────────────────────
+  const urlBase64ToUint8Array = (base64String) => {
+    const padding = '='.repeat((4 - base64String.length % 4) % 4);
+    const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+    const raw = window.atob(base64);
+    const output = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; ++i) output[i] = raw.charCodeAt(i);
+    return output;
+  };
+
+  const registerServiceWorkerAndSubscribe = useCallback(async () => {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      throw new Error('Tu navegador no soporta Web Push');
+    }
+    // 1. Register SW at root scope
+    let reg;
+    try {
+      reg = await navigator.serviceWorker.register('/sw.js');
+    } catch (e) {
+      throw new Error(`No se pudo registrar el Service Worker: ${e.message}`);
+    }
+    await navigator.serviceWorker.ready;
+    // 2. Get VAPID key from backend
+    let vk;
+    try {
+      const res = await api.get('/push/vapid-public-key');
+      vk = res.data;
+    } catch (e) {
+      throw new Error(`No se pudo obtener la VAPID public key del backend: ${e?.response?.status || e.message}`);
+    }
+    if (!vk?.public_key) throw new Error('Backend no devolvió VAPID public_key');
+    const appServerKey = urlBase64ToUint8Array(vk.public_key);
+    // 3. Subscribe (or get existing subscription)
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      try {
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: appServerKey,
+        });
+      } catch (e) {
+        // Android Chrome most common cause: Google Play Services not signed in
+        throw new Error(`PushManager.subscribe falló: ${e.message}. Asegurate de estar logueado en Google (Ajustes → Cuentas).`);
+      }
+    }
+    // 4. Send subscription to backend
+    const subJson = sub.toJSON();
+    try {
+      await api.post('/push/subscribe', {
+        endpoint: subJson.endpoint,
+        keys: subJson.keys,
+        user_agent: navigator.userAgent,
+      });
+    } catch (e) {
+      throw new Error(`Backend rechazó la suscripción: ${e?.response?.status || e.message}`);
+    }
+    return sub;
+  }, []);
+
+  const enableNotify = useCallback(async () => {
+    try {
+      if (typeof Notification === 'undefined') {
+        toast.error('Tu navegador no soporta notificaciones');
+        return;
+      }
+      if (!('serviceWorker' in navigator)) {
+        toast.error('Tu navegador no soporta Service Workers (requerido en mobile)');
+        return;
+      }
+      if (!window.isSecureContext) {
+        toast.error('Las notificaciones requieren HTTPS. Abrí la app con https://');
+        return;
+      }
+      if (Notification.permission === 'denied') {
+        toast.error('Permiso denegado. Activalo en Ajustes de Android → App → Notificaciones.');
+        return;
+      }
+      if (Notification.permission !== 'granted') {
+        const res = await Notification.requestPermission();
+        if (res !== 'granted') {
+          toast.error(`Permiso no otorgado: ${res}`);
+          return;
+        }
+      }
+      // Register SW + subscribe to Web Push so notifications keep working
+      // even if Chrome window is closed/minimized.
+      try {
+        await registerServiceWorkerAndSubscribe();
+      } catch (e) {
+        // Surface the REAL error so the cajero can see what's wrong (VAPID,
+        // SW registration, backend endpoint, etc.)
+        const msg = e?.message || String(e);
+        console.error('Web Push subscribe failed:', e);
+        toast.error(`Push Web falló: ${msg}. Te dejé las notificaciones básicas activas.`);
+      }
+      setNotifyEnabled(true);
+      // On Android Chrome, `new Notification(...)` fired from the page is
+      // rejected — you MUST call registration.showNotification. Use the SW.
+      try {
+        const reg = await navigator.serviceWorker.getRegistration('/sw.js');
+        if (reg) {
+          await reg.showNotification('CRM Leads', {
+            body: 'Notificaciones activadas ✨',
+            icon: '/logo.png',
+            badge: '/logo.png',
+            silent: true,
+            tag: 'welcome',
+          });
+        }
+      } catch (e) {
+        console.warn('Preview notification failed (non-fatal):', e);
+      }
+    } catch (e) {
+      console.error('enableNotify error:', e);
+      toast.error(`Error activando notificaciones: ${e?.message || e}`);
+    }
+  }, [registerServiceWorkerAndSubscribe]);
+
+  const disableNotify = useCallback(async () => {
+    setNotifyEnabled(false);
+    try {
+      if ('serviceWorker' in navigator) {
+        const reg = await navigator.serviceWorker.getRegistration('/sw.js');
+        const sub = await reg?.pushManager?.getSubscription();
+        if (sub) {
+          const subJson = sub.toJSON();
+          await api.post('/push/unsubscribe', {
+            endpoint: subJson.endpoint,
+            keys: subJson.keys,
+          }).catch(() => {});
+          await sub.unsubscribe().catch(() => {});
+        }
+      }
+    } catch { /* silent */ }
+  }, []);
+
+  const showLeadNotification = useCallback((lead) => {
+    try {
+      if (!notifyEnabled || typeof Notification === 'undefined') return;
+      if (Notification.permission !== 'granted') return;
+      if (document.visibilityState === 'visible' && document.hasFocus()) return;
+      const title = lead.name || lead.phone || 'Nuevo mensaje';
+      const bodyParts = [];
+      if (lead.line_name) bodyParts.push(`📱 ${lead.line_name}`);
+      if (lead.unread_count > 1) bodyParts.push(`${lead.unread_count} mensajes sin leer`);
+      else bodyParts.push('Nuevo mensaje');
+      if (lead.ad_badge?.label) bodyParts.push(`📢 ${lead.ad_badge.label}`);
+      const n = new Notification(title, {
+        body: bodyParts.join(' · '),
+        icon: '/logo.png',
+        badge: '/logo.png',
+        tag: `lead-${lead.id}`,
+        renotify: true,
+        silent: true,
+      });
+      n.onclick = () => {
+        try {
+          window.focus();
+          const fresh = leadsRef.current.find(l => l.id === lead.id) || lead;
+          setSelectedLead(fresh);
+          n.close();
+        } catch { /* silent */ }
+      };
+      setTimeout(() => { try { n.close(); } catch {} }, 10000);
+    } catch { /* silent */ }
+  }, [notifyEnabled]);
+
   useEffect(() => {
     api.get('/auth/me').then(({ data }) => setCurrentUser(data)).catch(() => {});
   }, []);
@@ -1125,17 +780,34 @@ export default function LeadsCRM() {
       const { data } = await api.get('/crm/leads', { params });
       let list = data.leads || [];
       list.sort((a, b) => new Date(b.last_interaction || b.created_at || '') - new Date(a.last_interaction || a.created_at || ''));
-      // Detect newly unread leads and play sound
-      const newUnreadIds = new Set(
-        list.filter(l => l.unread_count > 0 || l.has_unread_messages).map(l => l.id)
-      );
-      const hasNewOnes = [...newUnreadIds].some(id => !prevUnreadIds.current.has(id));
-      if (hasNewOnes && prevUnreadIds.current.size > 0) playNotificationSound();
-      prevUnreadIds.current = newUnreadIds;
+      const currentUnreadMap = new Map();
+      const triggeredLeads = [];
+      list.forEach(l => {
+        const count = Number(l.unread_count || 0);
+        const hasUnread = count > 0 || l.has_unread_messages;
+        if (hasUnread) {
+          currentUnreadMap.set(l.id, count);
+          const prevCount = prevUnreadMap.current.get(l.id) || 0;
+          if (count > prevCount || (prevCount === 0 && hasUnread)) {
+            triggeredLeads.push(l);
+          }
+        }
+      });
+      if (triggeredLeads.length > 0 && firstLoadDone.current) {
+        playNotificationSound();
+        triggeredLeads.slice(0, 3).forEach(lead => showLeadNotification(lead));
+      }
+      prevUnreadMap.current = currentUnreadMap;
+      firstLoadDone.current = true;
+      leadsRef.current = list;
+      try {
+        const totalUnread = list.reduce((acc, l) => acc + (l.unread_count || 0), 0);
+        document.title = totalUnread > 0 ? `(${totalUnread}) CRM Leads` : 'CRM Leads';
+      } catch { /* silent */ }
       setLeads(list);
     } catch { toast.error('Error cargando leads'); }
     finally { setLoading(false); }
-  }, [selectedLineId, playNotificationSound]);
+  }, [selectedLineId, playNotificationSound, showLeadNotification]);
 
   const loadLines = useCallback(async () => {
     try { const { data } = await api.get('/crm/lines'); setLines(data || []); }
@@ -1146,8 +818,6 @@ export default function LeadsCRM() {
     try {
       const params = {};
       if (selectedLineId) params.line_id = selectedLineId;
-      
-      // Apply filter
       if (funnelFilter.type === 'custom' && funnelFilter.startDate && funnelFilter.endDate) {
         params.start_date = funnelFilter.startDate;
         params.end_date = funnelFilter.endDate;
@@ -1156,12 +826,11 @@ export default function LeadsCRM() {
       } else {
         params.days = parseInt(funnelFilter.type) || 30;
       }
-      
       const { data } = await api.get('/crm/funnel/stats', { params });
       setFunnel(data);
     } catch { /* silent */ }
   }, [selectedLineId, funnelFilter]);
-  
+
   const handleFunnelFilterChange = (type, startDate, endDate) => {
     setFunnelFilter({ type, startDate, endDate });
   };
@@ -1169,16 +838,43 @@ export default function LeadsCRM() {
   useEffect(() => { loadLeads(); loadLines(); loadFunnel(); }, [loadLeads, loadLines, loadFunnel]);
 
   useEffect(() => {
-    const interval = setInterval(() => { loadLeads(); loadFunnel(); }, 10000);
+    const interval = setInterval(() => { loadLeads(); loadFunnel(); }, 5000);
     return () => clearInterval(interval);
   }, [loadLeads, loadFunnel]);
+
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return;
+    const handler = (evt) => {
+      if (evt.data?.type === 'OPEN_LEAD' && evt.data.leadId) {
+        const fresh = leadsRef.current.find(l => l.id === evt.data.leadId);
+        if (fresh) setSelectedLead(fresh);
+        else {
+          loadLeads().then(() => {
+            const after = leadsRef.current.find(l => l.id === evt.data.leadId);
+            if (after) setSelectedLead(after);
+          });
+        }
+      }
+    };
+    navigator.serviceWorker.addEventListener('message', handler);
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const pendingId = params.get('openLead');
+      if (pendingId) {
+        const found = leadsRef.current.find(l => l.id === pendingId);
+        if (found) setSelectedLead(found);
+        window.history.replaceState({}, '', window.location.pathname);
+      }
+    } catch { /* silent */ }
+    return () => navigator.serviceWorker.removeEventListener('message', handler);
+  }, [loadLeads]);
 
   const handleStatusChange = async (leadId, status, conversionValue) => {
     try {
       await api.post(`/crm/leads/${leadId}/classify`, {
         status, send_to_meta: true,
         conversion_value: conversionValue,
-        currency: 'ARS'
+        currency: 'USD'
       });
       toast.success(`✅ ${STATUS_CONFIG[status]?.label}`);
       setLeads(prev => prev.map(l => l.id === leadId ? { ...l, status } : l));
@@ -1201,7 +897,6 @@ export default function LeadsCRM() {
     finally { setDraggedLead(null); }
   };
 
-  // Filtered leads for cajero chat list
   const filteredLeads = leads.filter(lead => {
     const matchStatus = filterStatus === 'all' || lead.status === filterStatus;
     const matchSearch = !searchTerm ||
@@ -1210,66 +905,111 @@ export default function LeadsCRM() {
     return matchStatus && matchSearch;
   });
 
+  // Open a lead from the chat list — marks as read.
+  const openLead = useCallback((lead) => {
+    setSelectedLead(lead);
+    setLeads(prev => prev.map(l => l.id === lead.id ? { ...l, unread_count: 0, has_unread_messages: false } : l));
+    api.post(`/crm/leads/${lead.id}/read`).catch(() => {});
+  }, []);
+
+  const closeLead = useCallback(() => setSelectedLead(null), []);
+
   // ── CAJERO VIEW ────────────────────────────────────────────────
   if (currentUser && !isAdmin) {
     const bgMain = darkMode ? 'bg-slate-950' : 'bg-gray-50';
     const bgCard = darkMode ? 'bg-slate-900/80' : 'bg-white';
-    const bgSidebar = darkMode ? 'bg-slate-900/50' : 'bg-white';
     const borderColor = darkMode ? 'border-slate-800' : 'border-gray-200';
     const textPrimary = darkMode ? 'text-white' : 'text-gray-900';
     const textSecondary = darkMode ? 'text-slate-400' : 'text-gray-600';
     const inputBg = darkMode ? 'bg-slate-800 border-slate-700 text-white' : 'bg-gray-50 border-gray-300 text-gray-900';
-    
-    return (
-      <div className={`h-screen ${bgMain} flex flex-col overflow-hidden`}>
-        {/* Top bar */}
-        <div className={`flex items-center gap-3 px-4 py-3 border-b ${borderColor} ${bgCard} shrink-0`}>
-          <div className="bg-emerald-500/20 p-2 rounded-xl border border-emerald-500/30">
-            <MessageCircle className="w-5 h-5 text-emerald-400" />
-          </div>
-          <div>
-            <h1 className={`text-base font-bold leading-tight flex items-center gap-2 ${textPrimary}`}>
-              WhatsApp CRM
-              {(() => {
-                const totalUnread = leads.filter(l => (l.unread_count > 0 || l.has_unread_messages) && selectedLead?.id !== l.id).length;
-                return totalUnread > 0 ? (
-                  <span className="flex items-center justify-center min-w-[20px] h-5 bg-red-500 text-white text-[10px] font-bold rounded-full px-1.5 animate-pulse">
-                    {totalUnread}
-                  </span>
-                ) : null;
-              })()}
-            </h1>
-            <p className={`text-xs ${textSecondary}`}>Bienvenido, {currentUser.email}</p>
-          </div>
-          <div className="ml-auto flex items-center gap-2">
-            {funnel && (
-              <Button
-                onClick={() => setShowFunnelModal(true)}
-                size="sm"
-                variant="outline"
-                className={darkMode ? "border-slate-600 text-slate-300 hover:text-white text-xs gap-1.5" : "border-gray-300 text-gray-600 hover:text-gray-900 text-xs gap-1.5"}
-              >
-                <BarChart3 className="w-3.5 h-3.5" /> Embudo de Conversión
-              </Button>
-            )}
-            <button
-              onClick={soundEnabled ? () => setSoundEnabled(false) : enableSound}
-              title={soundEnabled ? 'Silenciar notificaciones' : 'Activar sonido de notificaciones'}
-              className={`p-2 rounded-lg transition-colors text-lg leading-none ${soundEnabled ? 'bg-emerald-500/20 hover:bg-emerald-500/30' : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800'}`}
-            >
-              {soundEnabled ? '🔔' : '🔕'}
-            </button>
-            <button onClick={loadLeads} className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors">
-              <RefreshCw className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
 
-        {/* Funnel modal para cajero */}
+    // On mobile with a chat open → full-screen chat (hides sidebar list)
+    const mobileChatOpen = isMobile && selectedLead;
+
+    return (
+      <div className={`${bgMain} flex flex-col`} style={{ height: 'calc(100dvh - 4rem)', minHeight: 'calc(100dvh - 4rem)' }}>
+        {/* Top bar — hidden on mobile when a chat is open */}
+        {!mobileChatOpen && (
+          <div className={`flex items-center gap-2 px-3 py-2.5 border-b ${borderColor} ${bgCard} shrink-0 sticky top-0 z-10`}>
+            <div className="bg-emerald-500/20 p-2 rounded-xl border border-emerald-500/30 shrink-0">
+              <MessageCircle className="w-5 h-5 text-emerald-400" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <h1 className={`text-base font-bold leading-tight flex items-center gap-2 ${textPrimary}`}>
+                <span className="truncate">WhatsApp CRM</span>
+                {(() => {
+                  const totalUnread = leads.filter(l => (l.unread_count > 0 || l.has_unread_messages) && selectedLead?.id !== l.id).length;
+                  return totalUnread > 0 ? (
+                    <span className="flex items-center justify-center min-w-[20px] h-5 bg-red-500 text-white text-[10px] font-bold rounded-full px-1.5 animate-pulse">
+                      {totalUnread}
+                    </span>
+                  ) : null;
+                })()}
+              </h1>
+              <p className={`text-xs ${textSecondary} truncate`}>Hola, {currentUser.email}</p>
+            </div>
+            <div className="flex items-center gap-1 shrink-0">
+              {funnel && (
+                <Button
+                  onClick={() => setShowFunnelModal(true)}
+                  size="sm"
+                  variant="outline"
+                  className={darkMode ? "border-slate-600 text-slate-300 hover:text-white text-xs gap-1.5 h-8 px-2" : "border-gray-300 text-gray-600 hover:text-gray-900 text-xs gap-1.5 h-8 px-2"}
+                  data-testid="funnel-open-btn"
+                >
+                  <BarChart3 className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Embudo</span>
+                </Button>
+              )}
+              <button
+                onClick={soundEnabled ? () => setSoundEnabled(false) : enableSound}
+                title={soundEnabled ? 'Silenciar' : 'Activar sonido'}
+                data-testid="toggle-sound-btn"
+                className={`p-2 rounded-lg transition-colors text-base leading-none ${soundEnabled ? 'bg-emerald-500/20' : 'text-slate-500 hover:bg-slate-800'}`}
+              >
+                {soundEnabled ? '🔔' : '🔕'}
+              </button>
+              <button
+                onClick={notifyEnabled ? disableNotify : enableNotify}
+                title={notifyEnabled ? 'Desactivar notificaciones' : 'Activar notificaciones'}
+                data-testid="toggle-notify-btn"
+                className={`p-2 rounded-lg transition-colors text-base leading-none ${notifyEnabled ? 'bg-blue-500/20' : 'text-slate-500 hover:bg-slate-800'}`}
+              >
+                {notifyEnabled ? '💬' : '🔇'}
+              </button>
+              {pwaPrompt && !pwaInstalled && (
+                <button
+                  onClick={installPWA}
+                  title="Instalar app"
+                  data-testid="install-pwa-btn"
+                  className="flex items-center gap-1 px-2 h-8 rounded-lg text-xs font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/25"
+                >
+                  ⬇️<span className="hidden sm:inline">Instalar</span>
+                </button>
+              )}
+              {(currentUser?.role === 'admin' || (currentUser?.line_ids && currentUser.line_ids.length > 0)) && (
+                <button
+                  onClick={() => setBroadcastOpen(true)}
+                  title="Envío masivo"
+                  data-testid="broadcast-open-btn"
+                  className="flex items-center gap-1 px-2 h-8 rounded-lg text-xs font-semibold bg-purple-500/15 text-purple-300 border border-purple-500/40 hover:bg-purple-500/25"
+                >
+                  <Radio className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Masivo</span>
+                </button>
+              )}
+              <button onClick={loadLeads} className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors" data-testid="refresh-leads-btn">
+                <RefreshCw className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Funnel modal */}
         {showFunnelModal && funnel && (
-          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={() => setShowFunnelModal(false)}>
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] flex items-center justify-center p-2 sm:p-4" onClick={() => setShowFunnelModal(false)}>
             <div className="bg-slate-900 rounded-xl border border-slate-700 w-full max-w-3xl max-h-[90vh] overflow-y-auto shadow-2xl" onClick={e => e.stopPropagation()}>
-              <div className="flex items-center justify-between px-5 py-4 border-b border-slate-700">
+              <div className="flex items-center justify-between px-5 py-4 border-b border-slate-700 sticky top-0 bg-slate-900 z-10">
                 <h2 className="text-sm font-semibold text-white flex items-center gap-2">
                   <BarChart3 className="w-4 h-4 text-blue-400" /> Embudo de Conversión
                 </h2>
@@ -1277,10 +1017,10 @@ export default function LeadsCRM() {
                   <X className="w-4 h-4" />
                 </button>
               </div>
-              <div className="p-5 space-y-4">
-                <FunnelDisplay 
-                  funnel={funnel.funnel} 
-                  conversionRates={funnel.conversion_rates} 
+              <div className="p-3 sm:p-5 space-y-4">
+                <FunnelDisplay
+                  funnel={funnel.funnel}
+                  conversionRates={funnel.conversion_rates}
                   totals={funnel.totals}
                   period={funnel.period}
                   onFilterChange={handleFunnelFilterChange}
@@ -1294,18 +1034,25 @@ export default function LeadsCRM() {
           </div>
         )}
 
-        <div className="flex flex-1 overflow-hidden">
-          {/* Left: conversation list */}
-          <div className={`w-72 shrink-0 border-r ${borderColor} flex flex-col ${bgSidebar}`}>
-            <div className={`p-3 border-b ${borderColor} space-y-2`}>
+        <div className="flex flex-1 overflow-hidden min-h-0">
+          {/* Left: conversation list (hidden on mobile when chat is open) */}
+          <div
+            className={`
+              ${mobileChatOpen ? 'hidden' : 'flex'}
+              md:flex w-full md:w-80 md:shrink-0 border-r ${borderColor} flex-col ${bgCard}
+            `}
+            data-testid="chat-list-container"
+          >
+            <div className={`p-3 border-b ${borderColor} space-y-2 shrink-0`}>
               <div className="relative">
                 <Search className={`absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 ${textSecondary}`} />
                 <Input placeholder="Buscar..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)}
-                  className={`pl-9 ${inputBg} text-sm h-9`} />
+                  className={`pl-9 ${inputBg} text-sm h-9`} data-testid="chat-list-search" />
               </div>
               <div className="flex gap-1 flex-wrap">
                 {['all', ...STATUS_ORDER].map(key => (
                   <button key={key} onClick={() => setFilterStatus(key)}
+                    data-testid={`filter-${key}`}
                     className={`px-2 py-0.5 rounded text-xs font-medium transition-all ${filterStatus === key
                       ? (key === 'all' ? 'bg-slate-600 text-white' : STATUS_CONFIG[key]?.color)
                       : 'text-slate-500 hover:text-slate-300'}`}>
@@ -1319,14 +1066,14 @@ export default function LeadsCRM() {
             {(() => {
               const totalUnread = filteredLeads.filter(l => (l.unread_count > 0 || l.has_unread_messages) && selectedLead?.id !== l.id).length;
               return totalUnread > 0 ? (
-                <div className="mx-3 mt-2 mb-1 flex items-center gap-2 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
+                <div className="mx-3 mt-2 mb-1 flex items-center gap-2 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2 shrink-0">
                   <span className="flex items-center justify-center w-5 h-5 bg-red-500 text-white text-[10px] font-bold rounded-full animate-pulse shrink-0">{totalUnread}</span>
                   <span className="text-xs text-red-400 font-medium">{totalUnread === 1 ? 'chat sin leer' : 'chats sin leer'}</span>
                 </div>
               ) : null;
             })()}
 
-            <div className={`flex-1 overflow-y-auto divide-y ${darkMode ? 'divide-slate-800/50' : 'divide-gray-200'}`}>
+            <div className="flex-1 overflow-y-auto">
               {loading ? (
                 <div className="flex items-center justify-center h-32"><RefreshCw className="w-5 h-5 text-emerald-400 animate-spin" /></div>
               ) : filteredLeads.length === 0 ? (
@@ -1335,36 +1082,28 @@ export default function LeadsCRM() {
                   <p className="text-xs">No hay conversaciones</p>
                 </div>
               ) : [...filteredLeads].sort((a, b) => {
-                  const aUnread = (a.unread_count > 0 || a.has_unread_messages) ? 1 : 0;
-                  const bUnread = (b.unread_count > 0 || b.has_unread_messages) ? 1 : 0;
-                  return bUnread - aUnread;
-                }).map(lead => {
+                const aUnread = (a.unread_count > 0 || a.has_unread_messages) ? 1 : 0;
+                const bUnread = (b.unread_count > 0 || b.has_unread_messages) ? 1 : 0;
+                return bUnread - aUnread;
+              }).map(lead => {
                 const isSelected = selectedLead?.id === lead.id;
                 const cfg = STATUS_CONFIG[lead.status] || STATUS_CONFIG.nuevo;
                 const hasUnread = (lead.unread_count > 0 || lead.has_unread_messages) && !isSelected;
                 return (
-                  <button key={lead.id} onClick={() => {
-                      setSelectedLead(lead);
-                      // Clear unread locally so badge disappears immediately
-                      setLeads(prev => prev.map(l => l.id === lead.id ? { ...l, unread_count: 0, has_unread_messages: false } : l));
-                      // Persist the read state to backend
-                      api.post(`/crm/leads/${lead.id}/read`).catch(() => {});
-                    }}
-                    className={`w-full p-3 text-left transition-colors relative ${
+                  <button key={lead.id} onClick={() => openLead(lead)}
+                    data-testid={`chat-list-item-${lead.id}`}
+                    className={`w-full p-3 text-left transition-colors relative border-b ${borderColor} ${
                       isSelected ? (darkMode ? 'bg-slate-800' : 'bg-teal-50') : ''
                     } ${hasUnread ? (darkMode ? 'bg-red-950/20' : 'bg-red-50') : ''} ${
-                      darkMode ? 'hover:bg-slate-800/60' : 'hover:bg-gray-50'
+                      darkMode ? 'hover:bg-slate-800/60 active:bg-slate-800' : 'hover:bg-gray-50 active:bg-gray-100'
                     }`}>
-                    {/* Unread left bar */}
                     {hasUnread && <span className="absolute left-0 top-0 bottom-0 w-0.5 bg-red-500 rounded-r" />}
                     <div className="flex items-start gap-3">
                       <div className="relative shrink-0">
-                        <div className={`w-10 h-10 rounded-full flex items-center justify-center ${hasUnread ? 'bg-red-900/40 ring-2 ring-red-500/50' : 'bg-slate-700'}`}>
-                          <User className={`w-5 h-5 ${hasUnread ? 'text-red-300' : 'text-slate-400'}`} />
+                        <div className={`w-12 h-12 rounded-full flex items-center justify-center ${hasUnread ? 'bg-red-900/40 ring-2 ring-red-500/50' : 'bg-slate-700'}`}>
+                          <User className={`w-6 h-6 ${hasUnread ? 'text-red-300' : 'text-slate-400'}`} />
                         </div>
-                        {/* Status dot */}
                         <span className={`absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-slate-900 ${cfg.dot}`} />
-                        {/* Unread badge */}
                         {hasUnread && (
                           <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center px-1 shadow-lg shadow-red-500/40 animate-pulse">
                             {lead.unread_count > 9 ? '9+' : lead.unread_count || '!'}
@@ -1402,10 +1141,16 @@ export default function LeadsCRM() {
             </div>
           </div>
 
-          {/* Right: chat */}
-          <div className="flex-1 overflow-hidden">
+          {/* Right: chat panel */}
+          <div
+            className={`
+              ${mobileChatOpen ? 'flex' : 'hidden'}
+              md:flex flex-1 overflow-hidden min-h-0
+            `}
+            data-testid="chat-panel-container"
+          >
             {!selectedLead ? (
-              <div className="flex flex-col items-center justify-center h-full text-slate-500">
+              <div className="hidden md:flex flex-col items-center justify-center h-full w-full text-slate-500">
                 <MessageCircle className="w-16 h-16 mb-4 opacity-10" />
                 <p className="text-sm font-medium">Seleccioná una conversación</p>
                 <p className="text-xs mt-1 text-slate-600">Los mensajes de WhatsApp aparecerán aquí</p>
@@ -1415,6 +1160,8 @@ export default function LeadsCRM() {
                 lead={selectedLead}
                 onStatusChange={handleStatusChange}
                 showCloseButton={false}
+                showBackButton={isMobile}
+                onBack={closeLead}
                 userMessages={{
                   welcome_message: currentUser?.welcome_message,
                   user_message: currentUser?.user_message
@@ -1423,6 +1170,10 @@ export default function LeadsCRM() {
             )}
           </div>
         </div>
+
+        {broadcastOpen && (
+          <BroadcastModal lines={lines} currentUser={currentUser} onClose={() => setBroadcastOpen(false)} />
+        )}
       </div>
     );
   }
@@ -1432,26 +1183,38 @@ export default function LeadsCRM() {
   const textPrimary = darkMode ? 'text-white' : 'text-gray-900';
   const textSecondary = darkMode ? 'text-slate-400' : 'text-gray-600';
   const inputBg = darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-gray-300';
-  
+  const cardBg = darkMode ? 'bg-slate-900/50 border border-slate-800' : 'bg-white border border-gray-200';
+
   return (
-    <div className={`min-h-screen ${bgMain} p-6`}>
-      {/* Header */}
+    <div className={`min-h-screen ${bgMain} p-3 sm:p-6`}>
       <div className="max-w-[1800px] mx-auto mb-6">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
           <div>
-            <h1 className={`text-2xl font-bold ${textPrimary} flex items-center gap-3`}>
-              <Users className="w-7 h-7 text-blue-500" /> CRM Multi-Líneas
+            <h1 className={`text-xl sm:text-2xl font-bold ${textPrimary} flex items-center gap-3`}>
+              <Users className="w-6 h-6 sm:w-7 sm:h-7 text-blue-500" /> CRM Multi-Líneas
             </h1>
             <p className={`${textSecondary} text-sm mt-1`}>Gestiona y clasifica leads de WhatsApp</p>
           </div>
-          <Button onClick={() => { loadLeads(); loadLines(); loadFunnel(); }} variant="outline" className={darkMode ? "border-slate-600" : "border-gray-300"}>
-            <RefreshCw className="w-4 h-4 mr-2" /> Actualizar
-          </Button>
+          <div className="flex items-center gap-2">
+            {(currentUser?.role === 'admin' || currentUser?.role === 'superadmin') && (
+              <Button
+                onClick={() => setBroadcastOpen(true)}
+                variant="outline"
+                className="border-purple-500/40 text-purple-300 bg-purple-500/10 hover:bg-purple-500/20"
+                data-testid="admin-broadcast-btn"
+              >
+                <Radio className="w-4 h-4 mr-2" /> Envío masivo
+              </Button>
+            )}
+            <Button onClick={() => { loadLeads(); loadLines(); loadFunnel(); }} variant="outline" className={darkMode ? "border-slate-600" : "border-gray-300"}>
+              <RefreshCw className="w-4 h-4 mr-2" /> Actualizar
+            </Button>
+          </div>
         </div>
         {funnel && (
-          <FunnelDisplay 
-            funnel={funnel.funnel} 
-            conversionRates={funnel.conversion_rates} 
+          <FunnelDisplay
+            funnel={funnel.funnel}
+            conversionRates={funnel.conversion_rates}
             totals={funnel.totals}
             period={funnel.period}
             onFilterChange={handleFunnelFilterChange}
@@ -1462,15 +1225,12 @@ export default function LeadsCRM() {
         )}
       </div>
 
-      {/* Main content */}
-      <div className="max-w-[1800px] mx-auto flex gap-6">
-        {/* Sidebar - Lines */}
-        <div className="w-80 flex-shrink-0 space-y-4">
+      <div className="max-w-[1800px] mx-auto flex flex-col lg:flex-row gap-6">
+        <div className="w-full lg:w-80 lg:flex-shrink-0 space-y-4">
           <LinesManager lines={lines} onRefresh={loadLines} onSelectLine={setSelectedLineId} selectedLineId={selectedLineId} />
         </div>
 
-        {/* Kanban */}
-        <div className="flex-1">
+        <div className="flex-1 min-w-0">
           <div className="mb-4">
             <div className="relative">
               <Search className={`absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 ${textSecondary}`} />
@@ -1480,6 +1240,17 @@ export default function LeadsCRM() {
           </div>
           {loading ? (
             <div className="flex items-center justify-center h-64"><RefreshCw className="w-8 h-8 text-blue-500 animate-spin" /></div>
+          ) : isMobile ? (
+            /* WhatsApp-style chat list — mobile */
+            <div className={`${cardBg} rounded-lg overflow-hidden`}>
+              {filteredLeads.length === 0 ? (
+                <div className="p-8 text-center text-slate-500 text-sm">No hay leads</div>
+              ) : (
+                filteredLeads.map(lead => (
+                  <ChatListItem key={lead.id} lead={lead} onClick={setSelectedLead} />
+                ))
+              )}
+            </div>
           ) : (
             <div className="flex flex-col gap-3">
               {STATUS_ORDER.map(status => (
@@ -1491,14 +1262,15 @@ export default function LeadsCRM() {
         </div>
       </div>
 
-      {/* Admin modal for lead chat */}
       {selectedLead && (
         <AdminLeadModal
           lead={selectedLead}
-          lines={lines}
           onClose={() => setSelectedLead(null)}
           onUpdate={() => { loadLeads(); loadFunnel(); setSelectedLead(null); }}
         />
+      )}
+      {broadcastOpen && (
+        <BroadcastModal lines={lines} currentUser={currentUser} onClose={() => setBroadcastOpen(false)} />
       )}
     </div>
   );
