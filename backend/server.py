@@ -17,6 +17,7 @@ import hashlib
 import string
 import random
 import base64
+import json
 import httpx
 import bcrypt
 
@@ -1752,6 +1753,14 @@ class PageGenRequest(BaseModel):
 
 WA_GRAPH_URL = "https://graph.facebook.com/v20.0"
 
+# ─── Purchase Currency Override ────────────────────────────────────
+# Single source of truth for the currency reported to Meta CAPI on
+# Purchase events across this deployment. Set via env var PURCHASE_CURRENCY
+# (e.g. "USD" for the USD client, "ARS" for the Argentina client).
+# Defaults to "USD" for backwards compatibility.
+PURCHASE_CURRENCY = (os.environ.get("PURCHASE_CURRENCY") or "USD").upper().strip()
+logger.info(f"PURCHASE_CURRENCY configured as: {PURCHASE_CURRENCY}")
+
 class WASettingsUpdate(BaseModel):
     whatsapp_token: Optional[str] = None
     phone_number_id: Optional[str] = None
@@ -1804,6 +1813,147 @@ async def wa_send_text(phone: str, message: str, token: str = None, phone_id: st
     except Exception as e:
         logger.error(f"WA send error: {e}")
         return {"error": str(e)}
+
+
+async def wa_upload_media(file_bytes: bytes, filename: str, mime_type: str, token: str, phone_id: str):
+    """Upload a media file to WhatsApp and return the media_id"""
+    if not token or not phone_id:
+        return {"error": "WhatsApp no configurado"}
+    url = f"{WA_GRAPH_URL}/{phone_id}/media"
+    files = {
+        "file": (filename, file_bytes, mime_type),
+        "messaging_product": (None, "whatsapp"),
+        "type": (None, mime_type),
+    }
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        async with httpx.AsyncClient(timeout=60) as c:
+            resp = await c.post(url, files=files, headers=headers)
+            return resp.json()
+    except Exception as e:
+        logger.error(f"WA upload_media error: {e}")
+        return {"error": str(e)}
+
+
+async def wa_send_image(phone: str, media_id: str, caption: str = "", token: str = None, phone_id: str = None):
+    """Send a WhatsApp image by media_id via Cloud API"""
+    if not token or not phone_id:
+        return {"error": "WhatsApp no configurado"}
+    url = f"{WA_GRAPH_URL}/{phone_id}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "image",
+        "image": {"id": media_id},
+    }
+    if caption:
+        payload["image"]["caption"] = caption
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            resp = await c.post(url, json=payload, headers=headers)
+            return resp.json()
+    except Exception as e:
+        logger.error(f"WA send image error: {e}")
+        return {"error": str(e)}
+
+
+async def wa_send_audio(phone: str, media_id: str, token: str = None, phone_id: str = None, as_voice: bool = True):
+    """Send a WhatsApp audio/voice note by media_id via Cloud API."""
+    if not token or not phone_id:
+        return {"error": "WhatsApp no configurado"}
+    url = f"{WA_GRAPH_URL}/{phone_id}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "audio",
+        "audio": {"id": media_id, "voice": bool(as_voice)},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            resp = await c.post(url, json=payload, headers=headers)
+            return resp.json()
+    except Exception as e:
+        logger.error(f"WA send audio error: {e}")
+        return {"error": str(e)}
+
+
+async def send_auto_welcome(crm_lead: dict, line: dict):
+    """
+    Auto-send welcome message when a lead sends their FIRST message.
+    Takes welcome_message from the first active cajero assigned to the line.
+    Falls back to any admin user's welcome_message if no cajero has one.
+    Silent no-op if no welcome is configured.
+    """
+    try:
+        lead_id = crm_lead.get("id")
+        line_id = line.get("id")
+        phone = crm_lead.get("phone")
+        if not line_id or not phone:
+            return
+
+        if not line.get("whatsapp_token") or not line.get("phone_number_id"):
+            return
+
+        # Find welcome_message from cajeros assigned to this line first
+        welcome_msg = None
+        welcome_by = None
+        async for user in db.users.find({
+            "line_ids": line_id,
+            "is_active": True,
+            "role": "cajero",
+        }):
+            msg = (user.get("welcome_message") or "").strip()
+            if msg:
+                welcome_msg = msg
+                welcome_by = user.get("email")
+                break
+
+        # Fallback: any admin with welcome_message
+        if not welcome_msg:
+            async for user in db.users.find({"role": "admin", "is_active": True}):
+                msg = (user.get("welcome_message") or "").strip()
+                if msg:
+                    welcome_msg = msg
+                    welcome_by = user.get("email")
+                    break
+
+        if not welcome_msg:
+            logger.info(f"Auto-welcome: no welcome_message configured (line={line.get('name')}, lead={lead_id}) — skipping")
+            return
+
+        # Send the welcome via WhatsApp
+        result = await wa_send_text(
+            phone=phone,
+            message=welcome_msg,
+            token=line["whatsapp_token"],
+            phone_id=line["phone_number_id"],
+        )
+
+        # Persist in chat history so cajero sees it
+        now = datetime.now(timezone.utc).isoformat()
+        await db.crm_messages.insert_one({
+            "id": str(uuid.uuid4()),
+            "lead_id": lead_id,
+            "content": welcome_msg,
+            "sender": "admin",
+            "message_type": "text",
+            "auto_welcome": True,
+            "sent_by": welcome_by,
+            "created_at": now,
+            "wa_result": result,
+        })
+        await db.crm_leads.update_one(
+            {"id": lead_id},
+            {
+                "$set": {"last_interaction": now, "updated_at": now, "welcome_sent_at": now},
+                "$inc": {"messages_count": 1},
+            }
+        )
+        logger.info(f"Auto-welcome sent to {phone} on line {line.get('name')} (by {welcome_by})")
+    except Exception as e:
+        logger.error(f"Auto-welcome failed: {e}")
 
 # Webhook verification (PUBLIC - no auth, Meta calls this)
 @api_router.get("/whatsapp/webhook")
@@ -1984,6 +2134,11 @@ async def wa_webhook_receive(request: Request):
                                     "success": contact_result.get("success", False)
                                 }}}
                             )
+
+                        # Auto-send welcome message (fire-and-forget) if line is configured
+                        if crm_line and crm_line.get("whatsapp_token") and crm_line.get("phone_number_id"):
+                            import asyncio as _asyncio
+                            _asyncio.create_task(send_auto_welcome(crm_lead, crm_line))
                     else:
                         # Update existing lead
                         update_fields = {
@@ -2016,8 +2171,15 @@ async def wa_webhook_receive(request: Request):
                         # Update message count
                         await db.crm_leads.update_one(
                             {"phone": from_phone},
-                            {"$inc": {"messages_count": 1}}
+                            {"$inc": {"messages_count": 1, "unread_count": 1}}
                         )
+
+                        # Fire web push notification to every cajero assigned to this line
+                        if crm_line:
+                            import asyncio as _asyncio
+                            fresh_lead = await db.crm_leads.find_one({"phone": from_phone}, {"_id": 0}) or crm_lead
+                            preview_text = text if msg_type == "text" else f"[{msg_type}]"
+                            _asyncio.create_task(notify_line_cajeros_of_new_message(fresh_lead, crm_line, preview_text))
                     
                     # ═══════════════════════════════════════════════════════════════
 
@@ -2248,7 +2410,7 @@ async def wa_classify_contact(phone: str, data: WAClassify, current_user=Depends
                     meta_result = await send_meta_conversion_event(
                         event_name="Purchase",
                         lead_data=crm_lead,
-                        custom_data={"currency": "ARS", "value": charge, "content_type": "product"},
+                        custom_data={"currency": PURCHASE_CURRENCY, "value": charge, "content_type": "product"},
                         access_token=line["meta_access_token"],
                         pixel_id=line["meta_pixel_id"]
                     )
@@ -3027,14 +3189,14 @@ class CRMMessageCreate(BaseModel):
 class CRMReceiptValidation(BaseModel):
     status: str  # "approved" or "rejected"
     amount: Optional[float] = None
-    currency: Optional[str] = "ARS"
+    currency: Optional[str] = "USD"
     admin_notes: Optional[str] = ""
 
 class CRMLeadClassify(BaseModel):
     status: str  # basura, curioso, interesado, potencial, cliente_real
     send_to_meta: bool = True
     conversion_value: Optional[float] = None
-    currency: Optional[str] = "ARS"
+    currency: Optional[str] = "USD"
 
 # ─── Meta Conversions API Helper ───────────────────────────────────
 
@@ -3086,6 +3248,44 @@ async def extract_email_from_messages(lead_id: str) -> Optional[str]:
                 return match.group(0).lower().strip()
     return None
 
+
+async def extract_full_name_from_messages(lead_id: str) -> Optional[str]:
+    """
+    Scan the lead's own messages for full-name patterns so we can improve
+    first_name + last_name coverage when WhatsApp only gave us a single word.
+    Returns "Firstname Lastname" (Title-Cased) or None.
+    """
+    messages = await db.crm_messages.find(
+        {"lead_id": lead_id, "sender": "lead"},
+        {"_id": 0, "content": 1}
+    ).sort("created_at", 1).limit(30).to_list(30)
+
+    # Patterns that strongly indicate self-identification
+    patterns = [
+        r'(?:soy|me\s+llamo|mi\s+nombre\s+es|mi\s+nombre)\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,})\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,})',
+        r'(?:saludos|atte\.?|atentamente)[\s,]+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,})\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,})',
+    ]
+    blacklist = {
+        'buenas','buenos','tardes','noches','hola','chau','gracias','muchas','quiero',
+        'necesito','puedo','podria','podrias','quisiera','busco','pido','como','estas',
+        'para','sobre','dias','tarde','tengo','soy','llamo','nombre','cliente','cuenta',
+        'datos','clave','usuario','carga','retirar','depositar','jugar','info','ayuda',
+    }
+    for msg in messages:
+        content = msg.get("content", "")
+        if not isinstance(content, str) or len(content) > 500:
+            continue
+        for pat in patterns:
+            m = re.search(pat, content)
+            if m:
+                fn = m.group(1).lower()
+                ln = m.group(2).lower()
+                if fn in blacklist or ln in blacklist:
+                    continue
+                return f"{m.group(1).title()} {m.group(2).title()}"
+    return None
+
+
 # ── Auto-infer gender from first name (Spanish common names) ────────
 
 _MALE_NAMES = {
@@ -3100,6 +3300,25 @@ _MALE_NAMES = {
     'franco','joaquin','federico','rodrigo','bautista','santino','benicio','ciro',
     'benjamin','tobias','gael','dylan','nahuel','braian','jonathan','walter',
     'ruben','omar','alfredo','victor','cesar','rolando','gerardo','dario',
+    # Extended LATAM
+    'adrian','agustin','alex','alexis','alfonso','amilcar','andy','anibal','antonio',
+    'armando','arnoldo','arturo','augusto','aurelio','baltazar','basilio','bernardo',
+    'camilo','carmelo','cayetano','cipriano','cirilo','constantino','cornelio','cosme',
+    'cruz','danilo','demian','domingo','donato','efrain','eleuterio','eliseo',
+    'emanuel','emilio','enrique','erasmo','erick','erik','ernesto','esteban','eugenio',
+    'eusebio','evaristo','exequiel','fausto','felipe','felix','ferdinando','fidel',
+    'filemon','fortunato','gaston','genaro','german','gilberto','ginés','godofredo',
+    'guillermo','gumersindo','hilario','horacio','humberto','ian','isaac','isaias',
+    'isidro','ismael','israel','jair','jairo','javier','jeronimo','jesus','joan',
+    'joel','jonatan','josue','juanpa','juanpablo','julian','justo','leopoldo',
+    'liam','lionel','lisandro','lorenzo','luciano','luka','manuel','marcelino','mariano',
+    'marino','mateo','mauricio','maximo','maxi','mayco','mercedes','modesto','moises',
+    'nehuen','nehuén','octavio','olegario','ovidio','pascual','patricio','pio','placido',
+    'porfirio','prudencio','reinaldo','remigio','renzo','reynaldo','ricardo','roman',
+    'rosendo','rufino','rufo','salustiano','salvador','samuel','saul','severiano',
+    'sigfrido','silvano','silvio','simon','tadeo','teofilo','teobaldo','tito','ulises',
+    'urbano','valentin','valerio','vicente','vidal','vinicio','virgilio','wilfredo',
+    'wilmer','yago','zacarias',
 }
 _FEMALE_NAMES = {
     'maria','ana','laura','carolina','patricia','andrea','gabriela','claudia','silvia',
@@ -3113,6 +3332,28 @@ _FEMALE_NAMES = {
     'lara','mia','isabella','josefina','guadalupe','priscila','melina','tamara',
     'silvana','viviana','noelia','gisela','yanina','karen','jessica','daiana',
     'yamila','ludmila','oriana','jazmín','jazmin','mailen','ailén','ailen',
+    # Extended LATAM
+    'adela','adriana','agata','aida','alba','alondra','amalia','amanda','amparo',
+    'antonella','antonia','araceli','aurora','azucena','barbara','belen','belinda',
+    'benita','bernarda','betina','betty','blanca','brisa','camila','cami','carla',
+    'carmela','celia','celina','celine','chiara','clara','clarisa','cleo',
+    'constanza','coni','consuelo','cora','cristina','debora','denise','diana',
+    'dolores','doris','dulce','edith','elba','elisa','elsa','elvira','emma',
+    'estefania','estela','esther','eva','evelina','evelyn','fabiana','felicia',
+    'filomena','flora','francisca','genoveva','georgina','geraldine','gianna',
+    'gimena','gladys','gloria','griselda','haydee','hilda','indiana','ines',
+    'ingrid','iris','isabel','ivana','jacqueline','jamila','janet','jimena',
+    'joana','joanna','jordana','juana','justina','lali','leila','leticia',
+    'ligia','lila','lilian','linda','lola','lorena','lourdes','luciana','lucila',
+    'luisa','luisina','luna','macarena','maite','malena','mar','mara','marcela',
+    'margarita','mariela','marilyn','marisa','maritza','maru','melisa','mercedes',
+    'mia','mila','milena','mili','mirta','nadia','nahia','nancy','naomi',
+    'nayeli','nerea','nerina','nidia','nina','noemi','nora','odalis','ofelia',
+    'olga','olivia','ornella','paloma','paloma','pamela','patricia','paulina',
+    'perla','petra','ramona','raquel','regina','rina','rita','rosario','sabrina',
+    'salome','samanta','samara','sandra','sara','sarah','selena','serena','sheila',
+    'solana','stefania','stella','teresa','trinidad','ursula','valery','vera',
+    'veronica','virginia','wanda','xiomara','yael','yamila','yolanda','zaira','zulma',
 }
 
 def infer_gender_from_name(name: str) -> Optional[str]:
@@ -3237,6 +3478,19 @@ async def send_meta_conversion_event(
         
         # First name / Last name (improves EMQ score)
         name = lead_data.get("name", "")
+        # If we only have a first name, try to extract full name from chat messages
+        if name and lead_data.get("id"):
+            parts_check = name.strip().split()
+            if len(parts_check) == 1 and not name.startswith("Lead "):
+                full_name = await extract_full_name_from_messages(lead_data["id"])
+                if full_name:
+                    name = full_name
+                    # Persist so future events also get it
+                    await db.crm_leads.update_one(
+                        {"id": lead_data["id"]},
+                        {"$set": {"name": full_name, "name_enriched": True}}
+                    )
+                    logger.info(f"Meta CAPI: Enriched name '{lead_data.get('name')}' -> '{full_name}' for lead {lead_data.get('id')}")
         if name and name.strip() and not name.startswith("Lead "):
             parts = name.strip().split()
             fn = parts[0].lower()
@@ -3353,16 +3607,16 @@ async def send_meta_conversion_event(
             if event_name == "Purchase":
                 raw_value = custom_data.get("value", 0)
                 custom_data["value"] = float(raw_value) if raw_value else 0.0
-                # FORCE currency=ARS for all Purchase events regardless of payload.
-                # This guarantees no stale frontend cache or external webhook can
-                # send Purchase in USD/MXN/etc. Single source of truth.
+                # FORCE currency to the deployment-wide PURCHASE_CURRENCY
+                # (env var). This guarantees no stale frontend cache or
+                # external webhook can send Purchase with the wrong currency.
                 incoming_currency = custom_data.get("currency")
-                if incoming_currency and incoming_currency != "ARS":
+                if incoming_currency and incoming_currency != PURCHASE_CURRENCY:
                     logger.warning(
-                        f"Meta CAPI >> Overriding Purchase currency '{incoming_currency}' -> 'ARS' "
+                        f"Meta CAPI >> Overriding Purchase currency '{incoming_currency}' -> '{PURCHASE_CURRENCY}' "
                         f"| lead={lead_data.get('id', '?')}"
                     )
-                custom_data["currency"] = "ARS"
+                custom_data["currency"] = PURCHASE_CURRENCY
                 # Add content_type for better optimization
                 if "content_type" not in custom_data:
                     custom_data["content_type"] = "product"
@@ -3371,7 +3625,7 @@ async def send_meta_conversion_event(
             # Purchase MUST have custom_data with value/currency
             event_data["custom_data"] = {
                 "value": 0.0,
-                "currency": "ARS",
+                "currency": PURCHASE_CURRENCY,
                 "content_type": "product"
             }
         
@@ -3457,7 +3711,6 @@ async def crm_get_all_lines(current_user=Depends(get_current_user)):
 
 @api_router.post("/crm/lines")
 async def crm_create_line(data: CRMLineCreate, current_user=Depends(get_current_user)):
-    """Create a new WhatsApp line with full configuration"""
     if data.line_type not in CRM_LINE_TYPES:
         raise HTTPException(status_code=400, detail=f"Tipo de línea inválido. Opciones: {CRM_LINE_TYPES}")
     
@@ -3812,6 +4065,10 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                                     "success": contact_result.get("success", False)
                                 }}}
                             )
+
+                        # Auto-send welcome message from cajero config (fire-and-forget)
+                        import asyncio as _asyncio
+                        _asyncio.create_task(send_auto_welcome(crm_lead, line))
                     else:
                         # Update existing lead
                         update_fields = {
@@ -3876,6 +4133,12 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                     )
                     
                     logger.info(f"CRM: Message from {from_phone} saved on line {line['name']}")
+
+                    # Fire web push notification to every cajero assigned to this line
+                    import asyncio as _asyncio
+                    fresh_lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0}) or crm_lead
+                    preview_text = text if msg_type == "text" else f"[{msg_type}]"
+                    _asyncio.create_task(notify_line_cajeros_of_new_message(fresh_lead, line, preview_text))
 
     except Exception as e:
         logger.error(f"CRM Line webhook error: {e}")
@@ -4133,6 +4396,91 @@ async def crm_funnel_by_ad(
 
 # ─── CRM Leads Routes ──────────────────────────────────────────────
 
+@api_router.post("/crm/leads/enrich")
+async def crm_enrich_leads(
+    limit: int = Query(500, ge=1, le=5000),
+    current_user=Depends(get_current_user)
+):
+    """
+    Retroactively enrich existing leads with better matching data:
+    - Geo (city/state/zip) resolved from stored IP
+    - Full name from chat messages when WhatsApp only gave first name
+    - Gender inferred from first name
+    - Email extracted from chat messages
+    Improves future Meta CAPI event coverage (EMQ score).
+    """
+    if current_user.get("role") not in ("admin", "superadmin"):
+        raise HTTPException(status_code=403, detail="Solo admins pueden ejecutar enrichment")
+
+    stats = {"scanned": 0, "name_enriched": 0, "gender_enriched": 0, "geo_enriched": 0, "email_enriched": 0}
+
+    # Process leads missing any of the valuable fields
+    query = {
+        "$or": [
+            {"city": {"$in": [None, ""]}},
+            {"state": {"$in": [None, ""]}},
+            {"gender": {"$in": [None, ""]}},
+            {"email": {"$in": [None, ""]}},
+            {"name_enriched": {"$ne": True}},
+        ]
+    }
+    async for lead in db.crm_leads.find(query, {"_id": 0}).limit(limit):
+        stats["scanned"] += 1
+        updates = {}
+        lead_id = lead.get("id")
+        if not lead_id:
+            continue
+
+        # 1. Enrich name from chat
+        current_name = lead.get("name", "") or ""
+        parts = current_name.strip().split()
+        if (len(parts) <= 1 or lead.get("name_enriched") is not True) and not current_name.startswith("Lead "):
+            full_name = await extract_full_name_from_messages(lead_id)
+            if full_name and full_name != current_name:
+                updates["name"] = full_name
+                updates["name_enriched"] = True
+                stats["name_enriched"] += 1
+
+        # 2. Enrich geo from stored IP
+        if not lead.get("city") or not lead.get("state"):
+            ip = lead.get("ip_address")
+            if ip:
+                geo = await resolve_geo_from_ip(ip)
+                if geo:
+                    if geo.get("city") and not lead.get("city"):
+                        updates["city"] = geo["city"]
+                    if geo.get("state") and not lead.get("state"):
+                        updates["state"] = geo["state"]
+                    if geo.get("zip") and not lead.get("zip_code"):
+                        updates["zip_code"] = geo["zip"]
+                    if geo.get("country_code") and not lead.get("country_code"):
+                        updates["country_code"] = geo["country_code"]
+                    if any(k in updates for k in ("city", "state", "zip_code", "country_code")):
+                        stats["geo_enriched"] += 1
+
+        # 3. Enrich gender from name
+        if not lead.get("gender"):
+            effective_name = updates.get("name", current_name)
+            gender = infer_gender_from_name(effective_name)
+            if gender:
+                updates["gender"] = gender
+                stats["gender_enriched"] += 1
+
+        # 4. Enrich email from chat
+        if not lead.get("email"):
+            email = await extract_email_from_messages(lead_id)
+            if email:
+                updates["email"] = email
+                stats["email_enriched"] += 1
+
+        if updates:
+            updates["enriched_at"] = datetime.now(timezone.utc).isoformat()
+            await db.crm_leads.update_one({"id": lead_id}, {"$set": updates})
+
+    logger.info(f"Enrich leads: {stats}")
+    return {"ok": True, "stats": stats}
+
+
 @api_router.get("/crm/leads")
 async def crm_get_all_leads(
     status: Optional[str] = None,
@@ -4368,7 +4716,8 @@ async def crm_classify_lead(
     Status options (simplified):
     - nuevo: New lead, no classification yet (no event)
     - spam: Spam/Bot (sends LowQualityLead to Meta)
-    - consultas: Just asking, no purchase intent (sends LowQualityLead to Meta)
+    - consultas: Just asking — STANDBY tag only, NO Meta event sent
+      (prevents negative signal before a potential late Purchase)
     - valido: Valid customer who made a purchase (sends Purchase to Meta)
     
     Uses line-specific Meta credentials if the lead is assigned to a line
@@ -4426,8 +4775,8 @@ async def crm_classify_lead(
         if data.status == "valido":
             # Send Purchase event for valid customers
             purchase_value = float(data.conversion_value) if data.conversion_value else 0.0
-            # FORCE ARS regardless of payload — single source of truth
-            purchase_currency = "ARS"
+            # Currency from deployment-wide env var (USD or ARS)
+            purchase_currency = PURCHASE_CURRENCY
             custom_data = {
                 "currency": purchase_currency,
                 "value": purchase_value,
@@ -4455,8 +4804,8 @@ async def crm_classify_lead(
                 "success": meta_result.get("success", False)
             }]
             
-        elif data.status in ["spam", "consultas"]:
-            # For spam/consultas - send LowQualityLead event
+        elif data.status == "spam":
+            # For spam — send LowQualityLead event to Meta (teaches algo to avoid similar profiles)
             meta_result = await send_meta_conversion_event(
                 event_name="LowQualityLead",
                 lead_data=lead,
@@ -4475,6 +4824,14 @@ async def crm_classify_lead(
                 "pixel_id": use_pixel[:8] + "..." if use_pixel else None,
                 "success": meta_result.get("success", False)
             }]
+
+        elif data.status == "consultas":
+            # "Consultas" is a STANDBY tag — no Meta event sent.
+            # Reason: many leads ask first and purchase 4+ hours later. If we send
+            # LowQualityLead now, we can't override with Purchase later (Meta dedupe
+            # + negative signal already sent). Keep the lead clean for future Purchase.
+            event_sent = None
+            logger.info(f"CRM: Lead {lead_id} marked as 'consultas' (standby, no Meta event sent)")
     
     await db.crm_leads.update_one({"id": lead_id}, {"$set": update_data})
     updated_lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
@@ -4788,9 +5145,272 @@ async def crm_send_message(
         "contact_event_sent": meta_result is not None,
         "meta_result": meta_result
         }
-# ─── CRM Receipts Routes ───────────────────────────────────────────
 
-from fastapi import UploadFile, File
+# ─── CRM Send Image Message ────────────────────────────────────────
+
+from fastapi import UploadFile, File, Form
+
+@api_router.post("/crm/leads/{lead_id}/messages/image")
+async def crm_send_image_message(
+    lead_id: str,
+    file: UploadFile = File(...),
+    caption: str = Form(""),
+    current_user=Depends(get_current_user)
+):
+    """Upload an image and send it via WhatsApp to the lead. Stores it in chat history."""
+    lead = await db.crm_leads.find_one({"id": lead_id})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead no encontrado")
+
+    allowed_types = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail=f"Tipo de archivo no permitido: {file.content_type}")
+
+    if not lead.get("line_id") or not lead.get("phone"):
+        raise HTTPException(status_code=400, detail="Lead sin línea o teléfono configurado")
+
+    line = await db.crm_lines.find_one({"id": lead["line_id"]}, {"_id": 0})
+    if not line or not line.get("whatsapp_token") or not line.get("phone_number_id"):
+        raise HTTPException(status_code=400, detail="Línea sin credenciales de WhatsApp")
+
+    # Read file bytes
+    file_bytes = await file.read()
+    if len(file_bytes) > 10 * 1024 * 1024:  # 10 MB limit (WA max ~5MB but leave margin)
+        raise HTTPException(status_code=400, detail="Imagen muy grande (máx 10MB)")
+
+    # Save locally for chat history preview
+    os.makedirs("/app/backend/uploads/chat", exist_ok=True)
+    file_ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else "jpg"
+    image_id = str(uuid.uuid4())
+    file_name = f"{image_id}.{file_ext}"
+    file_path = f"/app/backend/uploads/chat/{file_name}"
+    with open(file_path, "wb") as f:
+        f.write(file_bytes)
+
+    # 1. Upload media to WhatsApp
+    upload_res = await wa_upload_media(
+        file_bytes=file_bytes,
+        filename=file.filename or file_name,
+        mime_type=file.content_type,
+        token=line["whatsapp_token"],
+        phone_id=line["phone_number_id"],
+    )
+    media_id = upload_res.get("id") if isinstance(upload_res, dict) else None
+    if not media_id:
+        logger.error(f"WA media upload failed for lead {lead_id}: {upload_res}")
+        raise HTTPException(status_code=502, detail=f"Error subiendo imagen a WhatsApp: {upload_res}")
+
+    # 2. Send image to the lead
+    send_res = await wa_send_image(
+        phone=lead["phone"],
+        media_id=media_id,
+        caption=caption or "",
+        token=line["whatsapp_token"],
+        phone_id=line["phone_number_id"],
+    )
+    whatsapp_ok = isinstance(send_res, dict) and "error" not in send_res and send_res.get("messages")
+
+    # 3. Store message in chat history
+    now = datetime.now(timezone.utc).isoformat()
+    message = {
+        "id": image_id,
+        "lead_id": lead_id,
+        "content": caption or "[Imagen]",
+        "sender": "admin",
+        "message_type": "image",
+        "image_path": file_name,
+        "caption": caption or "",
+        "created_at": now,
+        "wa_result": send_res,
+    }
+    await db.crm_messages.insert_one(message)
+    await db.crm_leads.update_one(
+        {"id": lead_id},
+        {
+            "$set": {"last_interaction": now, "updated_at": now},
+            "$inc": {"messages_count": 1}
+        }
+    )
+
+    message.pop("_id", None)
+    return {
+        "message": message,
+        "whatsapp_sent": bool(whatsapp_ok),
+        "whatsapp_result": send_res,
+        "media_id": media_id,
+    }
+
+
+@api_router.get("/crm/chat-image/{filename}")
+async def crm_get_chat_image(filename: str):
+    """Serve a chat image uploaded by admin (public — UUID filenames are unguessable).
+
+    Native <img src> cannot attach auth headers, so this endpoint must be public.
+    """
+    from fastapi.responses import FileResponse
+    # Sanity: prevent path traversal
+    if "/" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Filename inválido")
+    file_path = f"/app/backend/uploads/chat/{filename}"
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Imagen no encontrada")
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "jpg"
+    mime = {"png": "image/png", "webp": "image/webp", "gif": "image/gif", "jpg": "image/jpeg", "jpeg": "image/jpeg"}.get(ext, "image/jpeg")
+    return FileResponse(file_path, media_type=mime)
+
+
+@api_router.post("/crm/leads/{lead_id}/messages/audio")
+async def crm_send_audio_message(
+    lead_id: str,
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user)
+):
+    """Upload an audio (voice note) and send it via WhatsApp to the lead."""
+    lead = await db.crm_leads.find_one({"id": lead_id})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead no encontrado")
+    if not lead.get("line_id") or not lead.get("phone"):
+        raise HTTPException(status_code=400, detail="Lead sin línea o teléfono configurado")
+
+    line = await db.crm_lines.find_one({"id": lead["line_id"]}, {"_id": 0})
+    if not line or not line.get("whatsapp_token") or not line.get("phone_number_id"):
+        raise HTTPException(status_code=400, detail="Línea sin credenciales de WhatsApp")
+
+    file_bytes = await file.read()
+    if len(file_bytes) > 16 * 1024 * 1024:  # 16 MB WhatsApp limit for audio
+        raise HTTPException(status_code=400, detail="Audio muy grande (máx 16MB)")
+
+    # Accept common browser MIME types. Meta Cloud API accepts:
+    # audio/aac, audio/mp4, audio/mpeg, audio/amr, audio/ogg (opus)
+    # NOTE: Meta REJECTS webm container even if codec is opus, so we must
+    # transcode webm → ogg/opus via ffmpeg. Android Chrome records webm.
+    ctype = (file.content_type or "").lower()
+    base = ctype.split(";")[0].strip()
+    needs_transcode = base in ("audio/webm", "video/webm", "audio/x-matroska")
+
+    ext_map = {
+        "audio/ogg": ("ogg", "audio/ogg"),
+        "audio/mpeg": ("mp3", "audio/mpeg"),
+        "audio/mp3": ("mp3", "audio/mpeg"),
+        "audio/mp4": ("m4a", "audio/mp4"),
+        "audio/x-m4a": ("m4a", "audio/mp4"),
+        "audio/aac": ("aac", "audio/aac"),
+        "audio/amr": ("amr", "audio/amr"),
+    }
+    if needs_transcode:
+        ext, meta_mime = ("ogg", "audio/ogg")
+    elif base in ext_map:
+        ext, meta_mime = ext_map[base]
+    else:
+        raise HTTPException(status_code=400, detail=f"Formato no soportado: {ctype}. Usa ogg/opus, mp3, m4a, aac o amr.")
+
+    # Save locally for history (pre-transcode for fallback)
+    os.makedirs("/app/backend/uploads/chat", exist_ok=True)
+    audio_id = str(uuid.uuid4())
+    file_name = f"{audio_id}.{ext}"
+    file_path = f"/app/backend/uploads/chat/{file_name}"
+
+    # Transcode webm → ogg/opus using ffmpeg (required by Meta)
+    if needs_transcode:
+        import subprocess
+        import tempfile
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp_in:
+                tmp_in.write(file_bytes)
+                tmp_in_path = tmp_in.name
+            proc = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", tmp_in_path,
+                    "-c:a", "libopus", "-b:a", "64k",
+                    "-vn", "-f", "ogg",
+                    file_path,
+                ],
+                capture_output=True, timeout=45,
+            )
+            os.unlink(tmp_in_path)
+            if proc.returncode != 0:
+                err = proc.stderr.decode(errors="ignore")[-500:]
+                logger.error(f"ffmpeg audio transcode failed: {err}")
+                raise HTTPException(status_code=502, detail=f"Error convirtiendo audio (ffmpeg): {err[:200]}")
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+        except FileNotFoundError:
+            raise HTTPException(status_code=500, detail="ffmpeg no está instalado en el servidor. Instalá con: apt-get install -y ffmpeg")
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=504, detail="Conversión de audio tardó demasiado")
+    else:
+        with open(file_path, "wb") as f:
+            f.write(file_bytes)
+
+    # Upload to WhatsApp with the Meta-accepted MIME
+    upload_res = await wa_upload_media(
+        file_bytes=file_bytes,
+        filename=file.filename or file_name,
+        mime_type=meta_mime,
+        token=line["whatsapp_token"],
+        phone_id=line["phone_number_id"],
+    )
+    media_id = upload_res.get("id") if isinstance(upload_res, dict) else None
+    if not media_id:
+        logger.error(f"WA audio upload failed for lead {lead_id}: {upload_res}")
+        raise HTTPException(status_code=502, detail=f"Error subiendo audio: {upload_res}")
+
+    send_res = await wa_send_audio(
+        phone=lead["phone"],
+        media_id=media_id,
+        token=line["whatsapp_token"],
+        phone_id=line["phone_number_id"],
+        as_voice=True,
+    )
+    whatsapp_ok = isinstance(send_res, dict) and "error" not in send_res and send_res.get("messages")
+
+    now = datetime.now(timezone.utc).isoformat()
+    message = {
+        "id": audio_id,
+        "lead_id": lead_id,
+        "content": "[Audio]",
+        "sender": "admin",
+        "message_type": "audio",
+        "audio_path": file_name,
+        "audio_mime": meta_mime,
+        "created_at": now,
+        "wa_result": send_res,
+    }
+    await db.crm_messages.insert_one(message)
+    await db.crm_leads.update_one(
+        {"id": lead_id},
+        {
+            "$set": {"last_interaction": now, "updated_at": now},
+            "$inc": {"messages_count": 1}
+        }
+    )
+    message.pop("_id", None)
+    return {
+        "message": message,
+        "whatsapp_sent": bool(whatsapp_ok),
+        "whatsapp_result": send_res,
+        "media_id": media_id,
+    }
+
+
+@api_router.get("/crm/chat-audio/{filename}")
+async def crm_get_chat_audio(filename: str):
+    """Serve a chat audio uploaded by admin.
+    Public endpoint — filenames are UUIDs (unguessable). Native <audio src>
+    cannot attach auth headers, so protecting this would break playback.
+    """
+    from fastapi.responses import FileResponse
+    if "/" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Filename inválido")
+    file_path = f"/app/backend/uploads/chat/{filename}"
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Audio no encontrado")
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "ogg"
+    mime = {"ogg": "audio/ogg", "mp3": "audio/mpeg", "m4a": "audio/mp4", "aac": "audio/aac", "amr": "audio/amr"}.get(ext, "audio/ogg")
+    return FileResponse(file_path, media_type=mime)
+
+
+# ─── CRM Receipts Routes ───────────────────────────────────────────
 
 @api_router.post("/crm/leads/{lead_id}/receipts")
 async def crm_upload_receipt(
@@ -5027,7 +5647,7 @@ async def crm_leads_by_source(current_user=Depends(get_current_user)):
 async def crm_send_conversion_to_meta(
     lead_id: str,
     value: float = Query(0, description="Conversion value"),
-    currency: str = Query("ARS", description="Currency code"),
+    currency: str = Query("USD", description="Currency code"),
     current_user=Depends(get_current_user)
 ):
     """
@@ -5064,8 +5684,8 @@ async def crm_send_conversion_to_meta(
         )
     
     purchase_value = float(value) if value else 0.0
-    # FORCE ARS regardless of payload — single source of truth
-    purchase_currency = "ARS"
+    # Currency from deployment-wide env var (USD or ARS)
+    purchase_currency = PURCHASE_CURRENCY
     custom_data = {
         "currency": purchase_currency,
         "value": purchase_value,
@@ -5358,6 +5978,473 @@ async def crm_emq_dashboard(
         "by_event_type": by_type,
         "recent_events": recent_with_emq,
     }
+
+
+# ─── Web Push Notifications (VAPID) ────────────────────────────────
+# Keeps cajero notified even when Chrome is closed (works via background service worker)
+
+from pywebpush import webpush, WebPushException
+from py_vapid import Vapid
+
+_vapid_cache = {"public": None, "private_pem": None, "subject": None, "vapid_obj": None}
+
+async def get_vapid_keys():
+    """Get VAPID keys from MongoDB settings (persists across restarts).
+    Generates on first call if not present."""
+    if _vapid_cache["public"] and _vapid_cache["vapid_obj"]:
+        return _vapid_cache
+    # 1. Try env first
+    env_pub = os.environ.get("VAPID_PUBLIC_KEY")
+    env_priv = os.environ.get("VAPID_PRIVATE_PEM")
+    env_subj = os.environ.get("VAPID_SUBJECT", "mailto:admin@crm.local")
+    doc = None
+    if env_pub and env_priv:
+        _vapid_cache.update({"public": env_pub, "private_pem": env_priv, "subject": env_subj})
+    else:
+        # 2. Try DB
+        doc = await db.settings.find_one({"key": "vapid_keys"})
+        if doc:
+            _vapid_cache.update({
+                "public": doc["public"],
+                "private_pem": doc["private_pem"],
+                "subject": doc.get("subject", env_subj),
+            })
+        else:
+            # 3. Generate once and persist
+            from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+            v = Vapid()
+            v.generate_keys()
+            priv_pem = v.private_pem().decode()
+            pub_bytes = v.public_key.public_bytes(
+                encoding=Encoding.X962, format=PublicFormat.UncompressedPoint
+            )
+            pub_b64 = base64.urlsafe_b64encode(pub_bytes).decode().rstrip("=")
+            await db.settings.insert_one({
+                "key": "vapid_keys",
+                "public": pub_b64,
+                "private_pem": priv_pem,
+                "subject": env_subj,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+            _vapid_cache.update({"public": pub_b64, "private_pem": priv_pem, "subject": env_subj})
+            logger.info("Generated and persisted new VAPID keys")
+
+    # Build the Vapid object from the PEM so pywebpush 2.x accepts it
+    # (pywebpush 2.x no longer accepts raw PEM strings — needs a Vapid instance)
+    try:
+        vapid_obj = Vapid.from_pem(_vapid_cache["private_pem"].encode())
+        _vapid_cache["vapid_obj"] = vapid_obj
+    except Exception as e:
+        logger.error(f"Failed to build Vapid object from PEM: {e}")
+        _vapid_cache["vapid_obj"] = None
+    return _vapid_cache
+
+
+@api_router.get("/push/vapid-public-key")
+async def push_get_vapid_public_key(current_user=Depends(get_current_user)):
+    """Return VAPID public key so the frontend can subscribe to push."""
+    keys = await get_vapid_keys()
+    return {"public_key": keys["public"]}
+
+
+class PushSubscriptionPayload(BaseModel):
+    endpoint: str
+    keys: Dict[str, str]  # {p256dh, auth}
+    user_agent: Optional[str] = ""
+
+
+@api_router.post("/push/subscribe")
+async def push_subscribe(data: PushSubscriptionPayload, current_user=Depends(get_current_user)):
+    """Register/update a push subscription for the current user (one per browser)."""
+    now = datetime.now(timezone.utc).isoformat()
+    sub_doc = {
+        "user_id": current_user["id"],
+        "user_email": current_user.get("email"),
+        "endpoint": data.endpoint,
+        "keys": data.keys,
+        "user_agent": (data.user_agent or "")[:200],
+        "updated_at": now,
+    }
+    # Upsert by endpoint (each browser = unique endpoint)
+    existing = await db.push_subscriptions.find_one({"endpoint": data.endpoint})
+    if existing:
+        await db.push_subscriptions.update_one(
+            {"endpoint": data.endpoint},
+            {"$set": sub_doc}
+        )
+    else:
+        sub_doc["created_at"] = now
+        await db.push_subscriptions.insert_one(sub_doc)
+    logger.info(f"Push subscribed: user={current_user.get('email')} endpoint=...{data.endpoint[-20:]}")
+    return {"ok": True}
+
+
+@api_router.post("/push/unsubscribe")
+async def push_unsubscribe(data: PushSubscriptionPayload, current_user=Depends(get_current_user)):
+    """Remove a push subscription."""
+    await db.push_subscriptions.delete_one({
+        "user_id": current_user["id"],
+        "endpoint": data.endpoint
+    })
+    return {"ok": True}
+
+
+async def send_web_push(user_id: str, title: str, body: str, data: dict = None):
+    """Send a push notification to ALL browsers where user_id has subscribed."""
+    try:
+        keys = await get_vapid_keys()
+        vapid_obj = keys.get("vapid_obj")
+        if not vapid_obj:
+            logger.warning("Web push skipped: VAPID object not available")
+            return {"sent": 0, "failed": 0, "gone": 0}
+        payload = {
+            "title": title,
+            "body": body,
+            "data": data or {},
+        }
+        payload_json = json.dumps(payload)
+        vapid_claims = {"sub": keys["subject"]}
+        sent, failed, gone = 0, 0, 0
+        async for sub in db.push_subscriptions.find({"user_id": user_id}):
+            try:
+                webpush(
+                    subscription_info={
+                        "endpoint": sub["endpoint"],
+                        "keys": sub["keys"],
+                    },
+                    data=payload_json,
+                    vapid_private_key=vapid_obj,  # pywebpush 2.x expects a Vapid instance
+                    vapid_claims=vapid_claims,
+                    ttl=60,  # seconds
+                )
+                sent += 1
+            except WebPushException as e:
+                # 404/410 = subscription expired, remove it
+                status = getattr(e.response, "status_code", None) if hasattr(e, "response") and e.response else None
+                if status in (404, 410):
+                    await db.push_subscriptions.delete_one({"endpoint": sub["endpoint"]})
+                    gone += 1
+                else:
+                    failed += 1
+                    logger.warning(f"Web push failed ({status}): {e}")
+            except Exception as e:
+                failed += 1
+                logger.warning(f"Web push error: {e}")
+        if sent or failed or gone:
+            logger.info(f"Web push sent to {user_id}: sent={sent}, failed={failed}, gone={gone}")
+        return {"sent": sent, "failed": failed, "gone": gone}
+    except Exception as e:
+        logger.error(f"send_web_push fatal: {e}")
+        return {"sent": 0, "failed": 1, "gone": 0}
+
+
+async def notify_line_cajeros_of_new_message(crm_lead: dict, line: dict, message_preview: str = ""):
+    """Send web push to every cajero assigned to this line."""
+    try:
+        line_id = line.get("id")
+        if not line_id:
+            return
+        # Find cajeros assigned to this line
+        cajero_ids = []
+        async for user in db.users.find({"line_ids": line_id, "is_active": True}, {"id": 1}):
+            cajero_ids.append(user.get("id"))
+        if not cajero_ids:
+            return
+        title = crm_lead.get("name") or crm_lead.get("phone") or "Nuevo mensaje"
+        body_parts = []
+        if line.get("name"):
+            body_parts.append(f"📱 {line['name']}")
+        if message_preview:
+            preview = message_preview[:80] + ("…" if len(message_preview) > 80 else "")
+            body_parts.append(preview)
+        else:
+            body_parts.append("Nuevo mensaje")
+        body = " · ".join(body_parts)
+        data = {
+            "lead_id": crm_lead.get("id"),
+            "lead_name": crm_lead.get("name"),
+            "phone": crm_lead.get("phone"),
+            "line_id": line_id,
+            "url": "/leads",
+        }
+        for uid in cajero_ids:
+            await send_web_push(uid, title, body, data)
+    except Exception as e:
+        logger.error(f"notify_line_cajeros_of_new_message error: {e}")
+
+
+# ─── CRM Broadcast (Bulk Messaging with Anti-Spam) ─────────────────
+
+class BroadcastCreate(BaseModel):
+    line_id: str
+    target_status: List[str] = ["valido"]
+    message: str
+    image_path: Optional[str] = None  # local filename from prior upload (optional)
+    min_delay_sec: int = 4
+    max_delay_sec: int = 10
+    max_per_hour: int = 300
+
+_broadcast_workers: Dict[str, "asyncio.Task"] = {}
+
+
+@api_router.post("/crm/broadcast/upload-image")
+async def crm_broadcast_upload_image(
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user)
+):
+    """Upload an image for broadcast use (returns filename to pass to create)"""
+    allowed = ["image/jpeg", "image/jpg", "image/png", "image/webp"]
+    if file.content_type not in allowed:
+        raise HTTPException(status_code=400, detail="Solo JPG/PNG/WebP")
+    data = await file.read()
+    if len(data) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Imagen muy grande (máx 5MB)")
+    os.makedirs("/app/backend/uploads/broadcast", exist_ok=True)
+    ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else "jpg"
+    name = f"{uuid.uuid4()}.{ext}"
+    path = f"/app/backend/uploads/broadcast/{name}"
+    with open(path, "wb") as f:
+        f.write(data)
+    return {"filename": name, "url": f"/api/crm/broadcast-image/{name}"}
+
+
+@api_router.get("/crm/broadcast-image/{filename}")
+async def crm_broadcast_get_image(filename: str, current_user=Depends(get_current_user)):
+    from fastapi.responses import FileResponse
+    if "/" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Inválido")
+    path = f"/app/backend/uploads/broadcast/{filename}"
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="No encontrada")
+    return FileResponse(path)
+
+
+@api_router.post("/crm/broadcast")
+async def crm_create_broadcast(data: BroadcastCreate, current_user=Depends(get_current_user)):
+    """Create a broadcast job. Sends to all leads of selected line with target_status.
+    - Admins can broadcast to any line.
+    - Cajeros can only broadcast to lines they are assigned to (user.line_ids).
+    """
+    role = current_user.get("role")
+    user_line_ids = current_user.get("line_ids", []) or []
+    if role not in ("admin", "superadmin"):
+        # Cajero: must be assigned to this line
+        if data.line_id not in user_line_ids:
+            raise HTTPException(status_code=403, detail="No tenés permiso para enviar masivos en esta línea")
+
+    line = await db.crm_lines.find_one({"id": data.line_id}, {"_id": 0})
+    if not line:
+        raise HTTPException(status_code=404, detail="Línea no encontrada")
+    if not line.get("whatsapp_token") or not line.get("phone_number_id"):
+        raise HTTPException(status_code=400, detail="Línea sin credenciales de WhatsApp")
+    if not data.message.strip():
+        raise HTTPException(status_code=400, detail="Mensaje vacío")
+
+    # Find target leads
+    target_leads = []
+    cursor = db.crm_leads.find(
+        {"line_id": data.line_id, "status": {"$in": data.target_status}, "phone": {"$ne": None}},
+        {"_id": 0, "id": 1, "phone": 1, "name": 1}
+    )
+    async for lead in cursor:
+        if lead.get("phone"):
+            target_leads.append({"id": lead["id"], "phone": lead["phone"], "name": lead.get("name", "")})
+    if not target_leads:
+        raise HTTPException(status_code=400, detail="No hay leads con ese estado en la línea")
+
+    broadcast_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "id": broadcast_id,
+        "line_id": data.line_id,
+        "line_name": line.get("name"),
+        "created_by": current_user.get("email"),
+        "created_at": now,
+        "message": data.message,
+        "image_path": data.image_path or None,
+        "target_status": data.target_status,
+        "min_delay_sec": max(2, int(data.min_delay_sec)),
+        "max_delay_sec": max(int(data.min_delay_sec) + 1, int(data.max_delay_sec)),
+        "max_per_hour": min(max(int(data.max_per_hour), 10), 600),
+        "total": len(target_leads),
+        "sent": 0,
+        "failed": 0,
+        "skipped": 0,
+        "status": "running",  # running | paused | done | cancelled
+        "target_phones": [{"id": l["id"], "phone": l["phone"], "name": l["name"], "sent": False} for l in target_leads],
+    }
+    await db.crm_broadcasts.insert_one(doc)
+
+    # Fire background worker (fire-and-forget)
+    import asyncio
+    task = asyncio.create_task(_broadcast_worker(broadcast_id, line))
+    _broadcast_workers[broadcast_id] = task
+
+    doc.pop("_id", None)
+    doc.pop("target_phones", None)  # don't leak phone list in response
+    return doc
+
+
+async def _broadcast_worker(broadcast_id: str, line: dict):
+    """Sends broadcast messages with jitter + rate-limit + cancel support."""
+    import asyncio, random
+    try:
+        # Preload image media_id once (if image attached)
+        image_media_id = None
+        bc = await db.crm_broadcasts.find_one({"id": broadcast_id})
+        if not bc:
+            return
+        if bc.get("image_path"):
+            img_path = f"/app/backend/uploads/broadcast/{bc['image_path']}"
+            if os.path.exists(img_path):
+                with open(img_path, "rb") as f:
+                    img_bytes = f.read()
+                ext = bc["image_path"].rsplit(".", 1)[-1].lower() if "." in bc["image_path"] else "jpg"
+                mime = {"png": "image/png", "webp": "image/webp", "jpg": "image/jpeg", "jpeg": "image/jpeg"}.get(ext, "image/jpeg")
+                up = await wa_upload_media(
+                    file_bytes=img_bytes, filename=bc["image_path"], mime_type=mime,
+                    token=line["whatsapp_token"], phone_id=line["phone_number_id"]
+                )
+                image_media_id = up.get("id") if isinstance(up, dict) else None
+
+        # Rate limiting: spread over time
+        max_per_hour = bc["max_per_hour"]
+        min_gap = 3600 / max_per_hour  # base seconds between sends
+
+        sent = bc.get("sent", 0)
+        failed = bc.get("failed", 0)
+        targets = bc.get("target_phones", [])
+
+        for idx, t in enumerate(targets):
+            if t.get("sent"):
+                continue
+            # Check cancellation
+            state = await db.crm_broadcasts.find_one({"id": broadcast_id}, {"status": 1})
+            if not state or state.get("status") in ("cancelled", "paused"):
+                logger.info(f"Broadcast {broadcast_id} stopped by status: {state.get('status') if state else 'missing'}")
+                return
+
+            # Personalize message with {nombre} {linea}
+            first_name = (t.get("name") or "").split()[0] if t.get("name") else ""
+            personalized = bc["message"].replace("{nombre}", first_name).replace("{linea}", line.get("name", ""))
+
+            try:
+                if image_media_id:
+                    res = await wa_send_image(
+                        phone=t["phone"], media_id=image_media_id, caption=personalized,
+                        token=line["whatsapp_token"], phone_id=line["phone_number_id"]
+                    )
+                else:
+                    res = await wa_send_text(
+                        phone=t["phone"], message=personalized,
+                        token=line["whatsapp_token"], phone_id=line["phone_number_id"]
+                    )
+                ok = isinstance(res, dict) and "error" not in res and res.get("messages")
+                status_code = None
+                if isinstance(res, dict) and res.get("error"):
+                    err = res.get("error")
+                    if isinstance(err, dict):
+                        status_code = err.get("code")
+
+                # Log individual send
+                await db.crm_broadcasts.update_one(
+                    {"id": broadcast_id, "target_phones.id": t["id"]},
+                    {"$set": {
+                        "target_phones.$.sent": True,
+                        "target_phones.$.success": bool(ok),
+                        "target_phones.$.sent_at": datetime.now(timezone.utc).isoformat(),
+                        "target_phones.$.result_code": status_code,
+                    }}
+                )
+                if ok:
+                    sent += 1
+                    await db.crm_broadcasts.update_one({"id": broadcast_id}, {"$inc": {"sent": 1}})
+                else:
+                    failed += 1
+                    await db.crm_broadcasts.update_one({"id": broadcast_id}, {"$inc": {"failed": 1}})
+                    # If Meta returned 80007 (rate limit) or 131049 (phone quality) → pause
+                    if status_code in (80007, 131049):
+                        logger.warning(f"Broadcast {broadcast_id} paused by Meta (code={status_code})")
+                        await db.crm_broadcasts.update_one({"id": broadcast_id}, {"$set": {"status": "paused", "paused_reason": f"Meta code {status_code}"}})
+                        return
+            except Exception as e:
+                failed += 1
+                logger.warning(f"Broadcast send error: {e}")
+                await db.crm_broadcasts.update_one(
+                    {"id": broadcast_id, "target_phones.id": t["id"]},
+                    {"$set": {
+                        "target_phones.$.sent": True,
+                        "target_phones.$.success": False,
+                        "target_phones.$.error": str(e)[:200],
+                    }}
+                )
+                await db.crm_broadcasts.update_one({"id": broadcast_id}, {"$inc": {"failed": 1}})
+
+            # Jittered delay between sends
+            jitter = random.uniform(bc["min_delay_sec"], bc["max_delay_sec"])
+            wait = max(jitter, min_gap)
+            await asyncio.sleep(wait)
+
+        # Mark done
+        await db.crm_broadcasts.update_one(
+            {"id": broadcast_id},
+            {"$set": {"status": "done", "finished_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        logger.info(f"Broadcast {broadcast_id} done: sent={sent}, failed={failed}")
+    except asyncio.CancelledError:
+        await db.crm_broadcasts.update_one(
+            {"id": broadcast_id}, {"$set": {"status": "cancelled"}}
+        )
+    except Exception as e:
+        logger.error(f"Broadcast worker {broadcast_id} fatal: {e}")
+        await db.crm_broadcasts.update_one(
+            {"id": broadcast_id}, {"$set": {"status": "error", "error": str(e)[:300]}}
+        )
+    finally:
+        _broadcast_workers.pop(broadcast_id, None)
+
+
+@api_router.get("/crm/broadcasts")
+async def crm_list_broadcasts(limit: int = Query(30, le=200), current_user=Depends(get_current_user)):
+    """List broadcasts. Cajero sees only their own; admin sees all."""
+    role = current_user.get("role")
+    query = {}
+    if role not in ("admin", "superadmin"):
+        query = {"created_by": current_user.get("email")}
+    docs = []
+    async for d in db.crm_broadcasts.find(query, {"_id": 0, "target_phones": 0}).sort("created_at", -1).limit(limit):
+        docs.append(d)
+    return {"broadcasts": docs}
+
+
+@api_router.get("/crm/broadcast/{broadcast_id}")
+async def crm_get_broadcast_detail(broadcast_id: str, current_user=Depends(get_current_user)):
+    """Detail of a broadcast. Cajero can only view their own."""
+    doc = await db.crm_broadcasts.find_one({"id": broadcast_id}, {"_id": 0, "target_phones": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Broadcast no encontrado")
+    role = current_user.get("role")
+    if role not in ("admin", "superadmin") and doc.get("created_by") != current_user.get("email"):
+        raise HTTPException(status_code=403, detail="No tenés permiso para ver este masivo")
+    return doc
+
+
+@api_router.post("/crm/broadcast/{broadcast_id}/cancel")
+async def crm_cancel_broadcast(broadcast_id: str, current_user=Depends(get_current_user)):
+    """Cancel a broadcast. Creator can cancel their own, admin can cancel any."""
+    bc = await db.crm_broadcasts.find_one({"id": broadcast_id}, {"_id": 0, "created_by": 1})
+    if not bc:
+        raise HTTPException(status_code=404, detail="Broadcast no encontrado")
+    role = current_user.get("role")
+    if role not in ("admin", "superadmin") and bc.get("created_by") != current_user.get("email"):
+        raise HTTPException(status_code=403, detail="Solo podés cancelar tus propios masivos")
+    await db.crm_broadcasts.update_one(
+        {"id": broadcast_id}, {"$set": {"status": "cancelled"}}
+    )
+    task = _broadcast_workers.get(broadcast_id)
+    if task and not task.done():
+        task.cancel()
+    return {"ok": True}
 
 
 # ─── Health & Root ─────────────────────────────────────────────────
