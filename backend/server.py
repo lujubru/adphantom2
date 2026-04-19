@@ -317,7 +317,22 @@ async def get_me(current_user=Depends(get_current_user)):
         "line_ids": current_user.get("line_ids", []),
         "welcome_message": current_user.get("welcome_message", ""),
         "user_message": current_user.get("user_message", ""),
+        "auto_welcome_enabled": current_user.get("auto_welcome_enabled", True),
     }
+
+
+@api_router.get("/auth/me/welcome-variant")
+async def get_welcome_variant(current_user=Depends(get_current_user)):
+    """Return a rotated/humanized variant of the current cajero's welcome.
+
+    Used by the "👋 Bienvenida" button in the chat panel so that each manual
+    click produces a different phrasing (prevents Meta from flagging the
+    exact-same-message pattern when cajeros send manually).
+    """
+    raw = (current_user.get("welcome_message") or "").strip()
+    if not raw:
+        return {"message": ""}
+    return {"message": _pick_welcome_variation(raw)}
 class UserCreate(BaseModel):
     email: str
     password: str
@@ -325,6 +340,7 @@ class UserCreate(BaseModel):
     line_ids: List[str] = []
     welcome_message: Optional[str] = ""
     user_message: Optional[str] = ""
+    auto_welcome_enabled: Optional[bool] = True
 
 class UserUpdate(BaseModel):
     email: Optional[str] = None
@@ -334,6 +350,7 @@ class UserUpdate(BaseModel):
     welcome_message: Optional[str] = None
     user_message: Optional[str] = None
     is_active: Optional[bool] = None
+    auto_welcome_enabled: Optional[bool] = None
 
 @api_router.post("/auth/users")
 async def create_user(data: UserCreate, current_user=Depends(get_current_user)):
@@ -351,6 +368,7 @@ async def create_user(data: UserCreate, current_user=Depends(get_current_user)):
         "line_ids": data.line_ids,
         "welcome_message": data.welcome_message or "",
         "user_message": data.user_message or "",
+        "auto_welcome_enabled": data.auto_welcome_enabled if data.auto_welcome_enabled is not None else True,
         "is_active": True,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
@@ -395,8 +413,14 @@ async def update_user(user_id: str, data: UserUpdate, current_user=Depends(get_c
     for k, v in data.model_dump(exclude_unset=True).items():
         if k == "password" and v:
             update_data["hashed_password"] = pwd_context.hash(v)
-        elif v is not None:
-            update_data[k] = v
+        elif k == "password":
+            # Empty password → skip (don't overwrite existing)
+            continue
+        else:
+            # Allow False/0/"" through — only `None` means "no change".
+            # exclude_unset already drops fields not present in the request.
+            if v is not None or k in ("auto_welcome_enabled",):
+                update_data[k] = v
     
     if update_data:
         update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -1879,14 +1903,83 @@ async def wa_send_audio(phone: str, media_id: str, token: str = None, phone_id: 
         return {"error": str(e)}
 
 
+def _pick_welcome_variation(raw_msg: str) -> str:
+    """Return a humanized variant of a welcome message.
+
+    Two-tier strategy to avoid looking like a bot to Meta Integrity:
+    1. If the cajero wrote multiple variants separated by '---' (3+ dashes on
+       their own line), pick one at random. Gives fine-grained control.
+    2. If only one variant, apply micro-variations: rotate the opening
+       greeting and swap a few cosmetic emojis. Keeps the business content
+       intact while breaking the 'identical byte-for-byte message to every
+       lead' pattern that Meta flags as automation.
+    """
+    import random
+    import re
+
+    # Tier 1 — explicit variants
+    parts = [p.strip() for p in re.split(r"\n\s*-{3,}\s*\n", raw_msg) if p.strip()]
+    if len(parts) > 1:
+        return random.choice(parts)
+
+    msg = parts[0] if parts else raw_msg.strip()
+
+    # Tier 2 — micro-variations on a single template.
+    # 2a. Opening greeting swap — only if the message starts with a common
+    #     Spanish greeting so we don't butcher user-authored openings.
+    greeting_pool = [
+        "¡Hola!", "¡Buenas!", "Hola!", "Buenas!",
+        "¡Hola! 👋", "¡Buenas! 👋", "Hola, ¿cómo estás?",
+        "¡Hola, cómo va!", "Buen día!",
+    ]
+    greet_pattern = re.compile(
+        r"^(¡?\s*(hola|buenas|buen día|buenos días|buenas tardes|buenas noches)[!\.,\s]*👋?)",
+        re.IGNORECASE,
+    )
+    m = greet_pattern.match(msg)
+    if m:
+        original = m.group(0)
+        new_greet = random.choice(greeting_pool)
+        # Preserve trailing space/punctuation after greeting
+        rest = msg[len(original):]
+        if rest and not rest.startswith((" ", "\n", ".", ",", "!", "?")):
+            new_greet = new_greet + " "
+        msg = new_greet + rest
+
+    # 2b. Rotate a handful of decorative emojis (purely cosmetic, doesn't
+    #     change meaning). Only applies if the message has at least one.
+    emoji_swaps = [
+        ("🎁", ["🎁", "🎉", "✨"]),
+        ("💟", ["💟", "💜", "💖"]),
+        ("⭐", ["⭐", "🌟", "✨"]),
+        ("🔥", ["🔥", "💥", "⚡"]),
+    ]
+    for anchor, pool in emoji_swaps:
+        if anchor in msg and random.random() < 0.6:
+            msg = msg.replace(anchor, random.choice(pool), 1)
+
+    return msg
+
+
 async def send_auto_welcome(crm_lead: dict, line: dict):
     """
     Auto-send welcome message when a lead sends their FIRST message.
     Takes welcome_message from the first active cajero assigned to the line.
     Falls back to any admin user's welcome_message if no cajero has one.
     Silent no-op if no welcome is configured.
+
+    Meta-Integrity hardening:
+      * Randomized 15-75 second delay before the message actually sends.
+        Meta's Account Integrity classifier flags sub-second bot replies;
+        humans take 10s-1min to read a message and type a response. The
+        delay happens in-task so it doesn't block the webhook response.
+      * Message content is rotated via _pick_welcome_variation so every
+        lead doesn't receive the identical byte-for-byte payload.
     """
     try:
+        import random
+        import asyncio as _asyncio2
+
         lead_id = crm_lead.get("id")
         line_id = line.get("id")
         phone = crm_lead.get("phone")
@@ -1896,7 +1989,10 @@ async def send_auto_welcome(crm_lead: dict, line: dict):
         if not line.get("whatsapp_token") or not line.get("phone_number_id"):
             return
 
-        # Find welcome_message from cajeros assigned to this line first
+        # Find welcome_message from cajeros assigned to this line first.
+        # IMPORTANT: respect the per-cajero `auto_welcome_enabled` flag.
+        # A cajero can opt-out of auto-welcome and always send manually via
+        # the "👋 Bienvenida" button in the chat panel.
         welcome_msg = None
         welcome_by = None
         async for user in db.users.find({
@@ -1904,15 +2000,21 @@ async def send_auto_welcome(crm_lead: dict, line: dict):
             "is_active": True,
             "role": "cajero",
         }):
+            # Default True for backwards compatibility (existing cajeros
+            # without the flag keep the previous behavior).
+            if not user.get("auto_welcome_enabled", True):
+                continue
             msg = (user.get("welcome_message") or "").strip()
             if msg:
                 welcome_msg = msg
                 welcome_by = user.get("email")
                 break
 
-        # Fallback: any admin with welcome_message
+        # Fallback: any admin with welcome_message (also respects the flag)
         if not welcome_msg:
             async for user in db.users.find({"role": "admin", "is_active": True}):
+                if not user.get("auto_welcome_enabled", True):
+                    continue
                 msg = (user.get("welcome_message") or "").strip()
                 if msg:
                     welcome_msg = msg
@@ -1920,7 +2022,34 @@ async def send_auto_welcome(crm_lead: dict, line: dict):
                     break
 
         if not welcome_msg:
-            logger.info(f"Auto-welcome: no welcome_message configured (line={line.get('name')}, lead={lead_id}) — skipping")
+            logger.info(f"Auto-welcome: no welcome_message configured OR disabled (line={line.get('name')}, lead={lead_id}) — skipping")
+            return
+
+        # Pick a humanized variation (rotation + micro-variations)
+        welcome_msg = _pick_welcome_variation(welcome_msg)
+
+        # Human-like typing delay: 15-75 seconds (skewed lower so urgency
+        # isn't lost). Argentine cajeros typically reply in that range.
+        delay_sec = random.randint(15, 75)
+        logger.info(f"Auto-welcome: scheduling send in {delay_sec}s for lead {lead_id} on line {line.get('name')}")
+        await _asyncio2.sleep(delay_sec)
+
+        # Re-read the lead: if a human cajero already replied during the
+        # delay window, skip the auto-welcome (avoid double-greeting).
+        fresh = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
+        if fresh and fresh.get("welcome_sent_at"):
+            logger.info(f"Auto-welcome: lead {lead_id} already welcomed, skipping")
+            return
+        # If there's an admin-authored message since the lead was created,
+        # also skip (human cajero took over).
+        since = crm_lead.get("created_at") or datetime.now(timezone.utc).isoformat()
+        existing_admin = await db.crm_messages.count_documents({
+            "lead_id": lead_id,
+            "sender": "admin",
+            "created_at": {"$gt": since},
+        })
+        if existing_admin > 0:
+            logger.info(f"Auto-welcome: cajero already replied to {lead_id}, skipping")
             return
 
         # Send the welcome via WhatsApp
@@ -1951,7 +2080,7 @@ async def send_auto_welcome(crm_lead: dict, line: dict):
                 "$inc": {"messages_count": 1},
             }
         )
-        logger.info(f"Auto-welcome sent to {phone} on line {line.get('name')} (by {welcome_by})")
+        logger.info(f"Auto-welcome sent to {phone} on line {line.get('name')} (by {welcome_by}, delayed {delay_sec}s)")
     except Exception as e:
         logger.error(f"Auto-welcome failed: {e}")
 
@@ -3509,8 +3638,18 @@ async def send_meta_conversion_event(
                 logger.info(f"Meta CAPI: Email '{email}' resolved for lead {lead_data.get('id')}")
             user_data["em"] = [hashlib.sha256(email.lower().strip().encode()).hexdigest()]
         
-        # External ID (lead ID for deduplication)
-        if lead_data.get("id"):
+        # External ID — deterministic hash of the normalized phone number.
+        # Meta prefers stable identifiers shared across events (same user across
+        # multiple interactions = same external_id). Using the phone hash instead
+        # of a random UUID dramatically improves EMQ and reduces "synthetic
+        # automation" score from Meta Integrity.
+        phone_for_ext = (lead_data.get("phone") or "").strip()
+        # Keep only digits so "+54911..." and "54911..." produce the same hash
+        phone_digits_ext = "".join(c for c in phone_for_ext if c.isdigit())
+        if phone_digits_ext:
+            user_data["external_id"] = [hashlib.sha256(phone_digits_ext.encode()).hexdigest()]
+        elif lead_data.get("id"):
+            # Last-resort fallback (e.g. lead without phone — shouldn't happen)
             user_data["external_id"] = [hashlib.sha256(lead_data["id"].encode()).hexdigest()]
         
         # ── AUTO-RESOLVE GEO DATA FROM IP (city, state, zip, country) ──
@@ -6688,7 +6827,8 @@ app.add_middleware(
 )
 
 app.include_router(go_router)
-app.include_router(api_router)
+# Note: api_router is included at the END of the file after ALL routes
+# have been registered (including the Marketing Dashboard endpoints).
 
 @app.on_event("startup")
 async def startup():
@@ -6788,6 +6928,451 @@ async def startup():
         await db.campaigns.update_one({"_id": camp["_id"]}, {"$set": {"short_code": code}})
         logger.info(f"Migrated campaign {camp.get('name', camp['id'])} -> /go/{code}")
     logger.info("Traffic Guardian API started successfully")
+
+# ─── Marketing Dashboard (admin only) ──────────────────────────────
+# Aggregate analytics endpoints powering /dashboard. All require admin.
+
+def _dashboard_role_guard(user):
+    if user.get("role") not in ("admin", "superadmin"):
+        raise HTTPException(status_code=403, detail="Solo administradores")
+
+
+def _dashboard_date_range(days: int, start_date: Optional[str], end_date: Optional[str]):
+    """Return (start_iso, end_iso) strings for Mongo range queries."""
+    if start_date and end_date:
+        return start_date, end_date
+    now = datetime.now(timezone.utc)
+    return (now - timedelta(days=days)).isoformat(), now.isoformat()
+
+
+@api_router.get("/dashboard/overview")
+async def dashboard_overview(
+    line_id: Optional[str] = None,
+    days: int = Query(30, ge=1, le=365),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    """KPIs + period-over-period comparison + quick insights."""
+    _dashboard_role_guard(current_user)
+    s, e = _dashboard_date_range(days, start_date, end_date)
+    line_q = {"line_id": line_id} if line_id else {}
+
+    cur_match = {**line_q, "created_at": {"$gte": s, "$lte": e}}
+    cur_leads = await db.crm_leads.count_documents(cur_match)
+    cur_validos_match = {**cur_match, "status": "valido"}
+    cur_validos = await db.crm_leads.count_documents(cur_validos_match)
+    agg = await db.crm_leads.aggregate([
+        {"$match": cur_validos_match},
+        {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$charge_amount", 0]}}}},
+    ]).to_list(1)
+    total_revenue = float(agg[0]["total"]) if agg else 0.0
+    avg_ticket = (total_revenue / cur_validos) if cur_validos else 0.0
+    conv_rate = (cur_validos / cur_leads * 100) if cur_leads else 0.0
+
+    # Previous period comparison
+    try:
+        s_dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        e_dt = datetime.fromisoformat(e.replace("Z", "+00:00"))
+        span = e_dt - s_dt
+        prev_e = s_dt
+        prev_s = prev_e - span
+        prev_match = {**line_q, "created_at": {"$gte": prev_s.isoformat(), "$lt": prev_e.isoformat()}}
+        prev_leads = await db.crm_leads.count_documents(prev_match)
+        prev_validos = await db.crm_leads.count_documents({**prev_match, "status": "valido"})
+        prev_conv = (prev_validos / prev_leads * 100) if prev_leads else 0.0
+    except Exception:
+        prev_leads, prev_validos, prev_conv = 0, 0, 0.0
+
+    def _delta_pct(cur, prev):
+        if not prev:
+            return None
+        return round((cur - prev) / prev * 100, 1)
+
+    # Top ad by conversions
+    top_ad_pipe = [
+        {"$match": {**cur_match, "ad_source": {"$nin": [None, ""]}}},
+        {"$group": {
+            "_id": "$ad_source",
+            "leads": {"$sum": 1},
+            "validos": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
+            "revenue": {"$sum": {"$ifNull": ["$charge_amount", 0]}},
+        }},
+        {"$sort": {"validos": -1, "leads": -1}},
+        {"$limit": 1},
+    ]
+    top_ad_res = await db.crm_leads.aggregate(top_ad_pipe).to_list(1)
+    top_ad = None
+    if top_ad_res:
+        r = top_ad_res[0]
+        top_ad = {
+            "ad_source": r["_id"],
+            "leads": r["leads"],
+            "conversiones": r["validos"],
+            "revenue": float(r["revenue"] or 0),
+            "conversion_rate": round((r["validos"] / r["leads"] * 100), 1) if r["leads"] else 0,
+        }
+
+    # Quick insights — best converting gender + best converting location
+    insights = []
+    try:
+        gender_pipe = [
+            {"$match": {**cur_match, "gender": {"$in": ["m", "f"]}}},
+            {"$group": {"_id": "$gender", "leads": {"$sum": 1},
+                        "validos": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}}}},
+        ]
+        g_res = await db.crm_leads.aggregate(gender_pipe).to_list(2)
+        if len(g_res) == 2:
+            rates = {r["_id"]: (r["validos"] / r["leads"] * 100 if r["leads"] else 0) for r in g_res}
+            if rates.get("m") and rates.get("f"):
+                diff = abs(rates["m"] - rates["f"])
+                if diff >= 5:
+                    winner = "Masculino" if rates["m"] > rates["f"] else "Femenino"
+                    insights.append(f"Los leads {winner.lower()}s convierten {round(diff,1)}% mejor que el promedio")
+
+        state_pipe = [
+            {"$match": {**cur_match, "state": {"$nin": [None, ""]}}},
+            {"$group": {"_id": "$state", "leads": {"$sum": 1},
+                        "validos": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}}}},
+            {"$match": {"leads": {"$gte": 5}}},
+            {"$sort": {"validos": -1}},
+            {"$limit": 1},
+        ]
+        st_res = await db.crm_leads.aggregate(state_pipe).to_list(1)
+        if st_res and st_res[0]["leads"]:
+            rate = round(st_res[0]["validos"] / st_res[0]["leads"] * 100, 1)
+            insights.append(f"{st_res[0]['_id']} es la provincia con mejor conversión ({rate}%)")
+    except Exception:
+        pass
+
+    return {
+        "period": {"start": s, "end": e},
+        "kpis": {
+            "total_leads": cur_leads,
+            "conversiones": cur_validos,
+            "conversion_rate": round(conv_rate, 2),
+            "total_revenue": round(total_revenue, 2),
+            "avg_ticket": round(avg_ticket, 2),
+        },
+        "deltas": {
+            "total_leads": _delta_pct(cur_leads, prev_leads),
+            "conversiones": _delta_pct(cur_validos, prev_validos),
+            "conversion_rate": _delta_pct(conv_rate, prev_conv),
+        },
+        "top_ad": top_ad,
+        "insights": insights,
+    }
+
+
+@api_router.get("/dashboard/ad-performance")
+async def dashboard_ad_performance(
+    line_id: Optional[str] = None,
+    days: int = Query(30, ge=1, le=365),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    """Ad performance table with preview thumbnails and ROAS."""
+    _dashboard_role_guard(current_user)
+    s, e = _dashboard_date_range(days, start_date, end_date)
+    line_q = {"line_id": line_id} if line_id else {}
+    match = {**line_q, "created_at": {"$gte": s, "$lte": e}, "ad_source": {"$nin": [None, ""]}}
+
+    pipe = [
+        {"$match": match},
+        {"$group": {
+            "_id": "$ad_source",
+            "leads": {"$sum": 1},
+            "validos": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
+            "spam": {"$sum": {"$cond": [{"$eq": ["$status", "spam"]}, 1, 0]}},
+            "revenue": {"$sum": {"$ifNull": ["$charge_amount", 0]}},
+            # Grab a sample lead id per ad so we can resolve a preview image
+            "sample_lead_id": {"$first": "$id"},
+            "sample_referral": {"$first": "$referral"},
+            "sample_utm": {"$first": "$utm_content"},
+        }},
+        {"$sort": {"leads": -1}},
+        {"$limit": 50},
+    ]
+    rows = await db.crm_leads.aggregate(pipe).to_list(50)
+
+    out = []
+    for r in rows:
+        ref = r.get("sample_referral") or {}
+        preview_image = ref.get("image_url") or ref.get("thumbnail_url")
+        headline = ref.get("headline") or r["_id"]
+        body = ref.get("body") or ""
+        source_url = ref.get("source_url")
+        out.append({
+            "ad_source": r["_id"],
+            "leads": r["leads"],
+            "conversiones": r["validos"],
+            "spam": r["spam"],
+            "revenue": round(float(r["revenue"] or 0), 2),
+            "avg_ticket": round(float(r["revenue"] or 0) / r["validos"], 2) if r["validos"] else 0.0,
+            "conversion_rate": round((r["validos"] / r["leads"] * 100), 2) if r["leads"] else 0,
+            "preview_image": preview_image,
+            "headline": headline,
+            "body": body,
+            "source_url": source_url,
+            "sample_lead_id": r.get("sample_lead_id"),
+        })
+    return out
+
+
+@api_router.get("/dashboard/demographics")
+async def dashboard_demographics(
+    line_id: Optional[str] = None,
+    days: int = Query(30, ge=1, le=365),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    """Gender and age-range breakdown."""
+    _dashboard_role_guard(current_user)
+    s, e = _dashboard_date_range(days, start_date, end_date)
+    line_q = {"line_id": line_id} if line_id else {}
+    match = {**line_q, "created_at": {"$gte": s, "$lte": e}}
+
+    # Gender
+    gender_pipe = [
+        {"$match": match},
+        {"$group": {
+            "_id": {"$ifNull": ["$gender", "unknown"]},
+            "leads": {"$sum": 1},
+            "validos": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
+            "revenue": {"$sum": {"$ifNull": ["$charge_amount", 0]}},
+        }},
+    ]
+    g_rows = await db.crm_leads.aggregate(gender_pipe).to_list(10)
+    gender_labels = {"m": "Masculino", "f": "Femenino", "unknown": "Desconocido"}
+    gender = [{
+        "label": gender_labels.get(r["_id"], str(r["_id"]).title() or "Desconocido"),
+        "key": r["_id"] or "unknown",
+        "leads": r["leads"],
+        "conversiones": r["validos"],
+        "revenue": round(float(r["revenue"] or 0), 2),
+        "conversion_rate": round((r["validos"] / r["leads"] * 100), 1) if r["leads"] else 0,
+    } for r in g_rows]
+
+    # Age — bucket into ranges 18-24, 25-34, 35-44, 45-54, 55+
+    age_buckets = [
+        {"label": "18-24", "min": 18, "max": 24},
+        {"label": "25-34", "min": 25, "max": 34},
+        {"label": "35-44", "min": 35, "max": 44},
+        {"label": "45-54", "min": 45, "max": 54},
+        {"label": "55+", "min": 55, "max": 120},
+    ]
+    age_results = []
+    for b in age_buckets:
+        b_match = {**match, "inferred_age": {"$gte": b["min"], "$lte": b["max"]}}
+        total = await db.crm_leads.count_documents(b_match)
+        validos = await db.crm_leads.count_documents({**b_match, "status": "valido"})
+        rev_agg = await db.crm_leads.aggregate([
+            {"$match": {**b_match, "status": "valido"}},
+            {"$group": {"_id": None, "r": {"$sum": {"$ifNull": ["$charge_amount", 0]}}}},
+        ]).to_list(1)
+        age_results.append({
+            "range": b["label"],
+            "leads": total,
+            "conversiones": validos,
+            "revenue": round(float(rev_agg[0]["r"]) if rev_agg else 0, 2),
+            "conversion_rate": round((validos / total * 100), 1) if total else 0,
+        })
+    age_unknown = await db.crm_leads.count_documents({
+        **match,
+        "$or": [{"inferred_age": {"$exists": False}}, {"inferred_age": None}],
+    })
+
+    return {"gender": gender, "age": age_results, "age_unknown": age_unknown}
+
+
+@api_router.get("/dashboard/geography")
+async def dashboard_geography(
+    line_id: Optional[str] = None,
+    days: int = Query(30, ge=1, le=365),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    """Top provinces/cities with conversion rates."""
+    _dashboard_role_guard(current_user)
+    s, e = _dashboard_date_range(days, start_date, end_date)
+    line_q = {"line_id": line_id} if line_id else {}
+    match = {**line_q, "created_at": {"$gte": s, "$lte": e}}
+
+    def _format(rows):
+        return [{
+            "name": r["_id"] or "Desconocido",
+            "leads": r["leads"],
+            "conversiones": r["validos"],
+            "revenue": round(float(r.get("revenue", 0) or 0), 2),
+            "conversion_rate": round((r["validos"] / r["leads"] * 100), 1) if r["leads"] else 0,
+        } for r in rows]
+
+    province_pipe = [
+        {"$match": {**match, "state": {"$nin": [None, ""]}}},
+        {"$group": {
+            "_id": "$state",
+            "leads": {"$sum": 1},
+            "validos": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
+            "revenue": {"$sum": {"$ifNull": ["$charge_amount", 0]}},
+        }},
+        {"$sort": {"leads": -1}},
+        {"$limit": 15},
+    ]
+    city_pipe = [
+        {"$match": {**match, "city": {"$nin": [None, ""]}}},
+        {"$group": {
+            "_id": "$city",
+            "leads": {"$sum": 1},
+            "validos": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
+            "revenue": {"$sum": {"$ifNull": ["$charge_amount", 0]}},
+        }},
+        {"$sort": {"leads": -1}},
+        {"$limit": 15},
+    ]
+    country_pipe = [
+        {"$match": {**match, "country": {"$nin": [None, ""]}}},
+        {"$group": {
+            "_id": "$country",
+            "leads": {"$sum": 1},
+            "validos": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
+            "revenue": {"$sum": {"$ifNull": ["$charge_amount", 0]}},
+        }},
+        {"$sort": {"leads": -1}},
+        {"$limit": 10},
+    ]
+
+    p_rows = await db.crm_leads.aggregate(province_pipe).to_list(15)
+    c_rows = await db.crm_leads.aggregate(city_pipe).to_list(15)
+    cn_rows = await db.crm_leads.aggregate(country_pipe).to_list(10)
+    return {
+        "provinces": _format(p_rows),
+        "cities": _format(c_rows),
+        "countries": _format(cn_rows),
+    }
+
+
+@api_router.get("/dashboard/timeline")
+async def dashboard_timeline(
+    line_id: Optional[str] = None,
+    days: int = Query(30, ge=1, le=365),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    """Per-day leads + conversions for area chart."""
+    _dashboard_role_guard(current_user)
+    s, e = _dashboard_date_range(days, start_date, end_date)
+    line_q = {"line_id": line_id} if line_id else {}
+    match = {**line_q, "created_at": {"$gte": s, "$lte": e}}
+
+    pipe = [
+        {"$match": match},
+        {"$addFields": {
+            "day": {"$substr": ["$created_at", 0, 10]},
+        }},
+        {"$group": {
+            "_id": "$day",
+            "leads": {"$sum": 1},
+            "conversiones": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
+            "revenue": {"$sum": {"$ifNull": ["$charge_amount", 0]}},
+        }},
+        {"$sort": {"_id": 1}},
+    ]
+    rows = await db.crm_leads.aggregate(pipe).to_list(400)
+    return [{
+        "date": r["_id"],
+        "leads": r["leads"],
+        "conversiones": r["conversiones"],
+        "revenue": round(float(r["revenue"] or 0), 2),
+    } for r in rows]
+
+
+@api_router.get("/dashboard/hourly-heatmap")
+async def dashboard_hourly_heatmap(
+    line_id: Optional[str] = None,
+    days: int = Query(30, ge=1, le=365),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    """Day-of-week x hour-of-day heatmap (UTC-3 / Argentina)."""
+    _dashboard_role_guard(current_user)
+    s, e = _dashboard_date_range(days, start_date, end_date)
+    line_q = {"line_id": line_id} if line_id else {}
+    match = {**line_q, "created_at": {"$gte": s, "$lte": e}}
+
+    pipe = [
+        {"$match": match},
+        # Convert ISO string -> date, shift to Argentina tz (UTC-3)
+        {"$addFields": {
+            "ts": {"$dateFromString": {"dateString": "$created_at", "onError": None}},
+        }},
+        {"$match": {"ts": {"$ne": None}}},
+        {"$addFields": {
+            "local_ts": {"$dateAdd": {"startDate": "$ts", "unit": "hour", "amount": -3}},
+        }},
+        {"$group": {
+            "_id": {
+                "dow": {"$dayOfWeek": "$local_ts"},   # 1=Sun ... 7=Sat
+                "hour": {"$hour": "$local_ts"},
+            },
+            "leads": {"$sum": 1},
+        }},
+    ]
+    rows = await db.crm_leads.aggregate(pipe).to_list(7 * 24)
+    # Rearrange so Monday=0 ... Sunday=6 (Spanish convention)
+    matrix = [[0] * 24 for _ in range(7)]
+    for r in rows:
+        dow_mongo = r["_id"]["dow"]        # 1..7 (Sun..Sat)
+        hour = r["_id"]["hour"]
+        # Convert to Mon=0..Sun=6
+        mon_based = (dow_mongo - 2) % 7
+        matrix[mon_based][hour] = r["leads"]
+    labels = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+    return {"labels": labels, "matrix": matrix}
+
+
+@api_router.get("/dashboard/device-stats")
+async def dashboard_device_stats(
+    line_id: Optional[str] = None,
+    days: int = Query(30, ge=1, le=365),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    """Device / OS breakdown from wa_clicks."""
+    _dashboard_role_guard(current_user)
+    s, e = _dashboard_date_range(days, start_date, end_date)
+    match: dict = {"created_at": {"$gte": s, "$lte": e}}
+    if line_id:
+        match["line_id"] = line_id
+
+    async def _agg(field):
+        pipe = [
+            {"$match": {**match, field: {"$nin": [None, ""]}}},
+            {"$group": {"_id": f"${field}", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 10},
+        ]
+        try:
+            rows = await db.wa_clicks.aggregate(pipe).to_list(10)
+        except Exception:
+            rows = []
+        return [{"name": r["_id"] or "Desconocido", "count": r["count"]} for r in rows]
+
+    return {
+        "devices": await _agg("device"),
+        "os": await _agg("os"),
+        "browsers": await _agg("browser"),
+    }
+
+
+# ─── Router registration (MUST be after all @api_router decorators) ──
+app.include_router(api_router)
+
 
 @app.on_event("shutdown")
 async def shutdown():
