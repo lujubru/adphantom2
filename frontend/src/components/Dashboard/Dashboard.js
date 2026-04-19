@@ -1,211 +1,286 @@
-import React, { useState, useEffect } from 'react';
-import api from '@/utils/api';
-import { formatNumber, calculatePercentage, formatDate } from '@/utils/helpers';
-import { Card } from '@/components/ui/card';
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  Users, TrendingUp, DollarSign, Award, Target,
+  RefreshCw, Filter, Sparkles, Percent,
+} from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
-import { Activity, ShieldAlert, Globe, Monitor, Download } from 'lucide-react';
 import { toast } from 'sonner';
+import api from '@/utils/api';
+import { KpiCard } from '@/pages/dashboard/KpiCard';
+import { AdPerformanceTable } from '@/pages/dashboard/AdPerformanceTable';
+import {
+  TimelineChart, GenderPie, AgeBarChart, GeographyBar, HourlyHeatmap, DeviceChart,
+} from '@/pages/dashboard/Charts';
 
-const COLORS = ['#3b82f6', '#8b5cf6', '#ec4899', '#10b981', '#f59e0b', '#ef4444'];
+const DATE_PRESETS = [
+  { key: 'today', label: 'Hoy', days: 1 },
+  { key: '7', label: '7 días', days: 7 },
+  { key: '30', label: '30 días', days: 30 },
+  { key: '90', label: '90 días', days: 90 },
+];
 
 const Dashboard = () => {
-  const [stats, setStats] = useState(null);
-  const [recentClicks, setRecentClicks] = useState([]);
+  const [lines, setLines] = useState([]);
+  const [selectedLineId, setSelectedLineId] = useState('');
+  const [periodKey, setPeriodKey] = useState('30');
+  const [days, setDays] = useState(30);
+
+  const [overview, setOverview] = useState(null);
+  const [ads, setAds] = useState([]);
+  const [demographics, setDemographics] = useState({ gender: [], age: [], age_unknown: 0 });
+  const [geography, setGeography] = useState({ provinces: [], cities: [], countries: [] });
+  const [timeline, setTimeline] = useState([]);
+  const [heatmap, setHeatmap] = useState({ labels: [], matrix: [] });
+  const [deviceStats, setDeviceStats] = useState({ devices: [], os: [], browsers: [] });
+
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
 
-  useEffect(() => {
-    fetchData();
-  }, []);
+  const params = useCallback(() => {
+    const p = { days };
+    if (selectedLineId) p.line_id = selectedLineId;
+    return p;
+  }, [days, selectedLineId]);
 
-  const fetchData = async () => {
+  const loadAll = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
+    else setRefreshing(true);
     try {
-      const [statsRes, clicksRes] = await Promise.all([
-        api.get('/dashboard/stats'),
-        api.get('/dashboard/recent-clicks?limit=20')
+      const p = params();
+      const [ov, ad, dm, ge, tl, hm, dv] = await Promise.all([
+        api.get('/dashboard/overview', { params: p }),
+        api.get('/dashboard/ad-performance', { params: p }),
+        api.get('/dashboard/demographics', { params: p }),
+        api.get('/dashboard/geography', { params: p }),
+        api.get('/dashboard/timeline', { params: p }),
+        api.get('/dashboard/hourly-heatmap', { params: p }),
+        api.get('/dashboard/device-stats', { params: p }),
       ]);
-      setStats(statsRes.data);
-      setRecentClicks(clicksRes.data);
-    } catch (error) {
-      toast.error('Error al cargar datos del panel');
+      setOverview(ov.data);
+      setAds(ad.data || []);
+      setDemographics(dm.data || { gender: [], age: [], age_unknown: 0 });
+      setGeography(ge.data || { provinces: [], cities: [], countries: [] });
+      setTimeline(tl.data || []);
+      setHeatmap(hm.data || { labels: [], matrix: [] });
+      setDeviceStats(dv.data || { devices: [], os: [], browsers: [] });
+    } catch (err) {
+      if (!silent) toast.error('Error cargando dashboard');
+      console.error('Dashboard load failed:', err);
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
+  }, [params]);
+
+  // Load lines once
+  useEffect(() => {
+    api.get('/crm/lines').then(({ data }) => setLines(data || [])).catch(() => {});
+  }, []);
+
+  // Reload whenever filters change
+  useEffect(() => { loadAll(false); }, [loadAll]);
+
+  // Auto refresh every 60s
+  useEffect(() => {
+    const iv = setInterval(() => loadAll(true), 60000);
+    return () => clearInterval(iv);
+  }, [loadAll]);
+
+  const selectPeriod = (key) => {
+    setPeriodKey(key);
+    const preset = DATE_PRESETS.find(p => p.key === key);
+    if (preset) setDays(preset.days);
   };
 
-  const handleExport = async () => {
-    try {
-      const response = await api.get('/dashboard/export-csv', { responseType: 'blob' });
-      const url = window.URL.createObjectURL(new Blob([response.data]));
-      const link = document.createElement('a');
-      link.href = url;
-      link.setAttribute('download', `clicks_export_${Date.now()}.csv`);
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      toast.success('CSV exportado correctamente');
-    } catch (error) {
-      toast.error('Error al exportar CSV');
-    }
-  };
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center min-h-screen bg-slate-950">
-        <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500"></div>
-      </div>
-    );
-  }
-
-  const blockedPercentage = calculatePercentage(stats?.blocked_clicks || 0, stats?.total_clicks || 0);
+  const selectedLine = lines.find(l => l.id === selectedLineId);
 
   return (
-    <div data-testid="dashboard-container" className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 p-6">
-      <div className="max-w-7xl mx-auto space-y-6">
-        <div className="flex justify-between items-center">
-          <div>
-            <h1 className="text-3xl font-bold text-white mb-2">Panel de Control</h1>
-            <p className="text-slate-400">Análisis de tráfico e insights</p>
+    <div className="min-h-screen bg-slate-950 text-white">
+      {/* Sticky filter bar */}
+      <div className="sticky top-16 z-30 bg-slate-950/90 backdrop-blur-xl border-b border-slate-800">
+        <div className="max-w-[1800px] mx-auto px-4 sm:px-6 py-3 flex items-center gap-3 flex-wrap">
+          <div className="flex items-center gap-2">
+            <TrendingUp className="w-5 h-5 text-emerald-400" />
+            <h1 className="text-lg font-bold">Panel de Marketing</h1>
           </div>
-          <Button
-            onClick={handleExport}
-            data-testid="export-csv-button"
-            className="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white"
-          >
-            <Download className="w-4 h-4 mr-2" />
-            Exportar CSV
-          </Button>
-        </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-          <Card className="bg-slate-900/50 backdrop-blur-xl border-slate-800 p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-slate-400 text-sm mb-1">Total Clicks</p>
-                <p data-testid="dashboard-total-clicks" className="text-3xl font-bold text-white">{formatNumber(stats?.total_clicks || 0)}</p>
-              </div>
-              <div className="bg-blue-500/10 p-3 rounded-xl">
-                <Activity className="w-6 h-6 text-blue-500" />
-              </div>
+          <div className="ml-auto flex items-center gap-2 flex-wrap">
+            <div className="flex items-center gap-1.5 text-xs text-slate-400">
+              <Filter className="w-3.5 h-3.5" />
+              <span>Línea:</span>
             </div>
-          </Card>
+            <select
+              value={selectedLineId}
+              onChange={e => setSelectedLineId(e.target.value)}
+              className="bg-slate-900 border border-slate-700 text-white text-sm rounded-lg px-3 py-1.5 min-w-[160px]"
+              data-testid="dashboard-line-select"
+            >
+              <option value="">Todas las líneas</option>
+              {lines.map(l => (
+                <option key={l.id} value={l.id}>{l.name}</option>
+              ))}
+            </select>
 
-          <Card className="bg-slate-900/50 backdrop-blur-xl border-slate-800 p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-slate-400 text-sm mb-1">Bloqueados</p>
-                <p data-testid="dashboard-blocked" className="text-3xl font-bold text-red-400">{formatNumber(stats?.blocked_clicks || 0)}</p>
-                <p className="text-xs text-slate-500 mt-1">{blockedPercentage}% del total</p>
-              </div>
-              <div className="bg-red-500/10 p-3 rounded-xl">
-                <ShieldAlert className="w-6 h-6 text-red-500" />
-              </div>
+            <div className="flex items-center gap-0.5 bg-slate-900 border border-slate-700 rounded-lg p-0.5" data-testid="dashboard-period-toggle">
+              {DATE_PRESETS.map(p => (
+                <button
+                  key={p.key}
+                  onClick={() => selectPeriod(p.key)}
+                  data-testid={`period-${p.key}`}
+                  className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+                    periodKey === p.key ? 'bg-slate-700 text-white' : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  {p.label}
+                </button>
+              ))}
             </div>
-          </Card>
 
-          <Card className="bg-slate-900/50 backdrop-blur-xl border-slate-800 p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-slate-400 text-sm mb-1">Hoy</p>
-                <p data-testid="dashboard-today" className="text-3xl font-bold text-green-400">{formatNumber(stats?.clicks_today || 0)}</p>
-              </div>
-              <div className="bg-green-500/10 p-3 rounded-xl">
-                <Activity className="w-6 h-6 text-green-500" />
-              </div>
-            </div>
-          </Card>
-
-          <Card className="bg-slate-900/50 backdrop-blur-xl border-slate-800 p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-slate-400 text-sm mb-1">Países</p>
-                <p data-testid="dashboard-countries" className="text-3xl font-bold text-purple-400">{stats?.by_country?.length || 0}</p>
-              </div>
-              <div className="bg-purple-500/10 p-3 rounded-xl">
-                <Globe className="w-6 h-6 text-purple-500" />
-              </div>
-            </div>
-          </Card>
-        </div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <Card className="bg-slate-900/50 backdrop-blur-xl border-slate-800 p-6">
-            <h3 className="text-lg font-semibold text-white mb-4">Top Países</h3>
-            {(stats?.by_country?.length > 0) ? (
-              <ResponsiveContainer width="100%" height={300}>
-                <BarChart data={stats.by_country}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                  <XAxis dataKey="country" stroke="#94a3b8" />
-                  <YAxis stroke="#94a3b8" />
-                  <Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '8px' }} labelStyle={{ color: '#e2e8f0' }} />
-                  <Bar dataKey="count" fill="#3b82f6" radius={[8, 8, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className="text-center py-12 text-slate-500">No hay datos de países</div>
-            )}
-          </Card>
-
-          <Card className="bg-slate-900/50 backdrop-blur-xl border-slate-800 p-6">
-            <h3 className="text-lg font-semibold text-white mb-4">Distribución por Dispositivo</h3>
-            {(stats?.by_device?.length > 0) ? (
-              <ResponsiveContainer width="100%" height={300}>
-                <PieChart>
-                  <Pie data={stats.by_device} cx="50%" cy="50%" labelLine={false}
-                    label={({ device, percent }) => `${device} ${(percent * 100).toFixed(0)}%`}
-                    outerRadius={100} fill="#8884d8" dataKey="count" nameKey="device">
-                    {stats.by_device.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
-                    ))}
-                  </Pie>
-                  <Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '8px' }} />
-                </PieChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className="text-center py-12 text-slate-500">No hay datos de dispositivos</div>
-            )}
-          </Card>
-        </div>
-
-        <Card className="bg-slate-900/50 backdrop-blur-xl border-slate-800 p-6">
-          <h3 className="text-lg font-semibold text-white mb-4">Clicks Recientes</h3>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-slate-800">
-                  <th className="text-left py-3 px-4 text-slate-400 font-medium">IP</th>
-                  <th className="text-left py-3 px-4 text-slate-400 font-medium">País</th>
-                  <th className="text-left py-3 px-4 text-slate-400 font-medium">Dispositivo</th>
-                  <th className="text-left py-3 px-4 text-slate-400 font-medium">SO</th>
-                  <th className="text-left py-3 px-4 text-slate-400 font-medium">Estado</th>
-                  <th className="text-left py-3 px-4 text-slate-400 font-medium">Fecha</th>
-                </tr>
-              </thead>
-              <tbody>
-                {recentClicks.length > 0 ? recentClicks.map((click) => (
-                  <tr key={click.id} className="border-b border-slate-800/50 hover:bg-slate-800/30">
-                    <td className="py-3 px-4 text-slate-300 font-mono text-xs">{click.ip}</td>
-                    <td className="py-3 px-4 text-slate-300">{click.country}</td>
-                    <td className="py-3 px-4 text-slate-300">{click.device}</td>
-                    <td className="py-3 px-4 text-slate-300">{click.os}</td>
-                    <td className="py-3 px-4">
-                      {click.is_blocked ? (
-                        <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-red-500/10 text-red-400 border border-red-500/20">Bloqueado</span>
-                      ) : (
-                        <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-green-500/10 text-green-400 border border-green-500/20">Permitido</span>
-                      )}
-                    </td>
-                    <td className="py-3 px-4 text-slate-400 text-xs">{formatDate(click.created_at)}</td>
-                  </tr>
-                )) : (
-                  <tr>
-                    <td colSpan="6" className="py-8 text-center text-slate-500">No hay clicks registrados aún</td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
+            <Button
+              onClick={() => loadAll(false)}
+              size="sm"
+              variant="outline"
+              className="border-slate-700 text-slate-300 hover:text-white"
+              data-testid="dashboard-refresh-btn"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+            </Button>
           </div>
-        </Card>
+        </div>
+      </div>
+
+      <div className="max-w-[1800px] mx-auto px-4 sm:px-6 py-6 space-y-6">
+        {selectedLine && (
+          <div className="text-xs text-slate-400">
+            Mostrando datos de <span className="text-white font-medium">{selectedLine.name}</span>
+            {' · '}
+            <span className="text-slate-500">
+              {overview?.period?.start?.slice(0, 10)} → {overview?.period?.end?.slice(0, 10)}
+            </span>
+          </div>
+        )}
+
+        {/* KPI cards */}
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3" data-testid="kpi-row">
+          <KpiCard
+            testId="kpi-leads"
+            icon={Users}
+            label="Leads totales"
+            value={overview?.kpis?.total_leads ?? 0}
+            delta={overview?.deltas?.total_leads}
+            color="blue"
+          />
+          <KpiCard
+            testId="kpi-conversions"
+            icon={Award}
+            label="Conversiones"
+            value={overview?.kpis?.conversiones ?? 0}
+            delta={overview?.deltas?.conversiones}
+            color="emerald"
+          />
+          <KpiCard
+            testId="kpi-rate"
+            icon={Percent}
+            label="Tasa de conversión"
+            value={overview?.kpis?.conversion_rate ?? 0}
+            suffix="%"
+            delta={overview?.deltas?.conversion_rate}
+            color="purple"
+          />
+          <KpiCard
+            testId="kpi-revenue"
+            icon={DollarSign}
+            label="Ingresos"
+            value={overview?.kpis?.total_revenue ?? 0}
+            prefix="$"
+            color="amber"
+          />
+          <KpiCard
+            testId="kpi-ticket"
+            icon={Target}
+            label="Ticket promedio"
+            value={overview?.kpis?.avg_ticket ?? 0}
+            prefix="$"
+            color="cyan"
+          />
+        </div>
+
+        {/* Insights banner */}
+        {overview?.insights?.length > 0 && (
+          <div className="bg-gradient-to-r from-purple-900/30 to-blue-900/30 border border-purple-700/30 rounded-xl p-4 flex items-start gap-3" data-testid="insights-banner">
+            <Sparkles className="w-5 h-5 text-purple-300 shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <p className="text-xs font-semibold text-purple-300 uppercase tracking-wide mb-1">Insights automáticos</p>
+              <ul className="space-y-1 text-sm text-slate-200">
+                {overview.insights.map((ins, i) => <li key={i}>• {ins}</li>)}
+              </ul>
+            </div>
+          </div>
+        )}
+
+        {/* Top ad highlight */}
+        {overview?.top_ad && (
+          <div className="bg-slate-900/50 rounded-xl p-4 border border-slate-800 flex items-center gap-4 flex-wrap" data-testid="top-ad">
+            <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30">
+              <Award className="w-5 h-5 text-amber-400" />
+            </div>
+            <div className="flex-1 min-w-[200px]">
+              <p className="text-xs text-slate-400 uppercase tracking-wide">Mejor anuncio</p>
+              <p className="text-white font-semibold truncate" title={overview.top_ad.ad_source}>
+                {overview.top_ad.ad_source}
+              </p>
+            </div>
+            <div className="flex items-center gap-6 text-sm">
+              <div>
+                <p className="text-xs text-slate-500">Leads</p>
+                <p className="text-white font-semibold">{overview.top_ad.leads}</p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500">Válidos</p>
+                <p className="text-emerald-400 font-semibold">{overview.top_ad.conversiones}</p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500">Conv.</p>
+                <p className="text-purple-400 font-semibold">{overview.top_ad.conversion_rate}%</p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500">Ingresos</p>
+                <p className="text-amber-400 font-semibold">${(overview.top_ad.revenue || 0).toLocaleString('es-AR')}</p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Timeline */}
+        <TimelineChart data={timeline} loading={loading} />
+
+        {/* Ad performance table */}
+        <AdPerformanceTable ads={ads} loading={loading} />
+
+        {/* Demographics row */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <GenderPie gender={demographics.gender} loading={loading} />
+          <AgeBarChart age={demographics.age} ageUnknown={demographics.age_unknown} loading={loading} />
+        </div>
+
+        {/* Geography row */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <GeographyBar data={geography.provinces} title="Top provincias" loading={loading} />
+          <GeographyBar data={geography.cities} title="Top ciudades" loading={loading} />
+        </div>
+
+        {/* Heatmap + Device */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div className="lg:col-span-2">
+            <HourlyHeatmap matrix={heatmap.matrix} labels={heatmap.labels} loading={loading} />
+          </div>
+          <DeviceChart devices={deviceStats.devices} loading={loading} />
+        </div>
+
+        {/* Countries (if more than just AR) */}
+        {geography.countries?.length > 1 && (
+          <GeographyBar data={geography.countries} title="Distribución por país" loading={loading} />
+        )}
       </div>
     </div>
   );
