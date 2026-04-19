@@ -6258,8 +6258,23 @@ async def send_web_push(user_id: str, title: str, body: str, data: dict = None):
                 )
                 sent += 1
             except WebPushException as e:
-                # 404/410 = subscription expired, remove it
-                status = getattr(e.response, "status_code", None) if hasattr(e, "response") and e.response else None
+                # 404/410 = subscription expired, remove it.
+                # pywebpush 2.x sometimes leaves `e.response` without a
+                # parseable status_code, so we also check the exception
+                # message text (contains "Push failed: 410 Gone" or similar).
+                status = None
+                resp = getattr(e, "response", None)
+                if resp is not None:
+                    status = getattr(resp, "status_code", None) or getattr(resp, "status", None)
+                if status is None:
+                    msg = str(e)
+                    import re as _re
+                    m = _re.search(r"Push failed:\s*(\d{3})", msg)
+                    if m:
+                        try:
+                            status = int(m.group(1))
+                        except ValueError:
+                            status = None
                 if status in (404, 410):
                     await db.push_subscriptions.delete_one({"endpoint": sub["endpoint"]})
                     gone += 1
