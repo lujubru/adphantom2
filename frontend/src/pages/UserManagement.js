@@ -32,6 +32,7 @@ const UserManagement = () => {
 🌐Link de acceso: https://1ganamos.vip
 ¡Te dejo el CBU para que puedas cargar! 
 Le envio nuestros datos de cuenta 👇`,
+    auto_welcome_enabled: true,
   });
 
   useEffect(() => {
@@ -92,6 +93,7 @@ Le envio nuestros datos de cuenta 👇`,
       line_ids: user.line_ids || [],
       welcome_message: user.welcome_message || '',
       user_message: user.user_message || '',
+      auto_welcome_enabled: user.auto_welcome_enabled !== false,
     });
     setShowModal(true);
   };
@@ -117,6 +119,7 @@ Le envio nuestros datos de cuenta 👇`,
 🌐Link de acceso: https://1ganamos.vip
 ¡Te dejo el CBU para que puedas cargar! 
 Le envio nuestros datos de cuenta 👇`,
+      auto_welcome_enabled: true,
     });
   };
 
@@ -311,8 +314,23 @@ Le envio nuestros datos de cuenta 👇`,
               {/* Welcome Message (only for cajero) */}
               {formData.role === 'cajero' && (
                 <div>
+                  <label className={`flex items-center gap-2 mb-3 cursor-pointer select-none ${textSecondary}`}>
+                    <input
+                      type="checkbox"
+                      checked={formData.auto_welcome_enabled !== false}
+                      onChange={e => setFormData(prev => ({ ...prev, auto_welcome_enabled: e.target.checked }))}
+                      className="w-4 h-4 rounded border-slate-600 text-teal-500 focus:ring-teal-500 focus:ring-offset-0 bg-slate-800"
+                      data-testid="user-auto-welcome-checkbox"
+                    />
+                    <span className="text-sm font-medium">
+                      Bienvenida automática
+                      <span className="text-xs font-normal text-slate-500 ml-2">
+                        (si está desactivada, el cajero envía manualmente con el botón 👋 en el chat)
+                      </span>
+                    </span>
+                  </label>
                   <label className={`block text-sm font-medium mb-2 ${textSecondary}`}>
-                    Mensaje de Bienvenida
+                    Mensaje de Bienvenida <span className="text-xs text-teal-400">(se rota siempre — automática o manual)</span>
                   </label>
                   <textarea
                     value={formData.welcome_message}
@@ -320,6 +338,10 @@ Le envio nuestros datos de cuenta 👇`,
                     className={`w-full px-4 py-2 rounded-lg border ${inputBg} h-40 font-mono text-sm`}
                     data-testid="user-welcome-message"
                   />
+                  <p className={`text-[11px] ${textSecondary} mt-1 leading-relaxed`}>
+                    💡 <span className="font-medium">Múltiples variantes:</span> separalas con una línea que contenga solo <code className="px-1 bg-slate-800 text-teal-400 rounded">---</code> para que el sistema elija una al azar.
+                    Si escribís una sola, se aplican micro-variaciones automáticas (saludo y emojis) para evitar patrones de automatización.
+                  </p>
                 </div>
               )}
 

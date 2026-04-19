@@ -200,13 +200,23 @@ export const ChatPanel = ({
   };
 
   const sendBienvenida = async () => {
-    const mensaje = userMessages.welcome_message || `¡Buenas!👋 Trabajamos con las plataformas MÁS COMPLETAS del país!  
+    // Request a rotated/humanized variant from the backend. Same logic used
+    // by the auto-welcome path, so manual clicks don't produce the identical
+    // byte-for-byte message pattern that Meta Integrity flags.
+    let mensaje = '';
+    try {
+      const { data } = await api.get('/auth/me/welcome-variant');
+      mensaje = (data?.message || '').trim();
+    } catch { /* fallthrough to template */ }
+    if (!mensaje) {
+      mensaje = userMessages.welcome_message || `¡Buenas!👋 Trabajamos con las plataformas MÁS COMPLETAS del país!  
 💟 ¡GANAMOS! 💟 💜 GANAMOSvip 💜 🥇 OROPURO 🥇  
 ℹ MINIMOS: $2000 Acreditación // $5000 Retiro. 
 🏦 Retiras tus ganancias UNA vez cada 24hs! 
 ⛔ No abonamos ni trabajamos con Ruletas 
 🎁B0N0 ¡Beneficio de bienvenida activado! B0N0🎁  
 ✨¡Decime tu nombre para generar el usuario!✨`;
+    }
     try {
       await api.post(`/crm/leads/${lead.id}/messages`, { content: mensaje, sender: 'admin' });
       loadMessages();
