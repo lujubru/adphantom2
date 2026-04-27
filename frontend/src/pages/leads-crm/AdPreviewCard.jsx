@@ -68,14 +68,32 @@ export const AdPreviewCard = ({ preview, collapsed, onToggle }) => {
                     rel="noopener noreferrer"
                     className={`inline-flex items-center gap-1 text-[11px] font-medium ${color.text} hover:underline`}
                     data-testid="ad-preview-source-link"
+                    title={preview.source_url}
                   >
                     <ExternalLink className="w-3 h-3" />
                     {preview.source === 'meta_ctwa_ad' ? 'Ver anuncio' : preview.source === 'own_landing' ? 'Abrir landing' : 'Abrir'}
                   </a>
                 )}
-                {preview.ad_source && preview.ad_source !== preview.headline && (
-                  <span className="text-[10px] text-slate-500 font-mono truncate">
-                    {preview.ad_source}
+                {preview.source === 'meta_ctwa_ad' && preview.ads_library_url && preview.ads_library_url !== preview.source_url && (
+                  <a
+                    href={preview.ads_library_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 text-[11px] font-medium text-slate-300 hover:text-white hover:underline"
+                    data-testid="ad-preview-library-link"
+                    title="Abrir en Meta Ads Library"
+                  >
+                    <ExternalLink className="w-3 h-3" />
+                    Ads Library
+                  </a>
+                )}
+                {preview.source_id && (
+                  <span
+                    className="text-[10px] text-slate-500 font-mono truncate"
+                    title={`ID: ${preview.source_id}`}
+                    data-testid="ad-preview-source-id"
+                  >
+                    ID: {preview.source_id}
                   </span>
                 )}
               </div>

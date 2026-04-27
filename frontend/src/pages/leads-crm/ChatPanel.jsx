@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   MessageCircle, RefreshCw, Send, X, Image as ImageIcon, Mic, DollarSign,
-  User, Users, ArrowLeft,
+  User, Users, ArrowLeft, ArrowDown,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import { toast } from 'sonner';
 import api from '@/utils/api';
 import { STATUS_CONFIG } from './constants';
@@ -29,6 +30,37 @@ export const ChatPanel = ({
   const [adPreview, setAdPreview] = useState(null);
   const [adCollapsed, setAdCollapsed] = useState(false);
   const messagesEndRef = useRef(null);
+  const messagesContainerRef = useRef(null);
+  // Smart auto-scroll: only auto-scroll if cajero is near bottom. Otherwise
+  // show a floating "↓ N nuevos" pill so they don't lose their place while
+  // reading historical messages.
+  const [isNearBottom, setIsNearBottom] = useState(true);
+  const isNearBottomRef = useRef(true);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const lastSeenMsgIdRef = useRef(null);
+  const previousLeadIdRef = useRef(lead.id);
+
+  const scrollToBottom = useCallback((behavior = 'smooth') => {
+    const el = messagesContainerRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    } else {
+      messagesEndRef.current?.scrollIntoView({ behavior });
+    }
+    setUnreadCount(0);
+    setIsNearBottom(true);
+    isNearBottomRef.current = true;
+  }, []);
+
+  const handleScroll = useCallback(() => {
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const near = distanceFromBottom < 120;
+    isNearBottomRef.current = near;
+    setIsNearBottom(near);
+    if (near) setUnreadCount(0);
+  }, []);
 
   const loadMessages = useCallback(async () => {
     try {
@@ -47,14 +79,47 @@ export const ChatPanel = ({
   useEffect(() => {
     loadMessages();
     loadAdPreview();
-    setAdCollapsed(false);
+    setAdCollapsed(true); // contraído por default — el cajero lo despliega si quiere
     const interval = setInterval(loadMessages, 5000);
     return () => clearInterval(interval);
   }, [loadMessages, loadAdPreview]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    // When switching to a different lead, force-jump to bottom.
+    if (previousLeadIdRef.current !== lead.id) {
+      previousLeadIdRef.current = lead.id;
+      lastSeenMsgIdRef.current = null;
+      setUnreadCount(0);
+      isNearBottomRef.current = true;
+      setIsNearBottom(true);
+      // Defer to next frame so the DOM has the new messages painted.
+      requestAnimationFrame(() => scrollToBottom('auto'));
+      return;
+    }
+    if (messages.length === 0) return;
+    const lastMsg = messages[messages.length - 1];
+    const lastId = lastMsg?.id;
+    const prevSeen = lastSeenMsgIdRef.current;
+    const hasNew = lastId && lastId !== prevSeen;
+
+    if (isNearBottomRef.current) {
+      // Cajero is at the bottom — keep them pinned to the latest message.
+      scrollToBottom('smooth');
+      lastSeenMsgIdRef.current = lastId;
+    } else if (hasNew && prevSeen) {
+      // Cajero is reading older messages — count incoming new ones from the lead.
+      // Only count messages that arrived AFTER the last seen one.
+      const prevIdx = messages.findIndex(m => m.id === prevSeen);
+      const newOnes = prevIdx >= 0 ? messages.slice(prevIdx + 1) : messages;
+      // Only count incoming (not admin) messages as unread, otherwise the
+      // pill would also fire when the cajero sends something themselves.
+      const incoming = newOnes.filter(m => m.sender !== 'admin').length;
+      if (incoming > 0) setUnreadCount(c => c + incoming);
+    } else if (hasNew && !prevSeen) {
+      // First load — just record the last id without flagging unread.
+      lastSeenMsgIdRef.current = lastId;
+    }
+  }, [messages, lead.id, scrollToBottom]);
 
   const sendMessage = async (sender = 'admin') => {
     if (!newMessage.trim()) return;
@@ -62,12 +127,21 @@ export const ChatPanel = ({
     try {
       await api.post(`/crm/leads/${lead.id}/messages`, { content: newMessage, sender });
       setNewMessage('');
+      // Force scroll-to-bottom: if the cajero just sent something, they
+      // expect to see it land at the bottom even if they were scrolled up.
+      isNearBottomRef.current = true;
+      setIsNearBottom(true);
       loadMessages();
+      // Refocus the textarea so the cajero can keep typing without re-clicking
+      setTimeout(() => {
+        try { inputRef.current?.focus(); } catch { /* silent */ }
+      }, 0);
     } catch { toast.error('Error enviando mensaje'); }
     finally { setSending(false); }
   };
 
   const fileInputRef = useRef(null);
+  const inputRef = useRef(null);
   const handleImagePick = () => fileInputRef.current?.click();
 
   const sendImage = async (file) => {
@@ -329,14 +403,45 @@ Le envio nuestros datos de cuenta 👇`;
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-3 sm:p-4 space-y-2">
-        {messages.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-32 text-slate-600">
-            <MessageCircle className="w-8 h-8 mb-2 opacity-20" />
-            <p className="text-xs">Sin mensajes aún</p>
-          </div>
-        ) : messages.map(msg => <ChatMessage key={msg.id} message={msg} />)}
-        <div ref={messagesEndRef} />
+      <div className="relative flex-1 overflow-hidden">
+        <div
+          ref={messagesContainerRef}
+          onScroll={handleScroll}
+          className="absolute inset-0 overflow-y-auto p-3 sm:p-4 space-y-2"
+          data-testid="chat-messages-container"
+        >
+          {messages.length === 0 ? (
+            <div className="flex flex-col items-center justify-center h-32 text-slate-600">
+              <MessageCircle className="w-8 h-8 mb-2 opacity-20" />
+              <p className="text-xs">Sin mensajes aún</p>
+            </div>
+          ) : messages.map(msg => <ChatMessage key={msg.id} message={msg} />)}
+          <div ref={messagesEndRef} />
+        </div>
+
+        {/* Floating "new messages" pill — only shows when cajero scrolled up
+            AND new incoming messages arrived. Click jumps to the bottom. */}
+        {!isNearBottom && (
+          <button
+            type="button"
+            onClick={() => scrollToBottom('smooth')}
+            data-testid="chat-jump-to-bottom"
+            className={`absolute right-3 bottom-3 z-10 inline-flex items-center gap-1.5 rounded-full shadow-lg transition-all ${
+              unreadCount > 0
+                ? 'bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1.5 text-xs font-semibold'
+                : 'bg-slate-700/90 hover:bg-slate-600 text-slate-100 w-9 h-9 justify-center'
+            }`}
+            aria-label="Ir al final"
+            title={unreadCount > 0 ? `${unreadCount} mensaje${unreadCount > 1 ? 's' : ''} nuevo${unreadCount > 1 ? 's' : ''}` : 'Ir al final'}
+          >
+            <ArrowDown className="w-4 h-4" />
+            {unreadCount > 0 && (
+              <span data-testid="chat-unread-count">
+                {unreadCount} nuevo{unreadCount > 1 ? 's' : ''}
+              </span>
+            )}
+          </button>
+        )}
       </div>
 
       {/* Input */}
@@ -401,12 +506,19 @@ Le envio nuestros datos de cuenta 👇`;
             >
               <Mic className="w-4 h-4" />
             </Button>
-            <Input
-              placeholder={sending ? 'Enviando...' : 'Escribí un mensaje...'}
+            <Textarea
+              ref={inputRef}
+              placeholder={sending ? 'Enviando...' : 'Escribí un mensaje... (Shift+Enter = nueva línea)'}
               value={newMessage}
               onChange={e => setNewMessage(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendMessage('admin')}
-              className="flex-1 bg-slate-800 border-slate-600 text-white text-sm min-w-0"
+              onKeyDown={e => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  sendMessage('admin');
+                }
+              }}
+              rows={1}
+              className="flex-1 bg-slate-800 border-slate-600 text-white text-sm min-w-0 min-h-[36px] max-h-[160px] resize-none py-1.5 leading-tight"
               disabled={sending}
               data-testid="chat-input"
             />

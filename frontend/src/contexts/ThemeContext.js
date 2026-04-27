@@ -21,6 +21,14 @@ export const ThemeProvider = ({ children }) => {
 
   const toggleTheme = () => setDarkMode(prev => !prev);
 
+  // Expose a global so non-React-context consumers (like the hamburger
+  // menu, which is mounted inside a portal-like fixed div) can flip the
+  // theme without prop-drilling.
+  useEffect(() => {
+    window.__toggleTheme = toggleTheme;
+    return () => { try { delete window.__toggleTheme; } catch { /* silent */ } };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   return (
     <ThemeContext.Provider value={{ darkMode, setDarkMode, toggleTheme }}>
       {children}

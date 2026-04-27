@@ -45,7 +45,11 @@ function App() {
               <Route path="user-management" element={<UserManagement />} />
               <Route path="meta-diagnostics" element={<MetaDiagnostics />} />
               <Route path="meta-insights" element={<MetaInsights />} />
+              {/* Catch-all: redirect unknown routes to dashboard (fixes PWA blank screen) */}
+              <Route path="*" element={<Navigate to="/dashboard" replace />} />
             </Route>
+            {/* Top-level catch-all */}
+            <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </BrowserRouter>
         <Toaster position="top-right" richColors />

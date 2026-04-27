@@ -19,6 +19,7 @@ import { StatusBadge } from './leads-crm/StatusSelector';
 import { ChatPanel } from './leads-crm/ChatPanel';
 import { BroadcastModal } from './leads-crm/BroadcastModal';
 import { ChatListItem } from './leads-crm/ChatListItem';
+import { HamburgerMenu } from './leads-crm/HamburgerMenu';
 
 // ─── Funnel (admin only) ───────────────────────────────────────────
 
@@ -62,8 +63,11 @@ const FunnelDisplay = ({ funnel, conversionRates, totals, period, onFilterChange
               className="bg-slate-800 border border-slate-700 text-white text-xs rounded-lg px-2 py-1"
             >
               <option value="diario">Hoy</option>
+              <option value="ayer">Ayer</option>
+              <option value="ultimos_10">Últimos 10 días</option>
               <option value="semanal">Esta semana</option>
               <option value="mensual">Este mes</option>
+              <option value="mes_anterior">Mes anterior</option>
               <option value="7">Últimos 7 días</option>
               <option value="30">Últimos 30 días</option>
               <option value="90">Últimos 90 días</option>
@@ -671,7 +675,7 @@ export default function LeadsCRM() {
 
   const loadLeads = useCallback(async () => {
     try {
-      const params = { limit: 200 };
+      const params = { limit: 500 };
       if (selectedLineId) params.line_id = selectedLineId;
       const { data } = await api.get('/crm/leads', { params });
       let list = data.leads || [];
@@ -717,7 +721,7 @@ export default function LeadsCRM() {
       if (funnelFilter.type === 'custom' && funnelFilter.startDate && funnelFilter.endDate) {
         params.start_date = funnelFilter.startDate;
         params.end_date = funnelFilter.endDate;
-      } else if (['diario', 'semanal', 'mensual'].includes(funnelFilter.type)) {
+      } else if (['diario', 'ayer', 'ultimos_10', 'semanal', 'mensual', 'mes_anterior'].includes(funnelFilter.type)) {
         params.filter_type = funnelFilter.type;
       } else {
         params.days = parseInt(funnelFilter.type) || 30;
@@ -824,15 +828,45 @@ export default function LeadsCRM() {
 
     return (
       <div className={`${bgMain} flex flex-col`} style={{ height: 'calc(100dvh - 4rem)', minHeight: 'calc(100dvh - 4rem)' }}>
-        {/* Top bar — hidden on mobile when a chat is open */}
-        {!mobileChatOpen && (
+        {/* Hamburger menu — desktop only, hidden on mobile (mobile keeps top bar) */}
+        {!mobileChatOpen && !isMobile && (
+          <HamburgerMenu
+            currentUser={currentUser}
+            darkMode={darkMode}
+            funnel={funnel}
+            onFunnelOpen={() => setShowFunnelModal(true)}
+            soundEnabled={soundEnabled}
+            onSoundToggle={soundEnabled ? () => setSoundEnabled(false) : enableSound}
+            notifyEnabled={notifyEnabled}
+            onNotifyToggle={notifyEnabled ? disableNotify : enableNotify}
+            pwaPrompt={pwaPrompt}
+            pwaInstalled={pwaInstalled}
+            onInstall={installPWA}
+            onBroadcast={() => setBroadcastOpen(true)}
+            onRefresh={loadLeads}
+            onContactsExport={async () => {
+              try {
+                const res = await api.get('/crm/contacts/history?fmt=csv', { responseType: 'blob' });
+                const url = window.URL.createObjectURL(new Blob([res.data], { type: 'text/csv;charset=utf-8' }));
+                const a = document.createElement('a');
+                a.href = url; a.download = `contactos-${new Date().toISOString().slice(0, 10)}.csv`;
+                document.body.appendChild(a); a.click(); a.remove();
+                window.URL.revokeObjectURL(url);
+                toast.success('Contactos exportados');
+              } catch { toast.error('Error exportando contactos'); }
+            }}
+            unreadCount={leads.filter(l => (l.unread_count > 0 || l.has_unread_messages) && selectedLead?.id !== l.id).length}
+          />
+        )}
+
+        {/* Mobile top bar (preserved as-is) */}
+        {!mobileChatOpen && isMobile && (
           <div className={`flex items-center gap-2 px-3 py-2.5 border-b ${borderColor} ${bgCard} shrink-0 sticky top-0 z-10`}>
             <div className="bg-emerald-500/20 p-2 rounded-xl border border-emerald-500/30 shrink-0">
               <MessageCircle className="w-5 h-5 text-emerald-400" />
             </div>
             <div className="min-w-0 flex-1">
               <h1 className={`text-base font-bold leading-tight flex items-center gap-2 ${textPrimary}`}>
-                <span className="truncate">WhatsApp CRM</span>
                 {(() => {
                   const totalUnread = leads.filter(l => (l.unread_count > 0 || l.has_unread_messages) && selectedLead?.id !== l.id).length;
                   return totalUnread > 0 ? (
