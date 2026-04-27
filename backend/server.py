@@ -2098,6 +2098,124 @@ async def wa_webhook_verify(request: Request):
     logger.warning(f"WA webhook verify failed: mode={mode}, token={token}")
     raise HTTPException(status_code=403, detail="Verification failed")
 
+async def resend_enriched_landing_events(crm_lead: dict, line: dict):
+    """
+    Re-fire the Contact / Lead / InitiateCheckout events that were dispatched
+    when the user clicked the WhatsApp button on the landing. Uses the SAME
+    event_id stored in wa_clicks so Meta deduplicates within the 48h window
+    and keeps the event with the highest match quality (EMQ).
+
+    Triggered once per lead, right after the first inbound WhatsApp message,
+    so we can now include phone + fn/ln + gender + enriched geo in the same
+    Contact/Lead/InitiateCheckout that fired on the click.
+
+    No-op if:
+      * The line has no pixel_id/access_token (nothing to send to).
+      * No wa_click with stored landing_event_ids can be linked to this lead.
+      * The lead was already enriched (welcome_sent_at is a good proxy; we
+        also persist `landing_events_enriched_at` to be safe).
+    """
+    try:
+        lead_id = crm_lead.get("id")
+        if not lead_id:
+            return
+
+        # Idempotency guard — don't re-fire twice for the same lead.
+        if crm_lead.get("landing_events_enriched_at"):
+            return
+
+        # Pixel credentials: prefer the ones stored on the click (what was
+        # originally used), fall back to the current line config.
+        access_token = line.get("meta_access_token")
+        pixel_id = line.get("meta_pixel_id")
+
+        # Locate the wa_click this lead came from.
+        click_doc = None
+        click_id = crm_lead.get("click_id")
+        if click_id:
+            click_doc = await db.wa_clicks.find_one({"click_id": click_id}, {"_id": 0})
+        if not click_doc and crm_lead.get("phone"):
+            phone_clean = re.sub(r'\D', '', crm_lead["phone"])[-10:]
+            click_doc = await db.wa_clicks.find_one(
+                {"phone": {"$regex": phone_clean}, "landing_event_ids": {"$exists": True}},
+                {"_id": 0},
+                sort=[("created_at", -1)],
+            )
+
+        if not click_doc:
+            logger.info(f"Enriched re-fire: no click associated to lead {lead_id} — skipping")
+            return
+
+        stored_ids: dict = click_doc.get("landing_event_ids") or {}
+        if not stored_ids:
+            return
+
+        # Prefer pixel credentials captured at click time (line config might
+        # have changed since).
+        access_token = click_doc.get("meta_access_token_snapshot") or access_token
+        pixel_id = click_doc.get("meta_pixel_id_snapshot") or pixel_id
+        if not access_token or not pixel_id:
+            logger.info(f"Enriched re-fire: no pixel for lead {lead_id} — skipping")
+            return
+
+        # Build lead_data enriched with everything we now know.
+        lead_data = {
+            "id": lead_id,
+            "phone": crm_lead.get("phone"),
+            "name": crm_lead.get("name"),
+            "email": crm_lead.get("email"),
+            "gender": crm_lead.get("gender"),
+            "dob": crm_lead.get("dob"),
+            "click_id": click_id or click_doc.get("click_id"),
+            "ip_address": click_doc.get("ip") or crm_lead.get("ip_address"),
+            "user_agent": click_doc.get("user_agent"),
+            "fbp": click_doc.get("fbp"),
+            "fbc": click_doc.get("fbc"),
+            "ctwa_clid": crm_lead.get("ctwa_clid") or click_doc.get("ctwa_clid"),
+            "city": crm_lead.get("city"),
+            "state": crm_lead.get("state"),
+            "zip_code": crm_lead.get("zip_code"),
+            "country_code": crm_lead.get("country_code"),
+            "landing_code": click_doc.get("landing_code"),
+        }
+        landing_name = None
+        if click_doc.get("landing_code"):
+            try:
+                landing = await db.wa_landings.find_one(
+                    {"code": click_doc["landing_code"]}, {"_id": 0, "name": 1}
+                )
+                landing_name = landing.get("name") if landing else None
+            except Exception:
+                landing_name = None
+        custom_data = {"content_name": landing_name or "WA Landing"}
+
+        # Re-fire each event with its original event_id.
+        for evt_name, evt_id in stored_ids.items():
+            try:
+                result = await send_meta_conversion_event(
+                    event_name=evt_name,
+                    lead_data=lead_data,
+                    custom_data=custom_data,
+                    access_token=access_token,
+                    pixel_id=pixel_id,
+                    event_id=evt_id,
+                )
+                logger.info(
+                    f"Enriched re-fire: {evt_name} for lead {lead_id} "
+                    f"(event_id={evt_id}, success={result.get('success')})"
+                )
+            except Exception as e:
+                logger.warning(f"Enriched re-fire failed for {evt_name}/{lead_id}: {e}")
+
+        # Mark done to prevent double-firing.
+        await db.crm_leads.update_one(
+            {"id": lead_id},
+            {"$set": {"landing_events_enriched_at": datetime.now(timezone.utc).isoformat()}},
+        )
+    except Exception as e:
+        logger.error(f"resend_enriched_landing_events failed: {e}")
+
+
 # Webhook receive messages (PUBLIC - no auth, Meta calls this)
 @api_router.post("/whatsapp/webhook")
 async def wa_webhook_receive(request: Request):
@@ -2268,6 +2386,10 @@ async def wa_webhook_receive(request: Request):
                         if crm_line and crm_line.get("whatsapp_token") and crm_line.get("phone_number_id"):
                             import asyncio as _asyncio
                             _asyncio.create_task(send_auto_welcome(crm_lead, crm_line))
+                            # Re-fire landing CAPI events with enriched data
+                            # so Meta deduplicates & upgrades match quality
+                            # (uses event_ids stored on the click).
+                            _asyncio.create_task(resend_enriched_landing_events(crm_lead, crm_line))
                     else:
                         # Update existing lead
                         update_fields = {
@@ -3198,39 +3320,70 @@ async def wa_landing_track_wa(request: Request):
                 
                 # Get pixel_events from landing to know which events to send
                 pixel_events = landing.get("pixel_events", ["PageView", "Lead"])
-                
+
+                # Deterministic event_ids per click so we can re-fire them
+                # later (post-WhatsApp) with enriched user_data. Meta
+                # deduplicates by (event_name, event_id) within 48h and keeps
+                # the one with the best match quality.
+                import time as _time_mod
+                base_ts = int(_time_mod.time())
+                fired_event_ids: dict = {}
+
                 # Send Lead event via Conversions API
                 if "Lead" in pixel_events:
+                    eid = f"Lead_{click_id or click.get('id','')}_{base_ts}"
                     await send_meta_conversion_event(
                         event_name="Lead",
                         lead_data=lead_data,
                         custom_data=custom_data,
                         access_token=access_token,
-                        pixel_id=pixel_id
+                        pixel_id=pixel_id,
+                        event_id=eid,
                     )
-                    logger.info(f"Lead event sent via Conversions API for landing {landing_code}")
-                
+                    fired_event_ids["Lead"] = eid
+                    logger.info(f"Lead event sent via Conversions API for landing {landing_code} (event_id={eid})")
+
                 # Send Contact event via Conversions API
                 if "Contact" in pixel_events:
+                    eid = f"Contact_{click_id or click.get('id','')}_{base_ts}"
                     await send_meta_conversion_event(
                         event_name="Contact",
                         lead_data=lead_data,
                         custom_data=custom_data,
                         access_token=access_token,
-                        pixel_id=pixel_id
+                        pixel_id=pixel_id,
+                        event_id=eid,
                     )
-                    logger.info(f"Contact event sent via Conversions API for landing {landing_code}")
-                
+                    fired_event_ids["Contact"] = eid
+                    logger.info(f"Contact event sent via Conversions API for landing {landing_code} (event_id={eid})")
+
                 # Send InitiateCheckout event via Conversions API
                 if "InitiateCheckout" in pixel_events:
+                    eid = f"InitiateCheckout_{click_id or click.get('id','')}_{base_ts}"
                     await send_meta_conversion_event(
                         event_name="InitiateCheckout",
                         lead_data=lead_data,
                         custom_data=custom_data,
                         access_token=access_token,
-                        pixel_id=pixel_id
+                        pixel_id=pixel_id,
+                        event_id=eid,
                     )
-                    logger.info(f"InitiateCheckout event sent via Conversions API for landing {landing_code}")
+                    fired_event_ids["InitiateCheckout"] = eid
+                    logger.info(f"InitiateCheckout event sent via Conversions API for landing {landing_code} (event_id={eid})")
+
+                # Persist event_ids on the click doc so we can re-fire them
+                # once the lead actually writes to WhatsApp (see auto_welcome
+                # webhook path where we call resend_enriched_landing_events).
+                if fired_event_ids:
+                    await db.wa_clicks.update_one(
+                        {"click_id": click_id} if click_id else {"id": click.get("id")},
+                        {"$set": {
+                            "landing_event_ids": fired_event_ids,
+                            "landing_events_fired_at": datetime.now(timezone.utc).isoformat(),
+                            "meta_access_token_snapshot": access_token,
+                            "meta_pixel_id_snapshot": pixel_id,
+                        }}
+                    )
         else:
             logger.warning(f"Landing {landing_code} has no Meta Pixel configured (neither in landing nor in associated line)")
     except Exception as e:
@@ -3506,7 +3659,8 @@ async def send_meta_conversion_event(
     lead_data: dict,
     custom_data: dict = None,
     access_token: str = None,
-    pixel_id: str = None
+    pixel_id: str = None,
+    event_id: str = None,
 ):
     """
     Send conversion event to Meta Conversions API
@@ -3517,7 +3671,12 @@ async def send_meta_conversion_event(
     - Contact: Contacto inicial
     - Other: Eventos custom
     
-    Uses line-specific token/pixel only (no env fallbacks)
+    Uses line-specific token/pixel only (no env fallbacks).
+
+    `event_id`: optional. When provided, Meta will deduplicate against any
+    previous event with the same (event_name, event_id) within 48h and keep
+    the one with the highest match quality. This is how we "re-fire" a
+    landing event post-WhatsApp with enriched user_data.
     """
     token = access_token
     pixel = pixel_id
@@ -3712,8 +3871,11 @@ async def send_meta_conversion_event(
                 await db.crm_leads.update_one({"id": lead_data["id"]}, {"$set": auto_update})
                 logger.info(f"Meta CAPI: Auto-resolved for lead {lead_data.get('id')}: {list(auto_update.keys())}")
         
-        # Generate unique event_id for deduplication
-        event_id = f"{event_name}_{lead_data.get('id', 'unknown')}_{int(time.time())}"
+        # Generate unique event_id for deduplication.
+        # Callers can pass their own to force dedup with a prior event (e.g.
+        # re-firing a landing event with enriched user_data post-WhatsApp).
+        if not event_id:
+            event_id = f"{event_name}_{lead_data.get('id', 'unknown')}_{int(time.time())}"
 
         # Resolve event_source_url BEFORE building event_data (needed for action_source)
         source_url = click_data.get("landing_url") or click_data.get("referrer")
@@ -4208,6 +4370,9 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                         # Auto-send welcome message from cajero config (fire-and-forget)
                         import asyncio as _asyncio
                         _asyncio.create_task(send_auto_welcome(crm_lead, line))
+                        # Re-fire landing CAPI events with enriched user_data
+                        # (Meta dedups by event_id and keeps best EMQ)
+                        _asyncio.create_task(resend_enriched_landing_events(crm_lead, line))
                     else:
                         # Update existing lead
                         update_fields = {
@@ -4298,36 +4463,66 @@ async def crm_funnel_stats(
     filter_type: Optional[str] = Query(None, description="diario, semanal, mensual"),
     current_user=Depends(get_current_user)
 ):
-    # Calculate date range based on parameters
-    now = datetime.now(timezone.utc)
-    
+    # ARG timezone (UTC-3, no DST). Stats use the cajero's local day, not UTC.
+    AR_OFFSET = timedelta(hours=-3)
+    now_ar = datetime.now(timezone.utc) + AR_OFFSET  # naive-ish AR clock
+
+    def _ar_iso(dt_ar: datetime) -> str:
+        """Convert an AR-local moment back to a comparable UTC iso string."""
+        return (dt_ar - AR_OFFSET).replace(tzinfo=timezone.utc).isoformat()
+
     if start_date and end_date:
-        # Custom date range
-        date_from = start_date + "T00:00:00+00:00"
-        date_to = end_date + "T23:59:59+00:00"
+        # Custom date range — interpret YYYY-MM-DD as AR local days
+        try:
+            sd = datetime.fromisoformat(start_date).replace(hour=0, minute=0, second=0, microsecond=0)
+            ed = datetime.fromisoformat(end_date).replace(hour=23, minute=59, second=59, microsecond=999999)
+            date_from = _ar_iso(sd)
+            date_to = _ar_iso(ed)
+        except Exception:
+            date_from = start_date + "T00:00:00+00:00"
+            date_to = end_date + "T23:59:59+00:00"
         period_label = f"{start_date} a {end_date}"
     elif filter_type:
-        if filter_type == "diario":
-            date_from = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-            date_to = now.isoformat()
-            period_label = "Hoy"
+        # Truncate now_ar to start-of-day for AR
+        ar_today_start = now_ar.replace(hour=0, minute=0, second=0, microsecond=0)
+        if filter_type == "diario" or filter_type == "hoy":
+            date_from = _ar_iso(ar_today_start)
+            date_to = (now_ar - AR_OFFSET).replace(tzinfo=timezone.utc).isoformat()
+            period_label = "Hoy (Argentina)"
+        elif filter_type == "ayer":
+            ayer_start = ar_today_start - timedelta(days=1)
+            date_from = _ar_iso(ayer_start)
+            date_to = _ar_iso(ar_today_start - timedelta(microseconds=1))
+            period_label = "Ayer (Argentina)"
+        elif filter_type == "ultimos_10":
+            date_from = _ar_iso(ar_today_start - timedelta(days=9))  # 9 días atrás + hoy = 10
+            date_to = (now_ar - AR_OFFSET).replace(tzinfo=timezone.utc).isoformat()
+            period_label = "Últimos 10 días"
         elif filter_type == "semanal":
-            start_of_week = now - timedelta(days=now.weekday())
-            date_from = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-            date_to = now.isoformat()
+            start_of_week = ar_today_start - timedelta(days=ar_today_start.weekday())
+            date_from = _ar_iso(start_of_week)
+            date_to = (now_ar - AR_OFFSET).replace(tzinfo=timezone.utc).isoformat()
             period_label = "Esta semana"
-        elif filter_type == "mensual":
-            start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            date_from = start_of_month.isoformat()
-            date_to = now.isoformat()
+        elif filter_type == "mensual" or filter_type == "este_mes":
+            start_of_month = ar_today_start.replace(day=1)
+            date_from = _ar_iso(start_of_month)
+            date_to = (now_ar - AR_OFFSET).replace(tzinfo=timezone.utc).isoformat()
             period_label = "Este mes"
+        elif filter_type == "mes_anterior":
+            start_of_this_month = ar_today_start.replace(day=1)
+            # Last day of prev month at 23:59:59
+            end_prev = start_of_this_month - timedelta(microseconds=1)
+            start_prev = end_prev.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            date_from = _ar_iso(start_prev)
+            date_to = _ar_iso(end_prev)
+            period_label = "Mes anterior"
         else:
-            date_from = (now - timedelta(days=days)).isoformat()
-            date_to = now.isoformat()
+            date_from = (now_ar - timedelta(days=days) - AR_OFFSET).replace(tzinfo=timezone.utc).isoformat()
+            date_to = (now_ar - AR_OFFSET).replace(tzinfo=timezone.utc).isoformat()
             period_label = f"Últimos {days} días"
     else:
-        date_from = (now - timedelta(days=days)).isoformat()
-        date_to = now.isoformat()
+        date_from = (now_ar - timedelta(days=days) - AR_OFFSET).replace(tzinfo=timezone.utc).isoformat()
+        date_to = (now_ar - AR_OFFSET).replace(tzinfo=timezone.utc).isoformat()
         period_label = f"Últimos {days} días"
     
     date_query = {"created_at": {"$gte": date_from, "$lte": date_to}}
@@ -4626,7 +4821,7 @@ async def crm_get_all_leads(
     line_id: Optional[str] = None,
     min_score: int = 0,
     page: int = Query(1, ge=1),
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(50, ge=1, le=500),
     current_user=Depends(get_current_user)
 ):
     """Get all CRM leads with optional filters"""
@@ -4745,6 +4940,14 @@ async def crm_get_lead_ad_preview(lead_id: str, current_user=Depends(get_current
     # 1. Meta CTWA Ad referral — richest source (image, headline, body, etc.)
     if referral and (referral.get("headline") or referral.get("source_id") or referral.get("image_url") or referral.get("video_url")):
         media_type = referral.get("media_type") or ("video" if referral.get("video_url") else "image")
+        # Construct a clickable Meta link. Priority:
+        # 1. source_url from referral (the real ad post URL Meta sends)
+        # 2. Meta Ads Library link built from the ad id (source_id)
+        meta_source_url = referral.get("source_url")
+        meta_source_id = referral.get("source_id")
+        ads_library_url = None
+        if meta_source_id:
+            ads_library_url = f"https://www.facebook.com/ads/library/?id={meta_source_id}"
         return {
             "has_preview": True,
             "source": "meta_ctwa_ad",
@@ -4754,10 +4957,11 @@ async def crm_get_lead_ad_preview(lead_id: str, current_user=Depends(get_current
             "video_url": referral.get("video_url"),
             "thumbnail_url": referral.get("thumbnail_url"),
             "media_type": media_type,
-            "source_url": referral.get("source_url"),
-            "source_id": referral.get("source_id"),
+            "source_url": meta_source_url or ads_library_url,
+            "source_id": meta_source_id,
+            "ads_library_url": ads_library_url,
             "ctwa_clid": ctwa_clid,
-            "ad_source": ad_source or referral.get("source_id"),
+            "ad_source": ad_source or meta_source_id,
             "badge_label": "Click-to-WhatsApp Ad",
             "badge_color": "blue",
         }
@@ -5035,24 +5239,41 @@ async def crm_get_lead_messages(
     lead_id: str,
     page: int = Query(1, ge=1),
     limit: int = Query(100, ge=1, le=500),
+    unified: bool = Query(True),
     current_user=Depends(get_current_user)
 ):
-    """Get all messages for a lead"""
-    lead = await db.crm_leads.find_one({"id": lead_id})
+    """
+    Get messages for a lead.
+    When unified=True (default), returns the *full chat history of the phone number* —
+    aggregating messages from all crm_leads that share the same phone (e.g. when the
+    same user comes back through a different line). This preserves context for cajeros.
+    """
+    lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead no encontrado")
-    
-    total = await db.crm_messages.count_documents({"lead_id": lead_id})
+
+    phone = lead.get("phone")
+    if unified and phone:
+        related = await db.crm_leads.find({"phone": phone}, {"id": 1, "_id": 0}).to_list(100)
+        related_ids = [r["id"] for r in related if r.get("id")]
+        if lead_id not in related_ids:
+            related_ids.append(lead_id)
+        query = {"lead_id": {"$in": related_ids}}
+    else:
+        query = {"lead_id": lead_id}
+
+    total = await db.crm_messages.count_documents(query)
     skip = (page - 1) * limit
-    
+
     messages = await db.crm_messages.find(
-        {"lead_id": lead_id}, {"_id": 0}
+        query, {"_id": 0}
     ).sort("created_at", 1).skip(skip).limit(limit).to_list(limit)
-    
+
     return {
         "messages": messages,
         "total": total,
-        "page": page
+        "page": page,
+        "unified": unified and bool(phone),
     }
 
 @api_router.get("/crm/messages/{message_id}/image")
@@ -5453,13 +5674,21 @@ async def crm_send_audio_message(
     if needs_transcode:
         import subprocess
         import tempfile
+        # Locate the ffmpeg binary. First try the one shipped via
+        # imageio-ffmpeg (pip-installed, no apt required); fall back to
+        # whatever is on $PATH.
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg_exe = "ffmpeg"
         try:
             with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp_in:
                 tmp_in.write(file_bytes)
                 tmp_in_path = tmp_in.name
             proc = subprocess.run(
                 [
-                    "ffmpeg", "-y", "-i", tmp_in_path,
+                    ffmpeg_exe, "-y", "-i", tmp_in_path,
                     "-c:a", "libopus", "-b:a", "64k",
                     "-vn", "-f", "ogg",
                     file_path,
@@ -5474,7 +5703,7 @@ async def crm_send_audio_message(
             with open(file_path, "rb") as f:
                 file_bytes = f.read()
         except FileNotFoundError:
-            raise HTTPException(status_code=500, detail="ffmpeg no está instalado en el servidor. Instalá con: apt-get install -y ffmpeg")
+            raise HTTPException(status_code=500, detail="ffmpeg no está disponible. Reinstalá el container (pip install imageio-ffmpeg).")
         except subprocess.TimeoutExpired:
             raise HTTPException(status_code=504, detail="Conversión de audio tardó demasiado")
     else:
@@ -6958,6 +7187,80 @@ def _dashboard_date_range(days: int, start_date: Optional[str], end_date: Option
         return start_date, end_date
     now = datetime.now(timezone.utc)
     return (now - timedelta(days=days)).isoformat(), now.isoformat()
+
+
+@api_router.get("/crm/contacts/history")
+async def crm_contacts_history(
+    fmt: str = Query("json", regex="^(json|csv)$"),
+    current_user=Depends(get_current_user),
+):
+    """Histórico de contactos para los cajeros: teléfono + monto cargado total
+    + cantidad de interacciones. Solo cajero (admin no la pidió). Filtrado
+    automáticamente por las líneas asignadas al cajero.
+
+    `fmt=csv` devuelve un archivo CSV listo para descargar.
+    """
+    role = current_user.get("role")
+    if role not in ("cajero", "admin", "superadmin"):
+        raise HTTPException(status_code=403, detail="Sin permisos")
+
+    user_line_ids = current_user.get("line_ids") or []
+    match: dict = {}
+    if role == "cajero":
+        if not user_line_ids:
+            return [] if fmt == "json" else _csv_response([], filename="contactos.csv")
+        match["line_id"] = {"$in": user_line_ids}
+
+    pipe = [
+        {"$match": match},
+        {"$group": {
+            "_id": "$phone",
+            "name": {"$last": "$name"},
+            "total_cargado": {"$sum": {"$ifNull": ["$charge_amount", 0]}},
+            "messages": {"$sum": {"$ifNull": ["$messages_count", 0]}},
+            "ultima_interaccion": {"$max": "$last_interaction"},
+            "primera_interaccion": {"$min": "$created_at"},
+            "veces_contactado": {"$sum": 1},
+        }},
+        {"$sort": {"total_cargado": -1, "ultima_interaccion": -1}},
+        {"$limit": 5000},
+    ]
+    rows = await db.crm_leads.aggregate(pipe).to_list(5000)
+    out = [{
+        "phone": r["_id"] or "",
+        "name": r.get("name") or "",
+        "total_cargado": round(float(r.get("total_cargado") or 0), 2),
+        "veces_contactado": r.get("veces_contactado") or 0,
+        "mensajes": r.get("messages") or 0,
+        "primera_interaccion": (r.get("primera_interaccion") or "")[:10],
+        "ultima_interaccion": (r.get("ultima_interaccion") or "")[:10],
+    } for r in rows if r.get("_id")]
+
+    if fmt == "csv":
+        return _csv_response(out, filename="contactos.csv")
+    return out
+
+
+def _csv_response(rows: list, filename: str = "export.csv"):
+    """Render a list of dicts as a CSV streaming response (UTF-8 BOM for Excel)."""
+    import csv
+    import io
+    from fastapi.responses import StreamingResponse
+
+    buf = io.StringIO()
+    buf.write("\ufeff")  # BOM so Excel opens UTF-8 properly
+    if rows:
+        writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    else:
+        buf.write("phone,name,total_cargado,veces_contactado,mensajes,primera_interaccion,ultima_interaccion\n")
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @api_router.get("/dashboard/overview")
