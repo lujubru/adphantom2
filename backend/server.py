@@ -3154,19 +3154,49 @@ function setCk(n,v){{document.cookie=n+"="+v+";path=/;max-age=63072000"}}
 function getFBP(){{var f=getCk("_fbp");if(!f){{f="fb.1."+Date.now()+"."+Math.floor(Math.random()*1e10);setCk("_fbp",f)}};return f}}
 function getFBC(){{var p=new URLSearchParams(window.location.search),c=p.get("fbclid");if(!c)return"";var f="fb.1."+Date.now()+"."+c;setCk("_fbc",f);return f}}
 
+// Browser fingerprint (custom, no external library, ~deterministic per device)
+// Combines stable signals: canvas hash, WebGL renderer, audio context fingerprint,
+// hardware concurrency, device memory, timezone, screen, language, platform.
+// Result is a SHA-256 visitor_id used as extra `external_id` on Meta CAPI events.
+function _fpCanvas(){{try{{var c=document.createElement("canvas");c.width=200;c.height=50;var x=c.getContext("2d");x.textBaseline="top";x.font="14px Arial";x.fillStyle="#f60";x.fillRect(0,0,100,30);x.fillStyle="#069";x.fillText("AdPhantom_FP_v1",2,2);x.fillStyle="rgba(102,204,0,0.7)";x.fillText("AdPhantom_FP_v1",4,4);return c.toDataURL()}}catch(e){{return""}}}}
+function _fpWebGL(){{try{{var c=document.createElement("canvas"),g=c.getContext("webgl")||c.getContext("experimental-webgl");if(!g)return"";var d=g.getExtension("WEBGL_debug_renderer_info");return d?(g.getParameter(d.UNMASKED_VENDOR_WEBGL)+"|"+g.getParameter(d.UNMASKED_RENDERER_WEBGL)):""}}catch(e){{return""}}}}
+function _fpAudio(){{try{{var Ac=window.OfflineAudioContext||window.webkitOfflineAudioContext;if(!Ac)return"";var ctx=new Ac(1,5000,44100),osc=ctx.createOscillator();osc.type="triangle";osc.frequency.setValueAtTime(10000,ctx.currentTime);var c=ctx.createDynamicsCompressor();c.threshold.setValueAtTime(-50,ctx.currentTime);osc.connect(c);c.connect(ctx.destination);osc.start(0);return String(ctx.length)+"|"+String(c.threshold.value)}}catch(e){{return""}}}}
+function _sha256(s){{if(!window.crypto||!window.crypto.subtle)return Promise.resolve("");var b=new TextEncoder().encode(s);return crypto.subtle.digest("SHA-256",b).then(function(h){{var a=new Uint8Array(h),o="";for(var i=0;i<a.length;i++){{var x=a[i].toString(16);o+=(x.length<2?"0":"")+x}}return o}})}}
+function getVisitorId(){{
+  var cached=localStorage.getItem("ad_vid");if(cached&&cached.length===64)return Promise.resolve(cached);
+  var parts=[
+    _fpCanvas(),_fpWebGL(),_fpAudio(),
+    navigator.userAgent||"",navigator.language||"",(navigator.languages||[]).join(","),
+    navigator.platform||"",String(navigator.hardwareConcurrency||0),
+    String(navigator.deviceMemory||0),String(navigator.maxTouchPoints||0),
+    screen.width+"x"+screen.height+"x"+screen.colorDepth,
+    String(window.devicePixelRatio||1),
+    String(new Date().getTimezoneOffset()),
+    Intl&&Intl.DateTimeFormat?Intl.DateTimeFormat().resolvedOptions().timeZone:"",
+    String((navigator.plugins||{{length:0}}).length),String(navigator.cookieEnabled),
+    String(window.indexedDB?1:0),String("ontouchstart" in window?1:0),
+  ];
+  return _sha256(parts.join("|||")).then(function(h){{
+    if(h){{try{{localStorage.setItem("ad_vid",h)}}catch(e){{}}}}
+    return h;
+  }}).catch(function(){{return""}});
+}}
+
 var clickId=localStorage.getItem("ck_"+LANDING_CODE)||gID();
 localStorage.setItem("ck_"+LANDING_CODE,clickId);
 
 // Meta Pixel - PageView event
 if(typeof fbq !== 'undefined') {{ {pixel_pageview} }}
 
-// Track page view
-fetch(BASE_URL+"/api/wa-landings/track",{{method:"POST",headers:{{"Content-Type":"application/json"}},
-body:JSON.stringify({{landing_code:LANDING_CODE,click_id:clickId,fbp:getFBP(),fbc:getFBC(),
-utm_content:new URLSearchParams(window.location.search).get("utm_content")||"",
-utm_campaign:new URLSearchParams(window.location.search).get("utm_campaign")||"",
-user_agent:navigator.userAgent,referrer:document.referrer}})
-}}).catch(function(){{}});
+// Track page view (with browser fingerprint visitor_id for Meta CAPI external_id enrichment)
+getVisitorId().then(function(vid){{
+  fetch(BASE_URL+"/api/wa-landings/track",{{method:"POST",headers:{{"Content-Type":"application/json"}},
+  body:JSON.stringify({{landing_code:LANDING_CODE,click_id:clickId,fbp:getFBP(),fbc:getFBC(),
+  utm_content:new URLSearchParams(window.location.search).get("utm_content")||"",
+  utm_campaign:new URLSearchParams(window.location.search).get("utm_campaign")||"",
+  user_agent:navigator.userAgent,referrer:document.referrer,visitor_id:vid||""}})
+  }}).catch(function(){{}});
+}});
 
 function goWA(){{
 var btn=document.getElementById("waBtn");
@@ -3175,10 +3205,13 @@ var num=WA_NUMBERS[Math.floor(Math.random()*WA_NUMBERS.length)];
 var msg=WA_MSG+" (ID: "+clickId+")";
 // Meta Pixel - Conversion events (Lead, Contact, etc)
 if(typeof fbq !== 'undefined') {{ {pixel_wa_click} }}
-// Track WA click
+// Track WA click (also sends visitor_id so backend updates wa_clicks even if
+// the page-view track was blocked by an adblocker)
+getVisitorId().then(function(vid){{
 fetch(BASE_URL+"/api/wa-landings/track-wa",{{method:"POST",headers:{{"Content-Type":"application/json"}},
-body:JSON.stringify({{landing_code:LANDING_CODE,click_id:clickId}})
+body:JSON.stringify({{landing_code:LANDING_CODE,click_id:clickId,visitor_id:vid||""}})
 }}).catch(function(){{}});
+}});
 window.location.href="https://wa.me/"+num+"?text="+encodeURIComponent(msg);
 }}
 
@@ -3249,6 +3282,7 @@ async def wa_landing_track(request: Request):
             "is_vpn": vpn_flag,
             "is_datacenter": is_dc,
             "fingerprint_hash": fingerprint,
+            "visitor_id": (body.get("visitor_id") or "").strip(),
             "behavioral_score": score,
             "country": "XX",
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -3268,10 +3302,13 @@ async def wa_landing_track_wa(request: Request):
         click_id = body.get("click_id")
         email = body.get("email", "").strip().lower()
         
-        # Update click record — save email if provided
+        # Update click record — save email and visitor_id if provided
         update_set = {"wa_clicked": True, "wa_clicked_at": datetime.now(timezone.utc).isoformat()}
         if email and "@" in email:
             update_set["email"] = email
+        vid_in = (body.get("visitor_id") or "").strip()
+        if vid_in:
+            update_set["visitor_id"] = vid_in
         await db.wa_clicks.update_one(
             {"landing_code": landing_code, "click_id": click_id},
             {"$set": update_set}
@@ -3487,12 +3524,23 @@ class CRMLeadClassify(BaseModel):
 _geo_cache = {}  # Simple in-memory cache for IP geo lookups
 
 async def resolve_geo_from_ip(ip: str) -> dict:
-    """Resolve city, state, zip, country from IP using ip-api.com (free, no key needed)"""
+    """Resolve city, state, zip, country from IP using ip-api.com (free, no key needed).
+    Persistent cache lives in `geo_cache` collection so each IP is resolved once
+    in its lifetime even across server restarts.
+    """
     if not ip or ip in ("0.0.0.0", "unknown", "127.0.0.1", "::1"):
         return {}
-    # Check cache first
+    # Memory cache (per-process hot path)
     if ip in _geo_cache:
         return _geo_cache[ip]
+    # Persistent cache in Mongo
+    try:
+        cached = await db.geo_cache.find_one({"_id": ip}, {"_id": 0, "data": 1})
+        if cached and cached.get("data") is not None:
+            _geo_cache[ip] = cached["data"]
+            return cached["data"]
+    except Exception as e:
+        logger.debug(f"geo_cache mongo read failed for {ip}: {e}")
     try:
         async with httpx.AsyncClient(timeout=5) as c:
             resp = await c.get(f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,region,regionName,city,zip")
@@ -3507,6 +3555,16 @@ async def resolve_geo_from_ip(ip: str) -> dict:
                         "country_code": data.get("countryCode", "").lower(),
                     }
                     _geo_cache[ip] = result
+                    # Persist forever (IP-to-geo mappings are extremely stable;
+                    # if the user moves we'll just re-resolve a different IP).
+                    try:
+                        await db.geo_cache.update_one(
+                            {"_id": ip},
+                            {"$set": {"data": result, "cached_at": datetime.now(timezone.utc).isoformat()}},
+                            upsert=True,
+                        )
+                    except Exception as e:
+                        logger.debug(f"geo_cache mongo write failed for {ip}: {e}")
                     return result
     except Exception as e:
         logger.debug(f"Geo resolve failed for {ip}: {e}")
@@ -3726,6 +3784,44 @@ async def send_meta_conversion_event(
                     "fbc": wa_contact.get("fbc", ""),
                     "landing_code": wa_contact.get("landing_code", ""),
                 }
+
+        # ── Cross-session signal recovery ──────────────────────────
+        # If the current click_data is missing IP/UA/fbp/fbc/visitor_id, try
+        # to pull them from the LATEST wa_clicks doc that ever matched this
+        # phone OR this visitor_id. This rescues leads that arrive directly
+        # via WhatsApp (no landing visit in this session) but visited a
+        # landing of ours in the past.
+        try:
+            current_vid = click_data.get("visitor_id") or lead_data.get("visitor_id")
+            phone_for_lookup = re.sub(r'\D', '', lead_data.get("phone") or "")[-10:]
+            needs = (
+                not click_data.get("ip")
+                or not click_data.get("user_agent")
+                or not click_data.get("fbp")
+                or not click_data.get("fbc")
+                or not current_vid
+            )
+            if needs and (phone_for_lookup or current_vid):
+                or_clauses = []
+                if phone_for_lookup:
+                    or_clauses.append({"phone": {"$regex": phone_for_lookup}})
+                if current_vid:
+                    or_clauses.append({"visitor_id": current_vid})
+                latest = await db.wa_clicks.find_one(
+                    {"$or": or_clauses} if or_clauses else {"_id": None},
+                    {"_id": 0},
+                    sort=[("created_at", -1)]
+                )
+                if latest:
+                    for k in ("ip", "user_agent", "fbp", "fbc", "visitor_id", "fingerprint_hash"):
+                        if not click_data.get(k) and latest.get(k):
+                            click_data[k] = latest[k]
+                    logger.info(
+                        f"Meta CAPI: cross-session signals recovered for lead {lead_data.get('id')} "
+                        f"(phone tail={phone_for_lookup or '-'}, vid={'yes' if current_vid else 'no'})"
+                    )
+        except Exception as _e:
+            logger.debug(f"cross-session signal recovery failed: {_e}")
         
         # Build user data with all available info
         user_data = {}
@@ -3802,14 +3898,28 @@ async def send_meta_conversion_event(
         # multiple interactions = same external_id). Using the phone hash instead
         # of a random UUID dramatically improves EMQ and reduces "synthetic
         # automation" score from Meta Integrity.
+        # We also append the browser visitor_id (captured client-side via custom
+        # fingerprint on landing pages) as an additional external_id so Meta has
+        # *two* stable signals to match on. visitor_id is already a SHA-256 of
+        # device features, so we send it as-is (no double-hash).
+        ext_ids = []
         phone_for_ext = (lead_data.get("phone") or "").strip()
         # Keep only digits so "+54911..." and "54911..." produce the same hash
         phone_digits_ext = "".join(c for c in phone_for_ext if c.isdigit())
         if phone_digits_ext:
-            user_data["external_id"] = [hashlib.sha256(phone_digits_ext.encode()).hexdigest()]
+            ext_ids.append(hashlib.sha256(phone_digits_ext.encode()).hexdigest())
         elif lead_data.get("id"):
             # Last-resort fallback (e.g. lead without phone — shouldn't happen)
-            user_data["external_id"] = [hashlib.sha256(lead_data["id"].encode()).hexdigest()]
+            ext_ids.append(hashlib.sha256(lead_data["id"].encode()).hexdigest())
+
+        # Browser fingerprint visitor_id — already SHA-256, append if present
+        vid_ext = (click_data.get("visitor_id") or lead_data.get("visitor_id") or "").strip()
+        if vid_ext and len(vid_ext) == 64 and all(c in "0123456789abcdef" for c in vid_ext):
+            if vid_ext not in ext_ids:
+                ext_ids.append(vid_ext)
+
+        if ext_ids:
+            user_data["external_id"] = ext_ids
         
         # ── AUTO-RESOLVE GEO DATA FROM IP (city, state, zip, country) ──
         # This runs automatically so cajeros don't need to fill anything
@@ -3921,14 +4031,55 @@ async def send_meta_conversion_event(
                 # Add content_type for better optimization
                 if "content_type" not in custom_data:
                     custom_data["content_type"] = "product"
+                # ── Enriched Purchase metadata for better matching / dedupe ──
+                # order_id: stable per-lead per-day identifier so the same
+                # Purchase isn't double-counted if we re-fire. Format:
+                # "<lead_id>-<YYYYMMDD>". Meta also uses order_id for dedupe
+                # alongside event_id, which improves attribution.
+                if "order_id" not in custom_data and lead_data.get("id"):
+                    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+                    custom_data["order_id"] = f"{lead_data['id']}-{today}"
+                # content_ids / content_name from line metadata so Meta can
+                # attribute the conversion to the right product/campaign.
+                if "content_ids" not in custom_data:
+                    line_id = lead_data.get("line_id")
+                    if line_id:
+                        custom_data["content_ids"] = [str(line_id)]
+                        if "content_name" not in custom_data:
+                            try:
+                                line_doc = await db.crm_lines.find_one(
+                                    {"id": line_id},
+                                    {"_id": 0, "name": 1, "whatsapp_number": 1}
+                                )
+                                if line_doc and line_doc.get("name"):
+                                    custom_data["content_name"] = line_doc["name"]
+                            except Exception:
+                                pass
+                if "content_category" not in custom_data:
+                    custom_data["content_category"] = "credits"
+                if "num_items" not in custom_data:
+                    custom_data["num_items"] = 1
+                if "delivery_category" not in custom_data:
+                    # "home_delivery" is the closest standard value Meta
+                    # accepts for digital credits delivered to the user.
+                    custom_data["delivery_category"] = "home_delivery"
             event_data["custom_data"] = custom_data
         elif event_name == "Purchase":
             # Purchase MUST have custom_data with value/currency
-            event_data["custom_data"] = {
+            today = datetime.now(timezone.utc).strftime("%Y%m%d")
+            cd = {
                 "value": 0.0,
                 "currency": PURCHASE_CURRENCY,
-                "content_type": "product"
+                "content_type": "product",
+                "content_category": "credits",
+                "num_items": 1,
+                "delivery_category": "home_delivery",
             }
+            if lead_data.get("id"):
+                cd["order_id"] = f"{lead_data['id']}-{today}"
+            if lead_data.get("line_id"):
+                cd["content_ids"] = [str(lead_data["line_id"])]
+            event_data["custom_data"] = cd
         
         payload = {
             "data": [event_data],
@@ -6348,6 +6499,143 @@ async def crm_emq_dashboard(
     }
 
 
+@api_router.get("/crm/emq/by-line")
+async def crm_emq_by_line(
+    days: int = Query(7, ge=1, le=90),
+    current_user=Depends(get_current_user)
+):
+    """
+    EMQ Score breakdown by Meta line.
+    Returns, for each line that fired any CAPI event in the last N days:
+      - tier counts based on raw matching params count: 12+, 10-11, 8-9, <8
+      - avg params, avg EMQ %, success rate
+      - top 3 missing high-value parameters (so cajero/admin sees WHAT to fix)
+      - per-event-type counts (Lead/Contact/Purchase) for context
+
+    This is the metric Meta uses to rank Pixel quality. The frontend renders
+    a colored bar (green/blue/amber/red) per line so a missing-fbp landing
+    is visible at a glance.
+    """
+    date_from = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    # Build a {line_id: name} map for friendly labels
+    line_docs = await db.crm_lines.find({}, {"_id": 0, "id": 1, "name": 1}).to_list(500)
+    line_names = {ln["id"]: ln.get("name") or ln["id"] for ln in line_docs}
+
+    # Aggregate per line
+    cursor = db.meta_events_log.aggregate([
+        {"$match": {"created_at": {"$gte": date_from}}},
+        {"$group": {
+            "_id": "$line_id",
+            "total": {"$sum": 1},
+            "success": {"$sum": {"$cond": [{"$eq": ["$success", True]}, 1, 0]}},
+            "sum_params": {"$sum": "$matching_params_count"},
+            "tier_excellent": {"$sum": {"$cond": [{"$gte": ["$matching_params_count", 12]}, 1, 0]}},
+            "tier_good":      {"$sum": {"$cond": [{"$and": [{"$gte": ["$matching_params_count", 10]}, {"$lte": ["$matching_params_count", 11]}]}, 1, 0]}},
+            "tier_normal":    {"$sum": {"$cond": [{"$and": [{"$gte": ["$matching_params_count", 8]},  {"$lte": ["$matching_params_count", 9]}]}, 1, 0]}},
+            "tier_low":       {"$sum": {"$cond": [{"$lt":  ["$matching_params_count", 8]}, 1, 0]}},
+            "with_fbp": {"$sum": {"$cond": [{"$eq": ["$has_fbp", True]}, 1, 0]}},
+            "with_fbc": {"$sum": {"$cond": [{"$eq": ["$has_fbc", True]}, 1, 0]}},
+            "with_email": {"$sum": {"$cond": [{"$eq": ["$has_email", True]}, 1, 0]}},
+            "purchase_count": {"$sum": {"$cond": [{"$eq": ["$event_name", "Purchase"]}, 1, 0]}},
+            "lead_count":     {"$sum": {"$cond": [{"$eq": ["$event_name", "Lead"]}, 1, 0]}},
+            "contact_count":  {"$sum": {"$cond": [{"$eq": ["$event_name", "Contact"]}, 1, 0]}},
+        }},
+        {"$sort": {"total": -1}},
+    ])
+
+    rows = []
+    grand_total = 0
+    grand_excellent = 0
+    grand_good = 0
+    grand_normal = 0
+    grand_low = 0
+    grand_params = 0
+    grand_success = 0
+    async for r in cursor:
+        total = r["total"] or 0
+        if total == 0:
+            continue
+        # Compute weighted EMQ % per line by sampling user_data_keys
+        keys_sample = await db.meta_events_log.find(
+            {"created_at": {"$gte": date_from}, "line_id": r["_id"]},
+            {"_id": 0, "user_data_keys": 1}
+        ).limit(200).to_list(200)
+        emq_scores = []
+        missing_counter = {}
+        for ev in keys_sample:
+            ks = ev.get("user_data_keys") or []
+            if not ks:
+                continue
+            emq = calculate_emq_score(ks)
+            emq_scores.append(emq["score"])
+            for m in emq["missing_params"]:
+                missing_counter[m] = missing_counter.get(m, 0) + 1
+        avg_emq = round(sum(emq_scores) / len(emq_scores)) if emq_scores else 0
+        top_missing = sorted(missing_counter.items(), key=lambda x: -x[1])[:3]
+
+        rows.append({
+            "line_id": r["_id"],
+            "line_name": line_names.get(r["_id"], "Sin línea"),
+            "total": total,
+            "success_rate": round(r["success"] / total * 100) if total else 0,
+            "avg_params": round(r["sum_params"] / total, 1) if total else 0,
+            "avg_emq_score": avg_emq,
+            "tiers": {
+                "excellent": r["tier_excellent"],   # 12+
+                "good":      r["tier_good"],        # 10-11
+                "normal":    r["tier_normal"],      # 8-9
+                "low":       r["tier_low"],         # <8
+            },
+            "tier_pct": {
+                "excellent": round(r["tier_excellent"] / total * 100, 1),
+                "good":      round(r["tier_good"] / total * 100, 1),
+                "normal":    round(r["tier_normal"] / total * 100, 1),
+                "low":       round(r["tier_low"] / total * 100, 1),
+            },
+            "signals": {
+                "fbp_rate":   round(r["with_fbp"] / total * 100),
+                "fbc_rate":   round(r["with_fbc"] / total * 100),
+                "email_rate": round(r["with_email"] / total * 100),
+            },
+            "events": {
+                "Purchase": r["purchase_count"],
+                "Lead":     r["lead_count"],
+                "Contact":  r["contact_count"],
+            },
+            "top_missing": [m for m, _c in top_missing],
+        })
+        grand_total += total
+        grand_excellent += r["tier_excellent"]
+        grand_good += r["tier_good"]
+        grand_normal += r["tier_normal"]
+        grand_low += r["tier_low"]
+        grand_params += r["sum_params"]
+        grand_success += r["success"]
+
+    return {
+        "period_days": days,
+        "lines": rows,
+        "totals": {
+            "total": grand_total,
+            "success_rate": round(grand_success / grand_total * 100) if grand_total else 0,
+            "avg_params": round(grand_params / grand_total, 1) if grand_total else 0,
+            "tiers": {
+                "excellent": grand_excellent,
+                "good": grand_good,
+                "normal": grand_normal,
+                "low": grand_low,
+            },
+            "tier_pct": {
+                "excellent": round(grand_excellent / grand_total * 100, 1) if grand_total else 0,
+                "good":      round(grand_good / grand_total * 100, 1) if grand_total else 0,
+                "normal":    round(grand_normal / grand_total * 100, 1) if grand_total else 0,
+                "low":       round(grand_low / grand_total * 100, 1) if grand_total else 0,
+            },
+        },
+    }
+
+
 # ─── Web Push Notifications (VAPID) ────────────────────────────────
 # Keeps cajero notified even when Chrome is closed (works via background service worker)
 
@@ -7087,12 +7375,12 @@ async def startup():
         logger.error(f"MongoDB connection FAILED: {e}")
         return
     # Create admin user if not exists
-    existing = await db.users.find_one({"email": "admin@maxi.com"})
+    existing = await db.users.find_one({"email": "admin@blackguardian.tech"})
     if not existing:
-        hashed = pwd_context.hash("admin123")
+        hashed = pwd_context.hash("Frig20060920+")
         await db.users.insert_one({
             "id": str(uuid.uuid4()),
-            "email": "admin@maxi.com",
+            "email": "admin@blackguardian.tech",
             "hashed_password": hashed,
             "role": "admin",
             "is_active": True,
@@ -7102,32 +7390,7 @@ async def startup():
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
         logger.info("Admin user created: admin@maxi.com")
-    # Create cajero user if not exists 
-#    existing_cajero = await db.users.find_one({"email": "cajero@blackguardian.com"})
-#    if not existing_cajero:
-#        hashed_cajero = pwd_context.hash("cajero123")  # cambiá esto
-#        await db.users.insert_one({
-#            "id": str(uuid.uuid4()),
-#            "email": "cajero@blackguardian.com",
-#            "hashed_password": hashed_cajero,
-#            "role": "cajero",
-#            "is_active": True,
-#            "created_at": datetime.now(timezone.utc).isoformat(),
-#        })
-#        logger.info("Cajero user created: cajero@blackguardian.com")
-#    existing_ares = await db.users.find_one({"email": "ares@blackguardian.com"})
-#    if not existing_ares:
-#        hashed_ares = pwd_context.hash("ares123456")
-#        await db.users.insert_one({
-#            "id": str(uuid.uuid4()),
-#            "email": "ares@blackguardian.com",
-#            "hashed_password": hashed_ares,
-#            "role": "cajero",
-#            "line_ids": ["268bfa4d-a908-4d6b-a371-815a3d35b772"],
-#            "is_active": True,
-#            "created_at": datetime.now(timezone.utc).isoformat(),
-#        })
-#        logger.info("Cajero user created: ares@blackguardian.com")
+
 
     
     # Create indexes
