@@ -973,7 +973,7 @@ export default function LeadsCRM() {
             data-testid="chat-list-container"
           >
             <div className={`p-3 border-b ${borderColor} space-y-2 shrink-0`}>
-              <div className="relative">
+              <div className="relative md:ml-10" data-testid="chat-list-search-wrap">
                 <Search className={`absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 ${textSecondary}`} />
                 <Input placeholder="Buscar..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)}
                   className={`pl-9 ${inputBg} text-sm h-9`} data-testid="chat-list-search" />

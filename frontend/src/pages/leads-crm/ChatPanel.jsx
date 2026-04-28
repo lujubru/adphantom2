@@ -132,12 +132,16 @@ export const ChatPanel = ({
       isNearBottomRef.current = true;
       setIsNearBottom(true);
       loadMessages();
-      // Refocus the textarea so the cajero can keep typing without re-clicking
+    } catch { toast.error('Error enviando mensaje'); }
+    finally {
+      setSending(false);
+      // Refocus the textarea AFTER the disabled flag is cleared so the
+      // browser actually accepts the focus call. Cajero can keep typing
+      // without re-clicking the input.
       setTimeout(() => {
         try { inputRef.current?.focus(); } catch { /* silent */ }
-      }, 0);
-    } catch { toast.error('Error enviando mensaje'); }
-    finally { setSending(false); }
+      }, 60);
+    }
   };
 
   const fileInputRef = useRef(null);
@@ -361,20 +365,60 @@ Le envio nuestros datos de cuenta 👇`;
         </div>
       </div>
 
-      {/* Conversion value input */}
+      {/* Conversion value modal — centered overlay to avoid z-index issues
+          with the chat panel layout. Cajero just clicks "Validar" and a
+          clean dialog appears asking for the sale amount. */}
       {showConversionInput && (
-        <div className="px-4 py-3 border-b border-slate-700 bg-emerald-950/30 flex items-center gap-2">
-          <DollarSign className="w-4 h-4 text-emerald-400 shrink-0" />
-          <Input
-            type="number"
-            placeholder="Monto de venta (ej: 1500)"
-            value={conversionValue}
-            onChange={e => setConversionValue(e.target.value)}
-            className="bg-slate-800 border-slate-600 text-white text-sm h-8 flex-1"
-            autoFocus
-          />
-          <Button size="sm" onClick={confirmValido} className="bg-emerald-600 hover:bg-emerald-700 h-8 text-xs">Confirmar</Button>
-          <Button size="sm" variant="outline" onClick={() => { setShowConversionInput(false); setConversionValue(''); }} className="border-slate-600 h-8 text-xs">Cancelar</Button>
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm"
+          onClick={() => { setShowConversionInput(false); setConversionValue(''); }}
+          data-testid="conversion-modal-backdrop"
+        >
+          <div
+            className="w-full max-w-sm rounded-xl border border-emerald-700/40 bg-slate-900 shadow-2xl p-5"
+            onClick={e => e.stopPropagation()}
+            data-testid="conversion-modal"
+          >
+            <div className="flex items-center gap-2 mb-3">
+              <div className="w-9 h-9 rounded-full bg-emerald-500/15 flex items-center justify-center">
+                <DollarSign className="w-5 h-5 text-emerald-400" />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-white">Marcar como Válido</p>
+                <p className="text-[11px] text-slate-400">Ingresá el monto de la venta</p>
+              </div>
+            </div>
+            <Input
+              type="number"
+              inputMode="decimal"
+              placeholder="Ej: 1500"
+              value={conversionValue}
+              onChange={e => setConversionValue(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') confirmValido(); }}
+              className="bg-slate-800 border-slate-600 text-white text-base h-10"
+              autoFocus
+              data-testid="conversion-amount-input"
+            />
+            <div className="mt-4 flex items-center gap-2 justify-end">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => { setShowConversionInput(false); setConversionValue(''); }}
+                className="border-slate-600 text-slate-300 hover:bg-slate-800"
+                data-testid="conversion-cancel-btn"
+              >
+                Cancelar
+              </Button>
+              <Button
+                size="sm"
+                onClick={confirmValido}
+                className="bg-emerald-600 hover:bg-emerald-500 text-white"
+                data-testid="conversion-confirm-btn"
+              >
+                Confirmar venta
+              </Button>
+            </div>
+          </div>
         </div>
       )}
 

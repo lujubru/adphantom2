@@ -82,7 +82,7 @@ export const HamburgerMenu = ({
         onClick={() => setOpen(true)}
         data-testid="hamburger-btn"
         title="Menú"
-        className={`fixed top-[72px] left-3 z-40 w-9 h-9 rounded-full flex items-center justify-center shadow-md transition-all ${
+        className={`fixed top-[100px] left-2 z-40 w-9 h-9 rounded-full flex items-center justify-center shadow-md transition-all ${
           darkMode ? 'bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200' : 'bg-white hover:bg-gray-50 border border-gray-200 text-gray-700'
         }`}
       >

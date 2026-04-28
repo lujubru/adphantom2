@@ -8,6 +8,142 @@ import { Button } from '@/components/ui/button';
 import api from '@/utils/api';
 import { useTheme } from '@/contexts/ThemeContext';
 
+// ─── EMQ Score by Line — tier breakdown 12+ / 10-11 / 8-9 / <8 ─────
+
+const EMQByLine = ({ days }) => {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const load = async () => {
+      setLoading(true);
+      try {
+        const { data: d } = await api.get('/crm/emq/by-line', { params: { days } });
+        setData(d);
+      } catch { /* silent */ }
+      finally { setLoading(false); }
+    };
+    load();
+  }, [days]);
+
+  if (loading) return (
+    <div className="bg-slate-900/50 rounded-xl p-6 border border-slate-800 flex items-center justify-center h-32">
+      <RefreshCw className="w-5 h-5 text-blue-400 animate-spin" />
+    </div>
+  );
+
+  if (!data || !data.lines || data.lines.length === 0) return (
+    <div className="bg-slate-900/50 rounded-xl p-6 border border-slate-800 text-center" data-testid="emq-by-line-empty">
+      <BarChart3 className="w-8 h-8 text-slate-600 mx-auto mb-2" />
+      <p className="text-slate-400 text-sm">Sin eventos por línea en este período</p>
+    </div>
+  );
+
+  const tierMeta = [
+    { key: 'excellent', label: '12+ params',  color: 'bg-emerald-500', text: 'text-emerald-400', range: 'Excelente' },
+    { key: 'good',      label: '10-11 params', color: 'bg-blue-500',    text: 'text-blue-400',    range: 'Buena' },
+    { key: 'normal',    label: '8-9 params',   color: 'bg-amber-500',   text: 'text-amber-400',   range: 'Normal' },
+    { key: 'low',       label: '<8 params',    color: 'bg-red-500',     text: 'text-red-400',     range: 'Baja' },
+  ];
+
+  const totals = data.totals;
+
+  return (
+    <div className="space-y-4" data-testid="emq-by-line">
+      {/* Global tier summary — single horizontal stacked bar */}
+      <div className="bg-slate-900/50 rounded-xl border border-slate-800 p-5">
+        <div className="flex items-center justify-between mb-3">
+          <p className="text-sm font-semibold text-white">Distribución global de calidad ({data.period_days} días)</p>
+          <span className="text-xs text-slate-400">{totals.total} eventos · {totals.avg_params} params promedio</span>
+        </div>
+        <div className="flex h-4 rounded-md overflow-hidden bg-slate-800 mb-2" data-testid="emq-global-bar">
+          {tierMeta.map(t => totals.tier_pct[t.key] > 0 && (
+            <div
+              key={t.key}
+              className={`${t.color} transition-all`}
+              style={{ width: `${totals.tier_pct[t.key]}%` }}
+              title={`${t.label}: ${totals.tiers[t.key]} (${totals.tier_pct[t.key]}%)`}
+            />
+          ))}
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-3">
+          {tierMeta.map(t => (
+            <div key={t.key} className="flex items-center gap-2">
+              <span className={`w-2.5 h-2.5 rounded-sm ${t.color}`} />
+              <div className="flex-1 min-w-0">
+                <p className="text-xs text-slate-400 truncate">{t.label}</p>
+                <p className={`text-sm font-bold ${t.text}`}>{totals.tier_pct[t.key]}% <span className="text-slate-500 font-normal text-xs">({totals.tiers[t.key]})</span></p>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Per-line breakdown */}
+      <div className="bg-slate-900/50 rounded-xl border border-slate-800 overflow-hidden">
+        <div className="px-4 py-3 border-b border-slate-700 flex items-center justify-between">
+          <p className="text-sm font-semibold text-white">EMQ Score por Línea</p>
+          <span className="text-[11px] text-slate-500">Tu Pixel ranquea según estos parámetros</span>
+        </div>
+        <div className="divide-y divide-slate-800/50">
+          {data.lines.map(line => {
+            const dominant = ['excellent','good','normal','low'].reduce((a,b)=> line.tier_pct[a] >= line.tier_pct[b] ? a : b);
+            const dominantMeta = tierMeta.find(t => t.key === dominant);
+            return (
+              <div key={line.line_id || 'none'} className="px-4 py-3 hover:bg-slate-800/30 transition-colors" data-testid={`emq-line-row-${line.line_id || 'none'}`}>
+                {/* Header row */}
+                <div className="flex items-center gap-3 mb-2">
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-white truncate">{line.line_name}</p>
+                    <p className="text-[11px] text-slate-500">{line.total} eventos · {line.events.Purchase || 0} Purchase · {line.events.Lead || 0} Lead · {line.events.Contact || 0} Contact</p>
+                  </div>
+                  <div className="text-right shrink-0">
+                    <p className={`text-base font-bold ${dominantMeta.text}`}>{line.avg_emq_score}%</p>
+                    <p className="text-[10px] text-slate-500">{line.avg_params} params</p>
+                  </div>
+                </div>
+
+                {/* Stacked tier bar */}
+                <div className="flex h-2.5 rounded-sm overflow-hidden bg-slate-800">
+                  {tierMeta.map(t => line.tier_pct[t.key] > 0 && (
+                    <div
+                      key={t.key}
+                      className={`${t.color} transition-all`}
+                      style={{ width: `${line.tier_pct[t.key]}%` }}
+                      title={`${t.label}: ${line.tiers[t.key]} (${line.tier_pct[t.key]}%)`}
+                    />
+                  ))}
+                </div>
+
+                {/* Signals + missing */}
+                <div className="mt-2 flex items-center gap-3 flex-wrap text-[11px]">
+                  <span className={`font-medium ${line.signals.fbp_rate >= 80 ? 'text-emerald-400' : line.signals.fbp_rate >= 40 ? 'text-amber-400' : 'text-red-400'}`}>
+                    fbp {line.signals.fbp_rate}%
+                  </span>
+                  <span className={`font-medium ${line.signals.fbc_rate >= 80 ? 'text-emerald-400' : line.signals.fbc_rate >= 40 ? 'text-amber-400' : 'text-red-400'}`}>
+                    fbc {line.signals.fbc_rate}%
+                  </span>
+                  <span className={`font-medium ${line.signals.email_rate >= 50 ? 'text-emerald-400' : line.signals.email_rate >= 20 ? 'text-amber-400' : 'text-slate-500'}`}>
+                    email {line.signals.email_rate}%
+                  </span>
+                  <span className={`font-medium ${line.success_rate >= 95 ? 'text-emerald-400' : line.success_rate >= 80 ? 'text-amber-400' : 'text-red-400'}`}>
+                    OK {line.success_rate}%
+                  </span>
+                  {line.top_missing.length > 0 && (
+                    <span className="text-slate-500 ml-auto" title="Parámetros que más se pierden — agregalos para mejorar EMQ">
+                      falta: <span className="text-slate-300 font-mono">{line.top_missing.join(', ')}</span>
+                    </span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // ─── EMQ Dashboard ─────────────────────────────────────────────────
 
 const EMQDashboard = ({ lineId, days }) => {
@@ -323,7 +459,12 @@ export default function MetaInsights() {
         </div>
 
         {/* Content */}
-        {activeTab === 'emq' && <EMQDashboard lineId={selectedLineId} days={days} />}
+        {activeTab === 'emq' && (
+          <div className="space-y-4" data-testid="emq-tab-content">
+            <EMQByLine days={days} />
+            <EMQDashboard lineId={selectedLineId} days={days} />
+          </div>
+        )}
         {activeTab === 'ads' && <AdPerformanceDashboard lineId={selectedLineId} days={days} />}
       </div>
     </div>
