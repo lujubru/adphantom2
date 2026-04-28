@@ -3185,11 +3185,41 @@ function getVisitorId(){{
 var clickId=localStorage.getItem("ck_"+LANDING_CODE)||gID();
 localStorage.setItem("ck_"+LANDING_CODE,clickId);
 
-// Meta Pixel - PageView event
-if(typeof fbq !== 'undefined') {{ {pixel_pageview} }}
+// Pixel ID injected from server config so we can call fbq('init') again
+// with Advanced Matching once the visitor_id (browser fingerprint) is ready.
+// Calling fbq('init', PIXEL_ID, {{...}}) multiple times is supported by Meta
+// — the latest call updates the matching params for subsequent track calls.
+var PIXEL_ID="{pixel_id}";
 
-// Track page view (with browser fingerprint visitor_id for Meta CAPI external_id enrichment)
+// Build advanced matching params for the browser Pixel.
+// We have NO email/phone client-side (those come later via WhatsApp), but we
+// can always send `external_id` (browser fingerprint visitor_id) and the
+// derived country code from navigator.language. This satisfies Meta's
+// "Configurar las coincidencias avanzadas manuales" diagnostic.
+function _buildAdvancedMatching(vid){{
+  var am={{}};
+  if(vid&&vid.length===64) am.external_id=vid;
+  try{{
+    var lang=(navigator.language||"").toLowerCase();
+    var cc=lang.indexOf("-")>=0?lang.split("-")[1]:(lang||"");
+    if(cc&&cc.length===2) am.country=cc;
+  }}catch(e){{}}
+  // ct/st/zp the Pixel auto-resolves from IP server-side via Meta's geo
+  return am;
+}}
+
+// Track page view (with Advanced Matching for the browser Pixel + visitor_id
+// for our backend so CAPI can match on external_id).
 getVisitorId().then(function(vid){{
+  // 1. Re-init the Pixel with Advanced Matching so PageView and any later
+  //    track call carries external_id (and country if available).
+  if(typeof fbq!=="undefined"&&PIXEL_ID){{
+    try{{ fbq("init",PIXEL_ID,_buildAdvancedMatching(vid)); }}catch(e){{}}
+  }}
+  // 2. Now fire PageView (this is the original {pixel_pageview} block that
+  //    the admin configured per-landing — typically fbq('track','PageView')).
+  if(typeof fbq!=="undefined") {{ {pixel_pageview} }}
+  // 3. Track to our backend
   fetch(BASE_URL+"/api/wa-landings/track",{{method:"POST",headers:{{"Content-Type":"application/json"}},
   body:JSON.stringify({{landing_code:LANDING_CODE,click_id:clickId,fbp:getFBP(),fbc:getFBC(),
   utm_content:new URLSearchParams(window.location.search).get("utm_content")||"",
@@ -3203,16 +3233,27 @@ var btn=document.getElementById("waBtn");
 btn.disabled=true;btn.textContent="CONECTANDO...";
 var num=WA_NUMBERS[Math.floor(Math.random()*WA_NUMBERS.length)];
 var msg=WA_MSG+" (ID: "+clickId+")";
-// Meta Pixel - Conversion events (Lead, Contact, etc)
-if(typeof fbq !== 'undefined') {{ {pixel_wa_click} }}
-// Track WA click (also sends visitor_id so backend updates wa_clicks even if
-// the page-view track was blocked by an adblocker)
+// Re-init Pixel with Advanced Matching (visitor_id) so the Lead/Contact event
+// also satisfies "Coincidencias Avanzadas Manuales".
 getVisitorId().then(function(vid){{
-fetch(BASE_URL+"/api/wa-landings/track-wa",{{method:"POST",headers:{{"Content-Type":"application/json"}},
-body:JSON.stringify({{landing_code:LANDING_CODE,click_id:clickId,visitor_id:vid||""}})
-}}).catch(function(){{}});
+  if(typeof fbq!=="undefined"&&PIXEL_ID){{
+    try{{ fbq("init",PIXEL_ID,_buildAdvancedMatching(vid)); }}catch(e){{}}
+  }}
+  // Meta Pixel - Conversion events (Lead, Contact, etc) — original admin code
+  if(typeof fbq !== 'undefined') {{ {pixel_wa_click} }}
+  // Track WA click (also sends visitor_id so backend updates wa_clicks even if
+  // the page-view track was blocked by an adblocker)
+  fetch(BASE_URL+"/api/wa-landings/track-wa",{{method:"POST",headers:{{"Content-Type":"application/json"}},
+  body:JSON.stringify({{landing_code:LANDING_CODE,click_id:clickId,visitor_id:vid||""}})
+  }}).catch(function(){{}});
+  // Tiny delay so the Pixel image-beacon flushes BEFORE we navigate away
+  setTimeout(function(){{
+    window.location.href="https://wa.me/"+num+"?text="+encodeURIComponent(msg);
+  }},120);
+}}).catch(function(){{
+  // Fallback: if fingerprint/visitor_id fails, still go to WhatsApp
+  window.location.href="https://wa.me/"+num+"?text="+encodeURIComponent(msg);
 }});
-window.location.href="https://wa.me/"+num+"?text="+encodeURIComponent(msg);
 }}
 
 // Live counter
@@ -5405,23 +5446,39 @@ async def crm_get_lead_messages(
 ):
     """
     Get messages for a lead.
-    When unified=True (default), returns the *full chat history of the phone number* —
-    aggregating messages from all crm_leads that share the same phone (e.g. when the
-    same user comes back through a different line). This preserves context for cajeros.
+
+    When unified=True (default), returns the chat history aggregated across
+    all leads that share BOTH the same phone AND the same line_id as the
+    current lead. This preserves continuity when a returning customer comes
+    back to the SAME line (brand) months later, but does NOT leak history
+    from the same phone on OTHER lines (which would belong to other
+    cajeros / brands and confuses the cajero — e.g. the auto-welcome of a
+    different line shows up).
+
+    Pass ?unified=false to force strictly the single lead's messages.
     """
     lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead no encontrado")
 
     phone = lead.get("phone")
+    line_id = lead.get("line_id")
     if unified and phone:
-        related = await db.crm_leads.find({"phone": phone}, {"id": 1, "_id": 0}).to_list(100)
+        # Scope unification to the same line_id so cajeros only see THEIR
+        # brand's history with this phone. line_id may be None for legacy
+        # leads — match those together too.
+        related = await db.crm_leads.find(
+            {"phone": phone, "line_id": line_id},
+            {"id": 1, "_id": 0}
+        ).to_list(100)
         related_ids = [r["id"] for r in related if r.get("id")]
         if lead_id not in related_ids:
             related_ids.append(lead_id)
         query = {"lead_id": {"$in": related_ids}}
+        unified_used = len(related_ids) > 1
     else:
         query = {"lead_id": lead_id}
+        unified_used = False
 
     total = await db.crm_messages.count_documents(query)
     skip = (page - 1) * limit
@@ -5434,7 +5491,7 @@ async def crm_get_lead_messages(
         "messages": messages,
         "total": total,
         "page": page,
-        "unified": unified and bool(phone),
+        "unified": unified_used,
     }
 
 @api_router.get("/crm/messages/{message_id}/image")
@@ -7399,7 +7456,7 @@ async def startup():
             "line_ids": [],
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
-        logger.info("Admin user created: admin@maxi.com")
+        logger.info("Admin user created: admin@blackguardian.tech")
     # Create cajero user if not exists 
 #    existing_cajero = await db.users.find_one({"email": "cajero@blackguardian.com"})
 #    if not existing_cajero:
