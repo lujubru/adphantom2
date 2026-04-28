@@ -3838,14 +3838,24 @@ async def send_meta_conversion_event(
         # Facebook cookies (critical for matching)
         fbp = click_data.get("fbp") or lead_data.get("fbp")
         fbc = click_data.get("fbc") or lead_data.get("fbc")
-        
-        # If no fbc available, build one from ctwa_clid (Meta Click-to-WhatsApp Ads)
-        # Meta recommends: fbc = "fb.1.{timestamp_ms}.{ctwa_clid}"
+
+        # NOTE: We deliberately DO NOT synthesize fbc from ctwa_clid.
+        # ctwa_clid is a Click-to-WhatsApp click identifier, NOT a fbclid —
+        # they have different formats. Building "fb.1.{ts}.{ctwa_clid}"
+        # produces a value Meta detects as "modified fbclid" (warning in
+        # Events Manager: 'El servidor está enviando un valor fbclid
+        # modificado en el parámetro fbc'). Sending NO fbc is better than
+        # sending a fake one — Meta correlates ctwa_clid attribution
+        # internally via the WhatsApp webhook, so we don't lose anything.
         ctwa_clid = lead_data.get("ctwa_clid") or click_data.get("ctwa_clid")
-        if not fbc and ctwa_clid:
-            fbc = f"fb.1.{int(time.time() * 1000)}.{ctwa_clid}"
-            logger.info(f"Meta CAPI: built fbc from ctwa_clid for lead {lead_data.get('id')}")
-        
+
+        # Validate fbc format if we have one — must look like "fb.<n>.<ts>.<fbclid>"
+        # If it's malformed (e.g. someone stored just the raw fbclid),
+        # drop it so Meta doesn't reject the event.
+        if fbc and not (isinstance(fbc, str) and fbc.startswith("fb.") and fbc.count(".") >= 3):
+            logger.warning(f"Meta CAPI: dropping malformed fbc '{fbc[:50]}' for lead {lead_data.get('id')}")
+            fbc = None
+
         if fbp:
             user_data["fbp"] = fbp
         if fbc:
@@ -7390,7 +7400,32 @@ async def startup():
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
         logger.info("Admin user created: admin@maxi.com")
-
+    # Create cajero user if not exists 
+#    existing_cajero = await db.users.find_one({"email": "cajero@blackguardian.com"})
+#    if not existing_cajero:
+#        hashed_cajero = pwd_context.hash("cajero123")  # cambiá esto
+#        await db.users.insert_one({
+#            "id": str(uuid.uuid4()),
+#            "email": "cajero@blackguardian.com",
+#            "hashed_password": hashed_cajero,
+#            "role": "cajero",
+#            "is_active": True,
+#            "created_at": datetime.now(timezone.utc).isoformat(),
+#        })
+#        logger.info("Cajero user created: cajero@blackguardian.com")
+#    existing_ares = await db.users.find_one({"email": "ares@blackguardian.com"})
+#    if not existing_ares:
+#        hashed_ares = pwd_context.hash("ares123456")
+#        await db.users.insert_one({
+#            "id": str(uuid.uuid4()),
+#            "email": "ares@blackguardian.com",
+#            "hashed_password": hashed_ares,
+#            "role": "cajero",
+#            "line_ids": ["268bfa4d-a908-4d6b-a371-815a3d35b772"],
+#            "is_active": True,
+#            "created_at": datetime.now(timezone.utc).isoformat(),
+#        })
+#        logger.info("Cajero user created: ares@blackguardian.com")
 
     
     # Create indexes
