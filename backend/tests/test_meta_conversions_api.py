@@ -9,7 +9,7 @@ import uuid
 import time
 
 # Use the public preview URL for testing
-BASE_URL = "https://68c130ba-2559-4351-b87e-253387765b1a.preview.emergentagent.com"
+BASE_URL = "https://usd-ars-issue.preview.emergentagent.com"
 
 # Test credentials
 ADMIN_EMAIL = "admin@adphantom.com"

@@ -5,6 +5,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
+import asyncio
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict
@@ -1903,6 +1904,175 @@ async def wa_send_audio(phone: str, media_id: str, token: str = None, phone_id: 
         return {"error": str(e)}
 
 
+# ─── WhatsApp Template Messages (mass broadcast to NEW contacts) ──
+# Outside the 24h window, Meta REQUIRES sending pre-approved template
+# messages. Templates live at the WABA level (not the phone number level),
+# so all phone numbers in the same WhatsApp Business Account share the
+# same template catalog.
+
+async def wa_fetch_templates(waba_id: str, token: str, status_filter: str = "APPROVED") -> dict:
+    """Fetch all message templates for a WABA. Returns {data: [...], paging: {...}} or {error}."""
+    if not waba_id or not token:
+        return {"error": "WABA id o token faltante"}
+    url = f"{WA_GRAPH_URL}/{waba_id}/message_templates"
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {"fields": "name,status,category,language,components,rejected_reason,quality_score", "limit": 200}
+    if status_filter:
+        params["status"] = status_filter
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            resp = await c.get(url, headers=headers, params=params)
+            return resp.json()
+    except Exception as e:
+        logger.error(f"WA fetch templates error: {e}")
+        return {"error": str(e)}
+
+
+async def wa_create_template(
+    waba_id: str,
+    token: str,
+    name: str,
+    category: str,
+    language: str,
+    body_text: str,
+    header_text: Optional[str] = None,
+    header_image_url: Optional[str] = None,
+    footer_text: Optional[str] = None,
+    buttons: Optional[List[Dict]] = None,
+    example_body_vars: Optional[List[str]] = None,
+) -> dict:
+    """Submit a new template to Meta for approval. Meta validates format
+    instantly and returns status=PENDING (or REJECTED) with details."""
+    if not waba_id or not token:
+        return {"error": "WABA id o token faltante"}
+
+    components: List[Dict] = []
+    # Header: text OR image
+    if header_text:
+        components.append({"type": "HEADER", "format": "TEXT", "text": header_text})
+    elif header_image_url:
+        components.append({
+            "type": "HEADER",
+            "format": "IMAGE",
+            "example": {"header_handle": [header_image_url]},
+        })
+    # Body (required)
+    body_comp: Dict = {"type": "BODY", "text": body_text}
+    if example_body_vars:
+        body_comp["example"] = {"body_text": [example_body_vars]}
+    components.append(body_comp)
+    # Footer
+    if footer_text:
+        components.append({"type": "FOOTER", "text": footer_text})
+    # Buttons
+    if buttons:
+        components.append({"type": "BUTTONS", "buttons": buttons})
+
+    payload = {
+        "name": name,
+        "category": category,  # MARKETING / UTILITY / AUTHENTICATION
+        "language": language,
+        "components": components,
+    }
+    url = f"{WA_GRAPH_URL}/{waba_id}/message_templates"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            resp = await c.post(url, json=payload, headers=headers)
+            out = resp.json()
+            out["_http_status"] = resp.status_code
+            return out
+    except Exception as e:
+        logger.error(f"WA create template error: {e}")
+        return {"error": str(e)}
+
+
+async def wa_delete_template(waba_id: str, token: str, template_name: str) -> dict:
+    """Delete a template by name."""
+    url = f"{WA_GRAPH_URL}/{waba_id}/message_templates"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            resp = await c.delete(url, headers=headers, params={"name": template_name})
+            return resp.json()
+    except Exception as e:
+        logger.error(f"WA delete template error: {e}")
+        return {"error": str(e)}
+
+
+async def wa_send_template(
+    phone: str,
+    template_name: str,
+    language: str = "es_AR",
+    variables: Optional[List[str]] = None,
+    header_image_url: Optional[str] = None,
+    token: Optional[str] = None,
+    phone_id: Optional[str] = None,
+) -> dict:
+    """Send a WhatsApp template message via Cloud API.
+
+    `variables` populates the body BODY parameters in order ({{1}}, {{2}}, ...).
+    `header_image_url` is set when the template has an IMAGE header.
+    Returns Meta's response (with messages[0].id on success) or {error}.
+    """
+    if not token or not phone_id:
+        return {"error": "WhatsApp no configurado"}
+    url = f"{WA_GRAPH_URL}/{phone_id}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    components: List[Dict] = []
+    if header_image_url:
+        components.append({
+            "type": "header",
+            "parameters": [{"type": "image", "image": {"link": header_image_url}}],
+        })
+    if variables:
+        components.append({
+            "type": "body",
+            "parameters": [{"type": "text", "text": str(v)} for v in variables],
+        })
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": language},
+        },
+    }
+    if components:
+        payload["template"]["components"] = components
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            resp = await c.post(url, json=payload, headers=headers)
+            return resp.json()
+    except Exception as e:
+        logger.error(f"WA send template error: {e}")
+        return {"error": str(e)}
+
+
+# ─── Opt-out keyword detection ────────────────────────────────────
+# When a contact replies with any of these (case-insensitive, whole-message
+# match after normalization), they are auto-added to broadcast_optouts and
+# never receive another broadcast on that line.
+OPTOUT_KEYWORDS = {
+    "baja", "stop", "no", "cancelar", "bajar",
+    "no quiero mas", "no quiero más", "remover", "unsubscribe",
+}
+
+def is_optout_message(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip().lower()
+    if not t:
+        return False
+    # Strip trailing punctuation/spaces
+    t = re.sub(r"[!?.\s]+$", "", t)
+    return t in OPTOUT_KEYWORDS
+
+
 def _pick_welcome_variation(raw_msg: str) -> str:
     """Return a humanized variant of a welcome message.
 
@@ -3493,6 +3663,7 @@ class CRMLineCreate(BaseModel):
     # WhatsApp Business API Config
     whatsapp_token: Optional[str] = ""
     phone_number_id: Optional[str] = ""
+    whatsapp_business_account_id: Optional[str] = ""  # WABA id — required for fetching templates
     verify_token: Optional[str] = ""
     # Meta Pixel Config
     meta_access_token: Optional[str] = ""
@@ -3506,6 +3677,7 @@ class CRMLineUpdate(BaseModel):
     whatsapp_number: Optional[str] = None
     whatsapp_token: Optional[str] = None
     phone_number_id: Optional[str] = None
+    whatsapp_business_account_id: Optional[str] = None
     verify_token: Optional[str] = None
     meta_access_token: Optional[str] = None
     meta_pixel_id: Optional[str] = None
@@ -4366,6 +4538,36 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                 metadata = value.get("metadata", {})
                 display_phone = metadata.get("display_phone_number", "")
                 phone_number_id = metadata.get("phone_number_id", "")
+
+                # ── Broadcast message status updates (sent/delivered/read/failed) ──
+                # Meta sends `statuses` events with the wa_message_id we stored when
+                # the template went out. We update both broadcast_messages AND the
+                # parent campaign's stats counters.
+                statuses = value.get("statuses", [])
+                for st in statuses:
+                    wa_id = st.get("id")
+                    new_status = st.get("status")  # sent, delivered, read, failed
+                    if not wa_id or not new_status:
+                        continue
+                    bm = await db.broadcast_messages.find_one(
+                        {"wa_message_id": wa_id}, {"_id": 0, "campaign_id": 1, "status": 1}
+                    )
+                    if not bm:
+                        continue
+                    prev_status = bm.get("status")
+                    rank = {"failed": -1, "sent": 0, "delivered": 1, "read": 2}
+                    if rank.get(new_status, -2) <= rank.get(prev_status, -2):
+                        continue  # don't downgrade
+                    set_fields = {"status": new_status, f"{new_status}_at": datetime.now(timezone.utc).isoformat()}
+                    await db.broadcast_messages.update_one(
+                        {"wa_message_id": wa_id}, {"$set": set_fields}
+                    )
+                    # Update campaign counters: +1 to new, but only first transition counts
+                    if new_status in ("delivered", "read", "failed"):
+                        await db.broadcast_campaigns.update_one(
+                            {"id": bm["campaign_id"]},
+                            {"$inc": {f"stats.{new_status}": 1}}
+                        )
                 
                 contact_map = {}
                 for ct in contacts:
@@ -4408,6 +4610,59 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                         text = f"[Documento: {doc_filename}]"
                     else:
                         text = f"[{msg_type}]"
+
+                    # ── Auto opt-out detection ──────────────────────────
+                    # If the user replied with STOP/BAJA/etc., add them to
+                    # the line's broadcast_optouts so future broadcasts
+                    # exclude them. Only acts on text-like messages.
+                    if msg_type in ("text", "button", "interactive") and is_optout_message(text):
+                        try:
+                            phone_norm = _norm_e164(from_phone)
+                            if phone_norm:
+                                await db.broadcast_optouts.update_one(
+                                    {"line_id": line_id, "phone": phone_norm},
+                                    {"$setOnInsert": {
+                                        "id": str(uuid.uuid4()),
+                                        "line_id": line_id,
+                                        "phone": phone_norm,
+                                        "reason": f"auto: '{text.strip()[:50]}'",
+                                        "added_by": "auto",
+                                        "created_at": datetime.now(timezone.utc).isoformat(),
+                                    }},
+                                    upsert=True,
+                                )
+                                logger.info(f"Optout auto-added: line={line_id} phone={phone_norm} text='{text.strip()[:30]}'")
+                        except Exception as _e:
+                            logger.debug(f"optout auto-add failed: {_e}")
+
+                    # ── Track replies to broadcast campaigns ────────────
+                    # Mark the most recent broadcast_messages for this phone+line as
+                    # 'replied' so the campaign stats counter goes up exactly once.
+                    try:
+                        phone_norm_r = _norm_e164(from_phone)
+                        if phone_norm_r:
+                            recent_bm = await db.broadcast_messages.find_one(
+                                {
+                                    "line_id": line_id,
+                                    "phone": phone_norm_r,
+                                    "replied_at": {"$exists": False},
+                                    "status": {"$in": ["sent", "delivered", "read"]},
+                                },
+                                {"_id": 0, "id": 1, "campaign_id": 1},
+                                sort=[("created_at", -1)],
+                            )
+                            if recent_bm:
+                                await db.broadcast_messages.update_one(
+                                    {"id": recent_bm["id"]},
+                                    {"$set": {"replied_at": datetime.now(timezone.utc).isoformat()}}
+                                )
+                                await db.broadcast_campaigns.update_one(
+                                    {"id": recent_bm["campaign_id"]},
+                                    {"$inc": {"stats.replied": 1}}
+                                )
+                    except Exception as _e:
+                        logger.debug(f"broadcast reply tracking failed: {_e}")
+
 
                     sender_name = contact_map.get(from_phone, "")
                     now = datetime.now(timezone.utc).isoformat()
@@ -6924,6 +7179,1159 @@ class BroadcastCreate(BaseModel):
 
 _broadcast_workers: Dict[str, "asyncio.Task"] = {}
 
+# ════════════════════════════════════════════════════════════════════
+# CSV BROADCASTS — import audiences, fetch templates, manage opt-outs
+# ════════════════════════════════════════════════════════════════════
+# Phase 1 of the mass-broadcast feature: cajeros can upload a CSV with
+# their own contact list (phone, name, optional vars), select an APPROVED
+# Meta template, and send a staggered campaign. All endpoints are scoped
+# to the cajero's `line_ids` (admins see everything).
+
+class BroadcastAudienceCreate(BaseModel):
+    line_id: str
+    name: str  # display name for the audience
+
+class BroadcastOptoutCreate(BaseModel):
+    line_id: str
+    phone: str
+    reason: Optional[str] = "manual"
+
+
+def _norm_e164(raw: str) -> Optional[str]:
+    """Normalize a phone number to E.164-ish digits-only string.
+    Returns the digits (with country code), or None if invalid.
+    Allows 8-15 digits (E.164 max length 15 incl. country code)."""
+    if not raw:
+        return None
+    digits = "".join(ch for ch in str(raw) if ch.isdigit())
+    if len(digits) < 8 or len(digits) > 15:
+        return None
+    return digits
+
+
+def _user_can_use_line(user: dict, line_id: str) -> bool:
+    if user.get("role") == "admin":
+        return True
+    return line_id in (user.get("line_ids") or [])
+
+
+@api_router.get("/broadcasts/templates")
+async def broadcasts_list_templates(
+    line_id: str,
+    include_all: bool = False,
+    current_user=Depends(get_current_user),
+):
+    """List templates for a line's WABA.
+    By default only APPROVED ones; pass include_all=true to also see PENDING/REJECTED.
+    """
+    if not _user_can_use_line(current_user, line_id):
+        raise HTTPException(status_code=403, detail="Sin acceso a esta línea")
+    line = await db.crm_lines.find_one({"id": line_id}, {"_id": 0})
+    if not line:
+        raise HTTPException(status_code=404, detail="Línea no encontrada")
+
+    waba_id = line.get("whatsapp_business_account_id")
+    token = line.get("whatsapp_token") or WHATSAPP_TOKEN
+    if not waba_id:
+        raise HTTPException(status_code=400, detail="La línea no tiene WhatsApp Business Account ID configurado. Editá la línea y agregá el WABA ID.")
+    if not token:
+        raise HTTPException(status_code=400, detail="La línea no tiene WhatsApp token configurado.")
+
+    status_filter = None if include_all else "APPROVED"
+    result = await wa_fetch_templates(waba_id, token, status_filter=status_filter)
+    if "error" in result:
+        return {"templates": [], "error": result["error"]}
+
+    templates = []
+    for tpl in result.get("data", []):
+        body_text = ""
+        var_count = 0
+        header_format = None
+        for comp in tpl.get("components", []):
+            if comp.get("type") == "BODY":
+                body_text = comp.get("text", "") or ""
+                var_count = len(re.findall(r"\{\{(\d+)\}\}", body_text))
+            elif comp.get("type") == "HEADER":
+                header_format = comp.get("format")
+        templates.append({
+            "name": tpl.get("name"),
+            "language": tpl.get("language"),
+            "category": tpl.get("category"),
+            "status": tpl.get("status"),
+            "rejected_reason": tpl.get("rejected_reason"),
+            "quality_score": tpl.get("quality_score"),
+            "body_text": body_text,
+            "var_count": var_count,
+            "header_format": header_format,
+        })
+
+    line_name_lower = (line.get("name") or "").strip().lower().split()[0] if line.get("name") else ""
+    if line_name_lower:
+        templates.sort(key=lambda t: (0 if t["name"].lower().startswith(line_name_lower) else 1, t["name"]))
+    else:
+        templates.sort(key=lambda t: t["name"])
+
+    return {"templates": templates, "line_id": line_id, "line_name": line.get("name")}
+
+
+class BroadcastTemplateCreate(BaseModel):
+    line_id: str
+    name: str  # snake_case, lowercase, numbers + _
+    category: str = "MARKETING"  # MARKETING | UTILITY | AUTHENTICATION
+    language: str = "es_AR"
+    body_text: str
+    header_text: Optional[str] = None
+    header_image_url: Optional[str] = None
+    footer_text: Optional[str] = None
+    buttons: Optional[List[Dict]] = None
+    example_body_vars: Optional[List[str]] = None
+
+
+@api_router.post("/broadcasts/templates/create")
+async def broadcasts_create_template(
+    payload: BroadcastTemplateCreate,
+    current_user=Depends(get_current_user),
+):
+    """Submit a new template to Meta for approval."""
+    if not _user_can_use_line(current_user, payload.line_id):
+        raise HTTPException(status_code=403, detail="Sin acceso a esta línea")
+    line = await db.crm_lines.find_one({"id": payload.line_id}, {"_id": 0})
+    if not line:
+        raise HTTPException(status_code=404, detail="Línea no encontrada")
+    waba_id = line.get("whatsapp_business_account_id")
+    token = line.get("whatsapp_token") or WHATSAPP_TOKEN
+    if not waba_id or not token:
+        raise HTTPException(status_code=400, detail="La línea no tiene WABA id o token de WhatsApp configurados.")
+
+    # Validate template name format (Meta requirement: lowercase snake_case)
+    if not re.fullmatch(r"[a-z0-9_]+", payload.name):
+        raise HTTPException(status_code=400, detail="El nombre debe ser minúsculas, números y guión bajo (snake_case)")
+    if len(payload.name) > 512:
+        raise HTTPException(status_code=400, detail="El nombre es demasiado largo")
+    if payload.category not in ("MARKETING", "UTILITY", "AUTHENTICATION"):
+        raise HTTPException(status_code=400, detail="Categoría inválida")
+
+    # Count variables in body and ensure example vars matches
+    vars_in_body = len(re.findall(r"\{\{\d+\}\}", payload.body_text))
+    if vars_in_body and not payload.example_body_vars:
+        raise HTTPException(status_code=400, detail=f"La plantilla usa {vars_in_body} variables — agregá ejemplos de valores para cada una (Meta los exige).")
+    if payload.example_body_vars and len(payload.example_body_vars) != vars_in_body:
+        raise HTTPException(status_code=400, detail=f"Cantidad de ejemplos ({len(payload.example_body_vars)}) no coincide con las variables del body ({vars_in_body}).")
+
+    result = await wa_create_template(
+        waba_id=waba_id,
+        token=token,
+        name=payload.name,
+        category=payload.category,
+        language=payload.language,
+        body_text=payload.body_text,
+        header_text=payload.header_text,
+        header_image_url=payload.header_image_url,
+        footer_text=payload.footer_text,
+        buttons=payload.buttons,
+        example_body_vars=payload.example_body_vars,
+    )
+
+    # Meta returns {id, status, category} on success, or {error: {...}} on failure
+    if result.get("error"):
+        err = result["error"]
+        msg = err.get("error_user_msg") or err.get("message") or str(err)
+        raise HTTPException(status_code=400, detail=f"Meta rechazó la plantilla: {msg}")
+    if result.get("_http_status", 200) >= 400:
+        raise HTTPException(status_code=400, detail=f"Meta devolvió error HTTP {result.get('_http_status')}: {str(result)[:300]}")
+
+    return {
+        "ok": True,
+        "id": result.get("id"),
+        "status": result.get("status"),
+        "category": result.get("category"),
+        "note": "Enviada a Meta. Llega aprobación en 1-24hs. Si llega REJECTED, vas a ver la razón en la lista de plantillas.",
+    }
+
+
+@api_router.delete("/broadcasts/templates")
+async def broadcasts_delete_template(
+    line_id: str,
+    name: str,
+    current_user=Depends(get_current_user),
+):
+    if not _user_can_use_line(current_user, line_id):
+        raise HTTPException(status_code=403, detail="Sin acceso a esta línea")
+    line = await db.crm_lines.find_one({"id": line_id}, {"_id": 0})
+    if not line:
+        raise HTTPException(status_code=404, detail="Línea no encontrada")
+    waba_id = line.get("whatsapp_business_account_id")
+    token = line.get("whatsapp_token") or WHATSAPP_TOKEN
+    if not waba_id or not token:
+        raise HTTPException(status_code=400, detail="Línea sin WABA id/token")
+    result = await wa_delete_template(waba_id, token, name)
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=str(result["error"]))
+    return {"ok": True, "result": result}
+
+
+@api_router.post("/broadcasts/audiences/upload")
+async def broadcasts_upload_audience(
+    file: UploadFile = File(...),
+    line_id: str = Form(...),
+    name: str = Form(...),
+    current_user=Depends(get_current_user),
+):
+    """Upload a CSV audience for a line.
+
+    CSV must have a `phone` column (or `telefono`/`teléfono`/`tel`); optional
+    `name` and `var1..var5` columns are used to populate template variables.
+    Validates E.164, deduplicates by (line_id, phone), excludes anything
+    already in the optout blacklist for that line.
+    """
+    if not _user_can_use_line(current_user, line_id):
+        raise HTTPException(status_code=403, detail="Sin acceso a esta línea")
+    line = await db.crm_lines.find_one({"id": line_id}, {"_id": 0})
+    if not line:
+        raise HTTPException(status_code=404, detail="Línea no encontrada")
+
+    raw = await file.read()
+    if len(raw) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="CSV demasiado grande (máx 5MB)")
+
+    import csv as _csv
+    import io as _io
+    # Try utf-8 first, fall back to latin-1 (common Excel export)
+    text = None
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise HTTPException(status_code=400, detail="No se pudo decodificar el CSV")
+
+    # Sniff delimiter (,, ;, or \t)
+    sample = text[:2048]
+    try:
+        dialect = _csv.Sniffer().sniff(sample, delimiters=",;\t|")
+    except _csv.Error:
+        class _D: delimiter = ","
+        dialect = _D()
+
+    reader = _csv.DictReader(_io.StringIO(text), dialect=dialect)
+    fieldnames = [(h or "").strip().lower() for h in (reader.fieldnames or [])]
+    if not fieldnames:
+        raise HTTPException(status_code=400, detail="CSV vacío o sin encabezados")
+
+    # Map phone column synonyms
+    phone_col = None
+    for cand in ("phone", "telefono", "teléfono", "tel", "celular", "movil", "móvil", "whatsapp"):
+        if cand in fieldnames:
+            phone_col = cand
+            break
+    if not phone_col:
+        raise HTTPException(status_code=400, detail="El CSV debe tener una columna 'phone' (o telefono/tel/celular)")
+
+    name_col = "name" if "name" in fieldnames else ("nombre" if "nombre" in fieldnames else None)
+    var_cols = [c for c in fieldnames if re.fullmatch(r"var\d+", c)]
+    var_cols.sort(key=lambda c: int(c[3:]))
+
+    # Pre-load optout blacklist for this line
+    optouts = await db.broadcast_optouts.find(
+        {"line_id": line_id}, {"_id": 0, "phone": 1}
+    ).to_list(100000)
+    optout_phones = {o["phone"] for o in optouts}
+
+    audience_id = str(uuid.uuid4())
+    contacts: List[Dict] = []
+    seen_phones: set = set()
+    invalid_count = 0
+    duplicate_count = 0
+    optout_count = 0
+    total_rows = 0
+
+    for row in reader:
+        total_rows += 1
+        if total_rows > 100_000:
+            break
+        # Build a normalized lowercase-key version of the row
+        nrow = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+        phone_norm = _norm_e164(nrow.get(phone_col, ""))
+        if not phone_norm:
+            invalid_count += 1
+            continue
+        if phone_norm in seen_phones:
+            duplicate_count += 1
+            continue
+        if phone_norm in optout_phones:
+            optout_count += 1
+            continue
+        seen_phones.add(phone_norm)
+        contacts.append({
+            "id": str(uuid.uuid4()),
+            "audience_id": audience_id,
+            "line_id": line_id,
+            "phone": phone_norm,
+            "name": (nrow.get(name_col, "").strip() if name_col else "") or "",
+            "vars": {f"var{i+1}": nrow.get(c, "") for i, c in enumerate(var_cols) if nrow.get(c)},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    if not contacts:
+        raise HTTPException(status_code=400, detail=f"Ningún contacto válido en el CSV (filas: {total_rows}, inválidos: {invalid_count}, duplicados: {duplicate_count}, optouts: {optout_count})")
+
+    audience_doc = {
+        "id": audience_id,
+        "line_id": line_id,
+        "line_name": line.get("name"),
+        "name": name,
+        "filename": file.filename,
+        "total_contacts": len(contacts),
+        "stats": {
+            "total_rows": total_rows,
+            "valid": len(contacts),
+            "invalid": invalid_count,
+            "duplicates": duplicate_count,
+            "excluded_optouts": optout_count,
+            "var_columns": var_cols,
+            "name_column": name_col,
+        },
+        "created_by": current_user.get("id"),
+        "created_by_email": current_user.get("email"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.broadcast_audiences.insert_one(audience_doc)
+    # Insert contacts in batches of 1000
+    for i in range(0, len(contacts), 1000):
+        await db.broadcast_contacts.insert_many(contacts[i:i + 1000])
+
+    audience_doc.pop("_id", None)
+    return {"audience": audience_doc}
+
+
+@api_router.get("/broadcasts/audiences")
+async def broadcasts_list_audiences(
+    line_id: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    """List audiences. Cajeros see audiences for their own lines; admins see all."""
+    query: Dict = {}
+    if current_user.get("role") != "admin":
+        allowed = current_user.get("line_ids") or []
+        if not allowed:
+            return {"audiences": []}
+        query["line_id"] = {"$in": allowed}
+    if line_id:
+        if not _user_can_use_line(current_user, line_id):
+            raise HTTPException(status_code=403, detail="Sin acceso a esta línea")
+        query["line_id"] = line_id
+    items = await db.broadcast_audiences.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return {"audiences": items}
+
+
+@api_router.get("/broadcasts/audiences/{audience_id}")
+async def broadcasts_get_audience(audience_id: str, current_user=Depends(get_current_user)):
+    aud = await db.broadcast_audiences.find_one({"id": audience_id}, {"_id": 0})
+    if not aud:
+        raise HTTPException(status_code=404, detail="Audiencia no encontrada")
+    if not _user_can_use_line(current_user, aud["line_id"]):
+        raise HTTPException(status_code=403, detail="Sin acceso a esta audiencia")
+    sample = await db.broadcast_contacts.find(
+        {"audience_id": audience_id}, {"_id": 0}
+    ).limit(20).to_list(20)
+    return {"audience": aud, "sample": sample}
+
+
+@api_router.delete("/broadcasts/audiences/{audience_id}")
+async def broadcasts_delete_audience(audience_id: str, current_user=Depends(get_current_user)):
+    aud = await db.broadcast_audiences.find_one({"id": audience_id}, {"_id": 0})
+    if not aud:
+        raise HTTPException(status_code=404, detail="Audiencia no encontrada")
+    if not _user_can_use_line(current_user, aud["line_id"]):
+        raise HTTPException(status_code=403, detail="Sin acceso a esta audiencia")
+    await db.broadcast_audiences.delete_one({"id": audience_id})
+    await db.broadcast_contacts.delete_many({"audience_id": audience_id})
+    return {"deleted": True}
+
+
+@api_router.get("/broadcasts/optouts")
+async def broadcasts_list_optouts(
+    line_id: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    query: Dict = {}
+    if current_user.get("role") != "admin":
+        allowed = current_user.get("line_ids") or []
+        if not allowed:
+            return {"optouts": []}
+        query["line_id"] = {"$in": allowed}
+    if line_id:
+        if not _user_can_use_line(current_user, line_id):
+            raise HTTPException(status_code=403, detail="Sin acceso a esta línea")
+        query["line_id"] = line_id
+    items = await db.broadcast_optouts.find(query, {"_id": 0}).sort("created_at", -1).limit(2000).to_list(2000)
+    return {"optouts": items}
+
+
+@api_router.post("/broadcasts/optouts")
+async def broadcasts_add_optout(payload: BroadcastOptoutCreate, current_user=Depends(get_current_user)):
+    if not _user_can_use_line(current_user, payload.line_id):
+        raise HTTPException(status_code=403, detail="Sin acceso a esta línea")
+    phone = _norm_e164(payload.phone)
+    if not phone:
+        raise HTTPException(status_code=400, detail="Teléfono inválido")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "line_id": payload.line_id,
+        "phone": phone,
+        "reason": payload.reason or "manual",
+        "added_by": current_user.get("id"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # Upsert by (line_id, phone)
+    await db.broadcast_optouts.update_one(
+        {"line_id": payload.line_id, "phone": phone},
+        {"$setOnInsert": doc},
+        upsert=True,
+    )
+    return {"ok": True, "phone": phone}
+
+
+@api_router.delete("/broadcasts/optouts/{optout_id}")
+async def broadcasts_delete_optout(optout_id: str, current_user=Depends(get_current_user)):
+    o = await db.broadcast_optouts.find_one({"id": optout_id}, {"_id": 0})
+    if not o:
+        raise HTTPException(status_code=404, detail="Optout no encontrado")
+    if not _user_can_use_line(current_user, o["line_id"]):
+        raise HTTPException(status_code=403, detail="Sin acceso")
+    await db.broadcast_optouts.delete_one({"id": optout_id})
+    return {"deleted": True}
+
+
+# ════════════════════════════════════════════════════════════════════
+# CSV BROADCASTS — campaigns engine (Phase 2)
+# ════════════════════════════════════════════════════════════════════
+# Segment query → list of contacts from CRM leads.
+# Speed is FIXED to "cauta": 30-90s random delay between sends.
+# Hours: only 09:00-23:00 ART. Outside that window the worker sleeps.
+#
+# Why fixed: cliente lo pidió explícitamente — "prefiero que sea fijo
+# porque después el cajero voltea la línea por spam y va a decir que
+# no lo hizo".
+
+CAUTA_MIN_DELAY_S = 30
+CAUTA_MAX_DELAY_S = 90
+NIGHT_PAUSE_FROM_HOUR = 23  # ART
+NIGHT_PAUSE_TO_HOUR   = 9   # ART
+ART_TZ = timezone(timedelta(hours=-3))  # Argentina UTC-3 (no DST)
+
+
+def _is_night_pause_now() -> bool:
+    """True if current ART time is in the night-pause window [23:00, 09:00)."""
+    now_art = datetime.now(ART_TZ)
+    h = now_art.hour
+    return h >= NIGHT_PAUSE_FROM_HOUR or h < NIGHT_PAUSE_TO_HOUR
+
+
+def _seconds_until_morning() -> int:
+    """Seconds until next 09:00 ART (when night-pause ends)."""
+    now_art = datetime.now(ART_TZ)
+    target = now_art.replace(hour=NIGHT_PAUSE_TO_HOUR, minute=0, second=0, microsecond=0)
+    if now_art >= target:
+        target = target + timedelta(days=1)
+    return max(60, int((target - now_art).total_seconds()))
+
+
+class BroadcastSegmentQuery(BaseModel):
+    line_id: str
+    statuses: Optional[List[str]] = None        # ["valido", "nuevo", ...]
+    purchase_in_last_days: Optional[int] = None # leads with status=valido in last N days
+    response_in_last_days: Optional[int] = None # leads who replied in last N days
+    not_responded_in_last_days: Optional[int] = None  # opposite
+    limit: int = 5000
+
+
+async def _resolve_segment(query: BroadcastSegmentQuery) -> List[Dict]:
+    """Resolve a segment query into a list of {phone, name, line_id, vars}.
+    Excludes contacts already in optouts."""
+    base: Dict = {"line_id": query.line_id, "phone": {"$exists": True, "$ne": ""}}
+    if query.statuses:
+        base["status"] = {"$in": query.statuses}
+
+    now = datetime.now(timezone.utc)
+    if query.purchase_in_last_days:
+        from_dt = (now - timedelta(days=query.purchase_in_last_days)).isoformat()
+        base["status"] = "valido"
+        base["status_changed_at"] = {"$gte": from_dt}
+    if query.response_in_last_days:
+        from_dt = (now - timedelta(days=query.response_in_last_days)).isoformat()
+        base["last_message_at"] = {"$gte": from_dt}
+    if query.not_responded_in_last_days:
+        from_dt = (now - timedelta(days=query.not_responded_in_last_days)).isoformat()
+        base["last_message_at"] = {"$lt": from_dt}
+
+    leads = await db.crm_leads.find(
+        base, {"_id": 0, "phone": 1, "name": 1, "line_id": 1}
+    ).limit(query.limit).to_list(query.limit)
+
+    # Drop optouts
+    optouts = await db.broadcast_optouts.find(
+        {"line_id": query.line_id}, {"_id": 0, "phone": 1}
+    ).to_list(100000)
+    optout_phones = {o["phone"] for o in optouts}
+
+    # Normalize + dedupe by phone
+    seen = set()
+    out: List[Dict] = []
+    for lead in leads:
+        ph = _norm_e164(lead.get("phone"))
+        if not ph or ph in seen or ph in optout_phones:
+            continue
+        seen.add(ph)
+        out.append({
+            "phone": ph,
+            "name": lead.get("name") or "",
+            "line_id": query.line_id,
+            "vars": {},
+        })
+    return out
+
+
+@api_router.post("/broadcasts/segments/preview")
+async def broadcasts_segment_preview(
+    query: BroadcastSegmentQuery,
+    current_user=Depends(get_current_user),
+):
+    """Count and sample (max 10) contacts matching a segment query."""
+    if not _user_can_use_line(current_user, query.line_id):
+        raise HTTPException(status_code=403, detail="Sin acceso a esta línea")
+    contacts = await _resolve_segment(query)
+    return {"total": len(contacts), "sample": contacts[:10]}
+
+
+class BroadcastCampaignCreate(BaseModel):
+    line_id: str
+    name: str
+    # Source — exactly ONE of these:
+    audience_id: Optional[str] = None
+    segment: Optional[BroadcastSegmentQuery] = None
+    # Template
+    template_name: str
+    template_language: str = "es_AR"
+    # Mapping: variables[i] is the column name in audience contact's `vars`
+    # (e.g. ["name", "var1"] => template {{1}}=name, {{2}}=var1).
+    # The literal string "name" maps to contact.name.
+    template_var_mapping: List[str] = []
+    header_image_url: Optional[str] = None
+    # Schedule (optional)
+    scheduled_at: Optional[str] = None  # ISO datetime UTC
+    # Auto-resend (optional)
+    resend_after_hours: Optional[int] = None
+    resend_template_name: Optional[str] = None
+
+
+@api_router.post("/broadcasts/campaigns")
+async def broadcasts_create_campaign(
+    payload: BroadcastCampaignCreate,
+    current_user=Depends(get_current_user),
+):
+    """Create a campaign (status=draft, or scheduled if scheduled_at given)."""
+    if not _user_can_use_line(current_user, payload.line_id):
+        raise HTTPException(status_code=403, detail="Sin acceso a esta línea")
+    line = await db.crm_lines.find_one({"id": payload.line_id}, {"_id": 0})
+    if not line:
+        raise HTTPException(status_code=404, detail="Línea no encontrada")
+    if not (payload.audience_id or payload.segment):
+        raise HTTPException(status_code=400, detail="Debe especificar audience_id o segment")
+    if payload.audience_id and payload.segment:
+        raise HTTPException(status_code=400, detail="Solo audience_id O segment, no ambos")
+
+    # Resolve target count
+    if payload.audience_id:
+        aud = await db.broadcast_audiences.find_one({"id": payload.audience_id}, {"_id": 0})
+        if not aud:
+            raise HTTPException(status_code=404, detail="Audiencia no encontrada")
+        if aud["line_id"] != payload.line_id:
+            raise HTTPException(status_code=400, detail="La audiencia pertenece a otra línea")
+        target_count = aud.get("total_contacts", 0)
+    else:
+        if payload.segment.line_id != payload.line_id:
+            raise HTTPException(status_code=400, detail="El segmento debe ser de la misma línea")
+        contacts = await _resolve_segment(payload.segment)
+        target_count = len(contacts)
+
+    if target_count == 0:
+        raise HTTPException(status_code=400, detail="Sin contactos para esta campaña (audiencia/segmento vacío)")
+
+    status = "scheduled" if payload.scheduled_at else "draft"
+    campaign = {
+        "id": str(uuid.uuid4()),
+        "line_id": payload.line_id,
+        "line_name": line.get("name"),
+        "name": payload.name,
+        "audience_id": payload.audience_id,
+        "segment": payload.segment.dict() if payload.segment else None,
+        "template_name": payload.template_name,
+        "template_language": payload.template_language,
+        "template_var_mapping": payload.template_var_mapping or [],
+        "header_image_url": payload.header_image_url,
+        "scheduled_at": payload.scheduled_at,
+        "resend_after_hours": payload.resend_after_hours,
+        "resend_template_name": payload.resend_template_name,
+        "status": status,
+        "target_count": target_count,
+        "stats": {"sent": 0, "delivered": 0, "read": 0, "failed": 0, "replied": 0, "skipped_optout": 0},
+        "created_by": current_user.get("id"),
+        "created_by_email": current_user.get("email"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": None,
+        "completed_at": None,
+        "paused_reason": None,
+    }
+    await db.broadcast_campaigns.insert_one(campaign)
+    campaign.pop("_id", None)
+
+    if status == "scheduled":
+        # Spawn a sleeper task that wakes at scheduled_at and starts the worker
+        asyncio.create_task(_csv_campaign_scheduler(campaign["id"]))
+
+    return {"campaign": campaign}
+
+
+@api_router.get("/broadcasts/campaigns")
+async def broadcasts_list_campaigns(
+    line_id: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    query: Dict = {}
+    if current_user.get("role") != "admin":
+        allowed = current_user.get("line_ids") or []
+        if not allowed:
+            return {"campaigns": []}
+        query["line_id"] = {"$in": allowed}
+    if line_id:
+        if not _user_can_use_line(current_user, line_id):
+            raise HTTPException(status_code=403, detail="Sin acceso a esta línea")
+        query["line_id"] = line_id
+    items = await db.broadcast_campaigns.find(query, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
+    return {"campaigns": items}
+
+
+@api_router.get("/broadcasts/campaigns/{campaign_id}")
+async def broadcasts_get_campaign(campaign_id: str, current_user=Depends(get_current_user)):
+    c = await db.broadcast_campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Campaña no encontrada")
+    if not _user_can_use_line(current_user, c["line_id"]):
+        raise HTTPException(status_code=403, detail="Sin acceso")
+    # Recent messages for live tail
+    recent = await db.broadcast_messages.find(
+        {"campaign_id": campaign_id}, {"_id": 0}
+    ).sort("created_at", -1).limit(50).to_list(50)
+    return {"campaign": c, "recent_messages": recent}
+
+
+_csv_campaign_workers: Dict[str, "asyncio.Task"] = {}
+
+
+@api_router.post("/broadcasts/campaigns/{campaign_id}/start")
+async def broadcasts_start_campaign(campaign_id: str, current_user=Depends(get_current_user)):
+    c = await db.broadcast_campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Campaña no encontrada")
+    if not _user_can_use_line(current_user, c["line_id"]):
+        raise HTTPException(status_code=403, detail="Sin acceso")
+    if c["status"] in ("running", "completed", "cancelled"):
+        raise HTTPException(status_code=400, detail=f"La campaña está en estado {c['status']}")
+    await db.broadcast_campaigns.update_one(
+        {"id": campaign_id},
+        {"$set": {"status": "running", "started_at": datetime.now(timezone.utc).isoformat(), "paused_reason": None}}
+    )
+    if campaign_id in _csv_campaign_workers and not _csv_campaign_workers[campaign_id].done():
+        return {"started": True, "note": "ya estaba corriendo"}
+    task = asyncio.create_task(_csv_campaign_worker(campaign_id))
+    _csv_campaign_workers[campaign_id] = task
+    return {"started": True}
+
+
+@api_router.post("/broadcasts/campaigns/{campaign_id}/pause")
+async def broadcasts_pause_campaign(campaign_id: str, current_user=Depends(get_current_user)):
+    c = await db.broadcast_campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Campaña no encontrada")
+    if not _user_can_use_line(current_user, c["line_id"]):
+        raise HTTPException(status_code=403, detail="Sin acceso")
+    await db.broadcast_campaigns.update_one(
+        {"id": campaign_id},
+        {"$set": {"status": "paused", "paused_reason": "manual"}}
+    )
+    return {"paused": True}
+
+
+@api_router.post("/broadcasts/campaigns/{campaign_id}/cancel")
+async def broadcasts_cancel_campaign(campaign_id: str, current_user=Depends(get_current_user)):
+    c = await db.broadcast_campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Campaña no encontrada")
+    if not _user_can_use_line(current_user, c["line_id"]):
+        raise HTTPException(status_code=403, detail="Sin acceso")
+    await db.broadcast_campaigns.update_one(
+        {"id": campaign_id},
+        {"$set": {"status": "cancelled", "completed_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    return {"cancelled": True}
+
+
+async def _csv_campaign_scheduler(campaign_id: str):
+    """Sleep until scheduled_at, then start the campaign worker."""
+    try:
+        c = await db.broadcast_campaigns.find_one({"id": campaign_id}, {"_id": 0})
+        if not c or c.get("status") != "scheduled":
+            return
+        scheduled_at = c.get("scheduled_at")
+        if not scheduled_at:
+            return
+        target = datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        delay = (target - datetime.now(timezone.utc)).total_seconds()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        # Re-check status (may have been cancelled while sleeping)
+        c2 = await db.broadcast_campaigns.find_one({"id": campaign_id}, {"_id": 0, "status": 1})
+        if not c2 or c2.get("status") != "scheduled":
+            return
+        await db.broadcast_campaigns.update_one(
+            {"id": campaign_id},
+            {"$set": {"status": "running", "started_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        task = asyncio.create_task(_csv_campaign_worker(campaign_id))
+        _csv_campaign_workers[campaign_id] = task
+    except Exception as e:
+        logger.error(f"campaign scheduler {campaign_id} failed: {e}")
+
+
+async def _csv_campaign_worker(campaign_id: str):
+    """Send a CSV campaign — staggered template messages, night-pause aware."""
+    import random
+    try:
+        c = await db.broadcast_campaigns.find_one({"id": campaign_id}, {"_id": 0})
+        if not c:
+            return
+        line = await db.crm_lines.find_one({"id": c["line_id"]}, {"_id": 0})
+        if not line:
+            await db.broadcast_campaigns.update_one(
+                {"id": campaign_id},
+                {"$set": {"status": "failed", "paused_reason": "Línea no encontrada"}}
+            )
+            return
+        token = line.get("whatsapp_token") or WHATSAPP_TOKEN
+        phone_id = line.get("phone_number_id") or WHATSAPP_PHONE_NUMBER_ID
+        if not token or not phone_id:
+            await db.broadcast_campaigns.update_one(
+                {"id": campaign_id},
+                {"$set": {"status": "failed", "paused_reason": "WhatsApp no configurado en la línea"}}
+            )
+            return
+
+        # Resolve contacts
+        if c.get("audience_id"):
+            contacts = await db.broadcast_contacts.find(
+                {"audience_id": c["audience_id"]}, {"_id": 0}
+            ).to_list(100000)
+        else:
+            seg = BroadcastSegmentQuery(**c["segment"])
+            contacts = await _resolve_segment(seg)
+
+        # Refresh optouts at runtime
+        optouts = await db.broadcast_optouts.find(
+            {"line_id": c["line_id"]}, {"_id": 0, "phone": 1}
+        ).to_list(100000)
+        optout_phones = {o["phone"] for o in optouts}
+
+        # Skip already-sent (resume support)
+        already_sent = await db.broadcast_messages.find(
+            {"campaign_id": campaign_id, "status": {"$in": ["sent", "delivered", "read"]}},
+            {"_id": 0, "phone": 1},
+        ).to_list(100000)
+        already_phones = {m["phone"] for m in already_sent}
+
+        var_mapping = c.get("template_var_mapping") or []
+
+        for contact in contacts:
+            # Cancel/pause check
+            state = await db.broadcast_campaigns.find_one(
+                {"id": campaign_id}, {"_id": 0, "status": 1}
+            )
+            if not state or state.get("status") not in ("running",):
+                logger.info(f"campaign {campaign_id} stopped: status={state.get('status') if state else 'missing'}")
+                return
+
+            phone = contact.get("phone")
+            if not phone or phone in already_phones:
+                continue
+            if phone in optout_phones:
+                await db.broadcast_campaigns.update_one(
+                    {"id": campaign_id}, {"$inc": {"stats.skipped_optout": 1}}
+                )
+                continue
+
+            # Night pause check
+            while _is_night_pause_now():
+                await db.broadcast_campaigns.update_one(
+                    {"id": campaign_id},
+                    {"$set": {"paused_reason": "Pausa nocturna 23:00-09:00 ART"}}
+                )
+                logger.info(f"campaign {campaign_id} sleeping until morning")
+                await asyncio.sleep(min(_seconds_until_morning(), 300))
+                # Re-check status while sleeping
+                state = await db.broadcast_campaigns.find_one(
+                    {"id": campaign_id}, {"_id": 0, "status": 1}
+                )
+                if not state or state.get("status") not in ("running",):
+                    return
+            await db.broadcast_campaigns.update_one(
+                {"id": campaign_id}, {"$set": {"paused_reason": None}}
+            )
+
+            # Build template variables
+            tpl_vars: List[str] = []
+            for col in var_mapping:
+                if col == "name":
+                    tpl_vars.append((contact.get("name") or "").strip() or "amigo")
+                else:
+                    v = (contact.get("vars") or {}).get(col, "")
+                    tpl_vars.append(str(v) if v is not None else "")
+
+            msg_id = str(uuid.uuid4())
+            send_result = await wa_send_template(
+                phone=phone,
+                template_name=c["template_name"],
+                language=c.get("template_language") or "es_AR",
+                variables=tpl_vars or None,
+                header_image_url=c.get("header_image_url"),
+                token=token,
+                phone_id=phone_id,
+            )
+
+            wa_msg_id = None
+            err = None
+            success = False
+            if isinstance(send_result, dict):
+                if "error" in send_result:
+                    err = str(send_result.get("error"))[:300]
+                elif send_result.get("messages"):
+                    wa_msg_id = send_result["messages"][0].get("id")
+                    success = True
+                else:
+                    err = str(send_result)[:300]
+
+            doc = {
+                "id": msg_id,
+                "campaign_id": campaign_id,
+                "line_id": c["line_id"],
+                "phone": phone,
+                "name": contact.get("name", ""),
+                "template_name": c["template_name"],
+                "wa_message_id": wa_msg_id,
+                "status": "sent" if success else "failed",
+                "error": err,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            await db.broadcast_messages.insert_one(doc)
+            inc = {"stats.sent": 1} if success else {"stats.failed": 1}
+            await db.broadcast_campaigns.update_one({"id": campaign_id}, {"$inc": inc})
+
+            # Auto-pause on Meta rate-limit (#80007 / #131056) or auth error
+            if err and any(k in err for k in ("131056", "80007", "rate", "OAuthException")):
+                await db.broadcast_campaigns.update_one(
+                    {"id": campaign_id},
+                    {"$set": {"status": "paused", "paused_reason": f"Meta error: {err[:80]}"}}
+                )
+                logger.warning(f"campaign {campaign_id} auto-paused: {err[:120]}")
+                return
+
+            # Cauta delay
+            delay = random.uniform(CAUTA_MIN_DELAY_S, CAUTA_MAX_DELAY_S)
+            await asyncio.sleep(delay)
+
+        # Done with first pass
+        await db.broadcast_campaigns.update_one(
+            {"id": campaign_id},
+            {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc).isoformat(), "paused_reason": None}}
+        )
+        logger.info(f"campaign {campaign_id} completed")
+
+        # ── Auto-resend kickoff ─────────────────────────────────────
+        # If the campaign was configured with resend_after_hours +
+        # resend_template_name, queue a follow-up that runs after that
+        # delay and re-sends ONLY to contacts who never read/replied.
+        c_final = await db.broadcast_campaigns.find_one(
+            {"id": campaign_id},
+            {"_id": 0, "resend_after_hours": 1, "resend_template_name": 1, "resend_done_at": 1}
+        )
+        if (c_final
+            and c_final.get("resend_after_hours")
+            and c_final.get("resend_template_name")
+            and not c_final.get("resend_done_at")):
+            asyncio.create_task(_csv_campaign_resend(campaign_id))
+    except asyncio.CancelledError:
+        await db.broadcast_campaigns.update_one(
+            {"id": campaign_id}, {"$set": {"status": "cancelled"}}
+        )
+        raise
+    except Exception as e:
+        logger.exception(f"csv campaign worker {campaign_id} failed")
+        await db.broadcast_campaigns.update_one(
+            {"id": campaign_id},
+            {"$set": {"status": "failed", "paused_reason": f"worker error: {str(e)[:200]}"}}
+        )
+
+
+@app.on_event("startup")
+async def _resume_scheduled_campaigns():
+    """On boot, re-arm schedulers for any campaigns still in 'scheduled' state."""
+    try:
+        scheduled = await db.broadcast_campaigns.find(
+            {"status": "scheduled"}, {"_id": 0, "id": 1}
+        ).to_list(500)
+        for c in scheduled:
+            asyncio.create_task(_csv_campaign_scheduler(c["id"]))
+        if scheduled:
+            logger.info(f"Re-armed {len(scheduled)} scheduled campaigns")
+        # Also resume any running campaigns that were interrupted by a restart
+        running = await db.broadcast_campaigns.find(
+            {"status": "running"}, {"_id": 0, "id": 1}
+        ).to_list(500)
+        for c in running:
+            task = asyncio.create_task(_csv_campaign_worker(c["id"]))
+            _csv_campaign_workers[c["id"]] = task
+        if running:
+            logger.info(f"Resumed {len(running)} running campaigns")
+        # Re-arm pending resends — campaigns that completed with a configured
+        # resend but the resend task didn't finish (e.g. server restarted
+        # while sleeping). Look for completed/paused campaigns with the
+        # resend config set and `resend_done_at` not set.
+        pending_resends = await db.broadcast_campaigns.find(
+            {
+                "status": {"$in": ["completed", "paused"]},
+                "resend_after_hours": {"$gt": 0},
+                "resend_template_name": {"$exists": True, "$ne": None, "$ne": ""},
+                "resend_done_at": {"$exists": False},
+                "completed_at": {"$exists": True, "$ne": None},
+            },
+            {"_id": 0, "id": 1}
+        ).to_list(500)
+        for c in pending_resends:
+            asyncio.create_task(_csv_campaign_resend(c["id"]))
+        if pending_resends:
+            logger.info(f"Re-armed {len(pending_resends)} pending resends")
+    except Exception as e:
+        logger.error(f"campaign restart hook failed: {e}")
+
+
+async def _csv_campaign_resend(campaign_id: str):
+    """Auto-resend pass: after resend_after_hours, re-send to contacts who
+    never read/replied to the first message. Uses resend_template_name.
+    Same anti-spam rules as the first pass: cauta delay + night pause +
+    optout exclusion at runtime + auto-pause on Meta rate-limit.
+    """
+    import random
+    try:
+        c = await db.broadcast_campaigns.find_one({"id": campaign_id}, {"_id": 0})
+        if not c:
+            return
+        if c.get("resend_done_at"):
+            logger.info(f"resend {campaign_id} already done, skipping")
+            return
+        hours = c.get("resend_after_hours") or 0
+        tpl = c.get("resend_template_name")
+        if not hours or not tpl:
+            return
+
+        # Sleep until completed_at + hours
+        completed_at = c.get("completed_at")
+        if completed_at:
+            try:
+                base = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+                if base.tzinfo is None:
+                    base = base.replace(tzinfo=timezone.utc)
+                target = base + timedelta(hours=hours)
+                delay = (target - datetime.now(timezone.utc)).total_seconds()
+                if delay > 0:
+                    logger.info(f"resend {campaign_id} sleeping {int(delay)}s until {target.isoformat()}")
+                    await asyncio.sleep(delay)
+            except Exception as _e:
+                logger.debug(f"resend wakeup parse failed: {_e}")
+
+        # Re-check: campaign still completed and not cancelled?
+        c2 = await db.broadcast_campaigns.find_one({"id": campaign_id}, {"_id": 0})
+        if not c2 or c2.get("status") == "cancelled" or c2.get("resend_done_at"):
+            return
+
+        line = await db.crm_lines.find_one({"id": c["line_id"]}, {"_id": 0})
+        if not line:
+            return
+        token = line.get("whatsapp_token") or WHATSAPP_TOKEN
+        phone_id = line.get("phone_number_id") or WHATSAPP_PHONE_NUMBER_ID
+        if not token or not phone_id:
+            await db.broadcast_campaigns.update_one(
+                {"id": campaign_id},
+                {"$set": {"resend_done_at": datetime.now(timezone.utc).isoformat(),
+                          "resend_skipped_reason": "WhatsApp no configurado"}}
+            )
+            return
+
+        # Mark resend as running
+        await db.broadcast_campaigns.update_one(
+            {"id": campaign_id},
+            {"$set": {"resend_started_at": datetime.now(timezone.utc).isoformat(),
+                      "status": "running", "paused_reason": "Auto-resend en curso"}}
+        )
+
+        # Targets: messages of THIS campaign in status sent/delivered, NOT replied,
+        # and NOT already part of a previous resend (is_resend flag).
+        targets = await db.broadcast_messages.find(
+            {
+                "campaign_id": campaign_id,
+                "status": {"$in": ["sent", "delivered"]},
+                "replied_at": {"$exists": False},
+                "is_resend": {"$ne": True},
+            },
+            {"_id": 0, "phone": 1, "name": 1}
+        ).to_list(100000)
+
+        # Refresh optouts
+        optouts = await db.broadcast_optouts.find(
+            {"line_id": c["line_id"]}, {"_id": 0, "phone": 1}
+        ).to_list(100000)
+        optout_phones = {o["phone"] for o in optouts}
+
+        # Need vars for the resend template? We don't know the var count of
+        # the resend template here — keep it simple: re-use the same mapping
+        # as the original. If the resend template has fewer vars Meta will
+        # ignore extras, if it has more it'll fail (will be caught & logged).
+        var_mapping = c.get("template_var_mapping") or []
+
+        # Reload contacts for var values (audience or segment)
+        if c.get("audience_id"):
+            contacts_full = await db.broadcast_contacts.find(
+                {"audience_id": c["audience_id"]}, {"_id": 0}
+            ).to_list(100000)
+        else:
+            seg = BroadcastSegmentQuery(**c["segment"])
+            contacts_full = await _resolve_segment(seg)
+        contacts_by_phone = {ct["phone"]: ct for ct in contacts_full}
+
+        for t in targets:
+            # Cancel/pause check
+            state = await db.broadcast_campaigns.find_one(
+                {"id": campaign_id}, {"_id": 0, "status": 1}
+            )
+            if not state or state.get("status") not in ("running",):
+                logger.info(f"resend {campaign_id} stopped: status={state.get('status') if state else 'missing'}")
+                return
+
+            phone = t["phone"]
+            if phone in optout_phones:
+                await db.broadcast_campaigns.update_one(
+                    {"id": campaign_id}, {"$inc": {"stats.resend_skipped_optout": 1}}
+                )
+                continue
+
+            # Night pause check
+            while _is_night_pause_now():
+                await db.broadcast_campaigns.update_one(
+                    {"id": campaign_id},
+                    {"$set": {"paused_reason": "Auto-resend en pausa nocturna 23:00-09:00 ART"}}
+                )
+                await asyncio.sleep(min(_seconds_until_morning(), 300))
+                state = await db.broadcast_campaigns.find_one(
+                    {"id": campaign_id}, {"_id": 0, "status": 1}
+                )
+                if not state or state.get("status") not in ("running",):
+                    return
+            await db.broadcast_campaigns.update_one(
+                {"id": campaign_id}, {"$set": {"paused_reason": "Auto-resend en curso"}}
+            )
+
+            ct = contacts_by_phone.get(phone, {"name": t.get("name", ""), "vars": {}})
+            tpl_vars: List[str] = []
+            for col in var_mapping:
+                if col == "name":
+                    tpl_vars.append((ct.get("name") or "").strip() or "amigo")
+                else:
+                    v = (ct.get("vars") or {}).get(col, "")
+                    tpl_vars.append(str(v) if v is not None else "")
+
+            send_result = await wa_send_template(
+                phone=phone,
+                template_name=tpl,
+                language=c.get("template_language") or "es_AR",
+                variables=tpl_vars or None,
+                token=token,
+                phone_id=phone_id,
+            )
+
+            wa_msg_id = None
+            err = None
+            success = False
+            if isinstance(send_result, dict):
+                if "error" in send_result:
+                    err = str(send_result.get("error"))[:300]
+                elif send_result.get("messages"):
+                    wa_msg_id = send_result["messages"][0].get("id")
+                    success = True
+                else:
+                    err = str(send_result)[:300]
+
+            doc = {
+                "id": str(uuid.uuid4()),
+                "campaign_id": campaign_id,
+                "line_id": c["line_id"],
+                "phone": phone,
+                "name": ct.get("name", ""),
+                "template_name": tpl,
+                "wa_message_id": wa_msg_id,
+                "status": "sent" if success else "failed",
+                "error": err,
+                "is_resend": True,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            await db.broadcast_messages.insert_one(doc)
+            inc = {"stats.resent": 1} if success else {"stats.resend_failed": 1}
+            await db.broadcast_campaigns.update_one({"id": campaign_id}, {"$inc": inc})
+
+            # Auto-pause on Meta rate-limit
+            if err and any(k in err for k in ("131056", "80007", "rate", "OAuthException")):
+                await db.broadcast_campaigns.update_one(
+                    {"id": campaign_id},
+                    {"$set": {"status": "paused", "paused_reason": f"Auto-resend pausado: {err[:80]}"}}
+                )
+                logger.warning(f"resend {campaign_id} auto-paused: {err[:120]}")
+                return
+
+            # Cauta delay
+            delay = random.uniform(CAUTA_MIN_DELAY_S, CAUTA_MAX_DELAY_S)
+            await asyncio.sleep(delay)
+
+        # Done
+        await db.broadcast_campaigns.update_one(
+            {"id": campaign_id},
+            {"$set": {
+                "status": "completed",
+                "resend_done_at": datetime.now(timezone.utc).isoformat(),
+                "paused_reason": None,
+            }}
+        )
+        logger.info(f"resend {campaign_id} completed")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(f"csv campaign resend {campaign_id} failed")
+        await db.broadcast_campaigns.update_one(
+            {"id": campaign_id},
+            {"$set": {"resend_skipped_reason": f"resend error: {str(e)[:200]}"}}
+        )
+
+
 
 @api_router.post("/crm/broadcast/upload-image")
 async def crm_broadcast_upload_image(
@@ -7442,12 +8850,12 @@ async def startup():
         logger.error(f"MongoDB connection FAILED: {e}")
         return
     # Create admin user if not exists
-    existing = await db.users.find_one({"email": "admin@blackguardian.tech"})
+    existing = await db.users.find_one({"email": "admin@maxi.com"})
     if not existing:
-        hashed = pwd_context.hash("Frig20060920+")
+        hashed = pwd_context.hash("admin123")
         await db.users.insert_one({
             "id": str(uuid.uuid4()),
-            "email": "admin@blackguardian.tech",
+            "email": "admin@maxi.com",
             "hashed_password": hashed,
             "role": "admin",
             "is_active": True,
@@ -7456,7 +8864,7 @@ async def startup():
             "line_ids": [],
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
-        logger.info("Admin user created: admin@blackguardian.tech")
+        logger.info("Admin user created: admin@maxi.com")
     # Create cajero user if not exists 
 #    existing_cajero = await db.users.find_one({"email": "cajero@blackguardian.com"})
 #    if not existing_cajero:
