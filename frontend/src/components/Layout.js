@@ -1,12 +1,13 @@
 import React from 'react';
 import { Navigate, Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Target, LogOut, BarChart, Globe, Users, UserCog, Sun, Moon, Sparkles, Activity, TrendingUp } from 'lucide-react';
+import { LayoutDashboard, Target, LogOut, BarChart, Globe, Users, UserCog, Sun, Moon, Sparkles, Activity, TrendingUp, Megaphone } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useTheme } from '@/contexts/ThemeContext';
 
 const ALL_NAV_ITEMS = [
   { path: '/dashboard', label: 'Panel', icon: LayoutDashboard, roles: ['admin'] },
   { path: '/leads-crm', label: 'CRM', icon: Users, roles: ['admin', 'cajero'] },
+  { path: '/broadcasts', label: 'Broadcasts', icon: Megaphone, roles: ['admin', 'cajero'] },
   { path: '/campaigns', label: 'Campañas', icon: Target, roles: ['admin'] },
   { path: '/wa-landings', label: 'Landings', icon: Globe, roles: ['admin'] },
   { path: '/wa-landing-forensics', label: 'WAForensics', icon: Globe, roles: ['admin'] },
@@ -27,6 +28,15 @@ const ADMIN_ONLY_PATHS = [
   '/meta-insights',
 ];
 
+// Rutas explícitamente permitidas para cajero (whitelist gana siempre).
+// Esto evita cualquier confusión cuando agregamos features nuevas:
+// si está en esta lista, el cajero siempre puede entrar, incluso si por
+// error alguien la sumara a ADMIN_ONLY_PATHS más adelante.
+const CAJERO_ALLOWED_PATHS = [
+  '/leads-crm',
+  '/broadcasts',
+];
+
 const Layout = () => {
   const location = useLocation();
   const navigate = useNavigate();
@@ -36,8 +46,12 @@ const Layout = () => {
 
   if (!token) return <Navigate to="/login" />;
 
-  // Bloquear rutas admin para cajeros
-  if (role === 'cajero' && ADMIN_ONLY_PATHS.includes(location.pathname)) {
+  // Bloquear rutas admin para cajeros — pero la whitelist gana siempre.
+  if (
+    role === 'cajero'
+    && ADMIN_ONLY_PATHS.includes(location.pathname)
+    && !CAJERO_ALLOWED_PATHS.includes(location.pathname)
+  ) {
     return <Navigate to="/leads-crm" replace />;
   }
 
