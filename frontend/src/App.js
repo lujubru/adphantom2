@@ -19,6 +19,7 @@ import LeadsCRM from '@/pages/LeadsCRM';
 import UserManagement from '@/pages/UserManagement';
 import MetaDiagnostics from '@/pages/MetaDiagnostics';
 import MetaInsights from '@/pages/MetaInsights';
+import Broadcasts from '@/pages/Broadcasts';
 import '@/App.css';
 
 function App() {
@@ -45,6 +46,7 @@ function App() {
               <Route path="user-management" element={<UserManagement />} />
               <Route path="meta-diagnostics" element={<MetaDiagnostics />} />
               <Route path="meta-insights" element={<MetaInsights />} />
+              <Route path="broadcasts" element={<Broadcasts />} />
               {/* Catch-all: redirect unknown routes to dashboard (fixes PWA blank screen) */}
               <Route path="*" element={<Navigate to="/dashboard" replace />} />
             </Route>
