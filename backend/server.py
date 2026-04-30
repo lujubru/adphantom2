@@ -1994,7 +1994,14 @@ async def wa_delete_template(waba_id: str, token: str, template_name: str) -> di
     try:
         async with httpx.AsyncClient(timeout=20) as c:
             resp = await c.delete(url, headers=headers, params={"name": template_name})
-            return resp.json()
+            data = resp.json()
+            # Meta returns 200 with {"success": true} on OK, or {"error": {...}} on failure
+            if resp.status_code >= 400 or (isinstance(data, dict) and data.get("error")):
+                err = data.get("error") if isinstance(data, dict) else {}
+                msg = err.get("message") if isinstance(err, dict) else str(err)
+                code = err.get("code") if isinstance(err, dict) else None
+                return {"error": msg or "Error desconocido de Meta", "code": code, "raw": data}
+            return data
     except Exception as e:
         logger.error(f"WA delete template error: {e}")
         return {"error": str(e)}
@@ -4403,6 +4410,7 @@ async def crm_create_line(data: CRMLineCreate, current_user=Depends(get_current_
         "whatsapp_token": data.whatsapp_token or "",
         "phone_number_id": data.phone_number_id or "",
         "verify_token": verify_token,
+        "whatsapp_business_account_id": data.whatsapp_business_account_id or "",
         # Meta Pixel
         "meta_access_token": data.meta_access_token or "",
         "meta_pixel_id": data.meta_pixel_id or "",
@@ -7366,7 +7374,19 @@ async def broadcasts_delete_template(
         raise HTTPException(status_code=400, detail="Línea sin WABA id/token")
     result = await wa_delete_template(waba_id, token, name)
     if result.get("error"):
-        raise HTTPException(status_code=400, detail=str(result["error"]))
+        err_msg = result["error"]
+        code = result.get("code")
+        # Helpful Spanish hint for the most common Meta error
+        if code == 100 or "permission" in str(err_msg).lower() or "owner/shared" in str(err_msg).lower():
+            err_msg = (
+                f"Meta rechazó el borrado: el token de WhatsApp de esta línea no tiene permisos "
+                f"para administrar plantillas (necesita 'whatsapp_business_management' y rol admin sobre la WABA). "
+                f"Solución: en Meta Business Manager → Configuración → Usuarios del sistema, generá un token "
+                f"de System User con permiso 'whatsapp_business_management' y pegalo en el campo 'WhatsApp Token' de la línea. "
+                f"También podés borrar la plantilla manualmente desde Meta Business → Cuentas de WhatsApp → Plantillas. "
+                f"(Detalle Meta: {err_msg})"
+            )
+        raise HTTPException(status_code=400, detail=err_msg)
     return {"ok": True, "result": result}
 
 
