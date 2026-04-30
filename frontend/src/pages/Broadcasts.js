@@ -950,7 +950,15 @@ const TemplatesTab = ({ lines }) => {
       await api.delete(`/broadcasts/templates?line_id=${lineId}&name=${encodeURIComponent(tpl.name)}`);
       toast.success('Plantilla borrada');
       load();
-    } catch (e) { toast.error(e?.response?.data?.detail || 'Error'); }
+    } catch (e) {
+      const detail = e?.response?.data?.detail || 'Error';
+      // Long permission errors get rendered as a persistent dismissible toast with longer duration
+      const isPerm = /permission|permisos|owner\/shared|whatsapp_business_management/i.test(detail);
+      toast.error(detail, {
+        duration: isPerm ? 15000 : 5000,
+        style: { maxWidth: '520px', whiteSpace: 'pre-wrap' },
+      });
+    }
   };
 
   return (
@@ -1005,7 +1013,7 @@ const TemplatesTab = ({ lines }) => {
                       {t.var_count > 0 && <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300">{t.var_count} vars</span>}
                     </div>
                     {t.body_text && <p className="text-[11px] text-slate-400 mt-1 line-clamp-3 whitespace-pre-wrap">{t.body_text}</p>}
-                    {t.rejected_reason && (
+                    {t.rejected_reason && !['NONE', 'PENDING', null, ''].includes(t.rejected_reason) && (
                       <p className="text-[11px] text-red-300 mt-1">
                         <AlertCircle className="w-3 h-3 inline-block mr-1" />
                         Razón de rechazo: {t.rejected_reason}
