@@ -131,6 +131,7 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
   const emptyForm = {
     name: '', line_type: 'publi', whatsapp_number: '',
     whatsapp_token: '', phone_number_id: '', verify_token: '',
+    whatsapp_business_account_id: '',
     meta_access_token: '', meta_pixel_id: '', description: ''
   };
   const [form, setForm] = useState(emptyForm);
@@ -144,6 +145,7 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
       whatsapp_token: line.whatsapp_token || '',
       phone_number_id: line.phone_number_id || '',
       verify_token: line.verify_token || '',
+      whatsapp_business_account_id: line.whatsapp_business_account_id || '',
       meta_access_token: line.meta_access_token || '',
       meta_pixel_id: line.meta_pixel_id || '',
       description: line.description || '',
@@ -205,6 +207,18 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
               <Input placeholder="Phone Number ID" value={form.phone_number_id} onChange={e => setForm({ ...form, phone_number_id: e.target.value })} className="bg-slate-700 border-slate-600 text-xs" />
             </div>
             <Input placeholder="Verify Token (webhook)" value={form.verify_token} onChange={e => setForm({ ...form, verify_token: e.target.value })} className="bg-slate-700 border-slate-600 text-xs mt-2" />
+            <div className="mt-2">
+              <Input
+                data-testid="line-waba-id-input"
+                placeholder="WhatsApp Business Account ID (WABA ID) — requerido para Broadcasts"
+                value={form.whatsapp_business_account_id}
+                onChange={e => setForm({ ...form, whatsapp_business_account_id: e.target.value })}
+                className="bg-slate-700 border-slate-600 text-xs"
+              />
+              <p className="text-[10px] text-slate-500 mt-1 leading-snug">
+                💡 Obtenelo en <a href="https://business.facebook.com/wa/manage/home/" target="_blank" rel="noreferrer" className="text-blue-400 hover:underline">Meta Business Manager → Cuentas de WhatsApp → Configuración</a>. Aparece como "ID de la cuenta" (numérico, distinto al Phone Number ID). Necesario para enviar campañas masivas con plantillas.
+              </p>
+            </div>
           </div>
           <div className="pt-2 border-t border-slate-600">
             <p className="text-xs text-slate-400 mb-2">📊 Meta Pixel</p>
@@ -228,6 +242,7 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
           const typeConfig = LINE_TYPE_CONFIG[line.line_type] || LINE_TYPE_CONFIG.publi;
           const hasConfig = line.whatsapp_token && line.phone_number_id;
           const hasPixel = line.meta_access_token && line.meta_pixel_id;
+          const hasWaba = !!line.whatsapp_business_account_id;
           return (
             <div key={line.id} className={`p-3 hover:bg-slate-800/50 transition-colors ${selectedLineId === line.id ? 'bg-slate-800' : ''}`}>
               <div className="flex items-center justify-between cursor-pointer" onClick={() => onSelectLine(line.id)}>
@@ -247,6 +262,7 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
               <div className="mt-1 flex items-center gap-2">
                 {hasConfig ? <span className="text-xs text-emerald-400 flex items-center gap-1"><Check className="w-3 h-3" />WA Config</span> : <span className="text-xs text-amber-400 flex items-center gap-1"><AlertTriangle className="w-3 h-3" />Sin WA</span>}
                 {hasPixel ? <span className="text-xs text-emerald-400 flex items-center gap-1"><Zap className="w-3 h-3" />Pixel</span> : <span className="text-xs text-amber-400 flex items-center gap-1"><AlertTriangle className="w-3 h-3" />Sin Pixel</span>}
+                {hasWaba ? <span data-testid={`line-waba-ok-${line.id}`} className="text-xs text-emerald-400 flex items-center gap-1"><Check className="w-3 h-3" />WABA</span> : <span data-testid={`line-waba-missing-${line.id}`} className="text-xs text-amber-400 flex items-center gap-1" title="Falta el WhatsApp Business Account ID — necesario para Broadcasts"><AlertTriangle className="w-3 h-3" />Sin WABA</span>}
               </div>
               {line.verify_token && (
                 <div className="mt-2 p-2 bg-slate-700/50 rounded text-xs">
