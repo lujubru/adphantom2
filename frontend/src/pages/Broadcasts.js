@@ -37,19 +37,34 @@ const StatPill = ({ icon: Icon, label, value, color = 'text-slate-300', testid }
 );
 
 // ── Lines selector hook ────────────────────────────────────────────
+// Returns the lines the current user can actually use:
+//  - admin → all lines
+//  - cajero → only the lines listed in current_user.line_ids
 const useLines = () => {
   const [lines, setLines] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [me, setMe] = useState(null);
   useEffect(() => {
     (async () => {
       try {
-        const { data } = await api.get('/crm/lines');
-        setLines(data.lines || data || []);
+        const [linesRes, meRes] = await Promise.all([
+          api.get('/crm/lines'),
+          api.get('/auth/me').catch(() => ({ data: null })),
+        ]);
+        const meData = meRes.data;
+        setMe(meData);
+        const allLines = linesRes.data.lines || linesRes.data || [];
+        if (meData?.role === 'cajero') {
+          const allowed = new Set(meData.line_ids || []);
+          setLines(allLines.filter(l => allowed.has(l.id)));
+        } else {
+          setLines(allLines);
+        }
       } catch { /* silent */ }
       finally { setLoading(false); }
     })();
   }, []);
-  return { lines, loading };
+  return { lines, loading, me };
 };
 
 // ════════════════════════════════════════════════════════════════════
@@ -1123,7 +1138,7 @@ const OptoutsTab = ({ lines }) => {
 // ════════════════════════════════════════════════════════════════════
 
 const Broadcasts = () => {
-  const { lines, loading: linesLoading } = useLines();
+  const { lines, loading: linesLoading, me } = useLines();
   const [tab, setTab] = useState('audiences');
   const [audiences, setAudiences] = useState([]);
   const [prefilledAudience, setPrefilledAudience] = useState(null);
@@ -1176,6 +1191,20 @@ const Broadcasts = () => {
 
         {linesLoading ? (
           <div className="flex items-center justify-center h-32"><RefreshCw className="w-5 h-5 text-emerald-400 animate-spin" /></div>
+        ) : lines.length === 0 ? (
+          <div className="text-center py-12 text-slate-400 rounded-lg border border-amber-500/30 bg-amber-500/5" data-testid="broadcasts-no-lines">
+            <AlertCircle className="w-10 h-10 text-amber-400 mx-auto mb-2 opacity-60" />
+            <p className="text-sm font-medium text-amber-200">
+              {me?.role === 'cajero'
+                ? 'Todavía no tenés líneas asignadas a tu usuario.'
+                : 'No hay líneas configuradas en el sistema.'}
+            </p>
+            <p className="text-[11px] text-slate-400 mt-1">
+              {me?.role === 'cajero'
+                ? 'Pedile al admin que te asigne una o más líneas en User Management.'
+                : 'Creá una línea desde la sección "Líneas WA" antes de usar Broadcasts.'}
+            </p>
+          </div>
         ) : (
           <>
             {tab === 'audiences' && <AudiencesTab lines={lines} onSelect={useAudience} />}
