@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { UserPlus, Edit2, Trash2, X, Check } from 'lucide-react';
+import { UserPlus, Edit2, Trash2, X, Check, Plus, Phone, Landmark } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import api from '@/utils/api';
 import { toast } from 'sonner';
@@ -33,6 +33,9 @@ const UserManagement = () => {
 ¡Te dejo el CBU para que puedas cargar! 
 Le envio nuestros datos de cuenta 👇`,
     auto_welcome_enabled: true,
+    derivation_message: 'Genial! Para realizar la carga te pido que envíes comprobante y usuario al siguiente número:',
+    derivation_numbers: [],
+    cbu_list: [],
   });
 
   useEffect(() => {
@@ -94,6 +97,9 @@ Le envio nuestros datos de cuenta 👇`,
       welcome_message: user.welcome_message || '',
       user_message: user.user_message || '',
       auto_welcome_enabled: user.auto_welcome_enabled !== false,
+      derivation_message: user.derivation_message || 'Genial! Para realizar la carga te pido que envíes comprobante y usuario al siguiente número:',
+      derivation_numbers: Array.isArray(user.derivation_numbers) ? user.derivation_numbers : [],
+      cbu_list: Array.isArray(user.cbu_list) ? user.cbu_list : [],
     });
     setShowModal(true);
   };
@@ -120,6 +126,9 @@ Le envio nuestros datos de cuenta 👇`,
 ¡Te dejo el CBU para que puedas cargar! 
 Le envio nuestros datos de cuenta 👇`,
       auto_welcome_enabled: true,
+      derivation_message: 'Genial! Para realizar la carga te pido que envíes comprobante y usuario al siguiente número:',
+      derivation_numbers: [],
+      cbu_list: [],
     });
   };
 
@@ -357,6 +366,158 @@ Le envio nuestros datos de cuenta 👇`,
                     className={`w-full px-4 py-2 rounded-lg border ${inputBg} h-40 font-mono text-sm`}
                     data-testid="user-user-message"
                   />
+                </div>
+              )}
+
+              {/* Derivation config (only for cajero) */}
+              {formData.role === 'cajero' && (
+                <div>
+                  <label className={`block text-sm font-medium mb-2 ${textSecondary}`}>
+                    Mensaje de Derivación <span className="text-xs text-amber-400">(se envía + el número elegido)</span>
+                  </label>
+                  <textarea
+                    value={formData.derivation_message}
+                    onChange={e => setFormData(prev => ({ ...prev, derivation_message: e.target.value }))}
+                    className={`w-full px-4 py-2 rounded-lg border ${inputBg} h-20 font-mono text-sm`}
+                    data-testid="user-derivation-message"
+                    placeholder="Genial! Para realizar la carga te pido que envíes comprobante y usuario al siguiente número:"
+                  />
+
+                  <div className="mt-3 flex items-center justify-between">
+                    <label className={`block text-sm font-medium ${textSecondary}`}>
+                      Números de Derivación <span className="text-xs text-slate-500 font-normal">({formData.derivation_numbers.length})</span>
+                    </label>
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={() => setFormData(prev => ({ ...prev, derivation_numbers: [...prev.derivation_numbers, ''] }))}
+                      className="bg-amber-600 hover:bg-amber-500 text-white text-xs h-7 px-2"
+                      data-testid="derivation-add-number-btn"
+                    >
+                      <Plus className="w-3.5 h-3.5 mr-1" /> Agregar número
+                    </Button>
+                  </div>
+
+                  <div className="mt-2 max-h-72 overflow-y-auto pr-1 space-y-2 border border-slate-700/50 rounded-lg p-2 bg-slate-900/40" data-testid="derivation-numbers-list">
+                    {formData.derivation_numbers.length === 0 ? (
+                      <p className="text-xs text-slate-500 text-center py-3">
+                        Sin números todavía. Tocá "Agregar número" para empezar.
+                      </p>
+                    ) : formData.derivation_numbers.map((num, idx) => (
+                      <div key={idx} className="flex items-center gap-2" data-testid={`derivation-number-row-${idx}`}>
+                        <span className="text-xs text-slate-500 font-mono w-6 shrink-0 text-right">{idx + 1}.</span>
+                        <Phone className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        <input
+                          type="tel"
+                          value={num}
+                          onChange={e => {
+                            const v = e.target.value;
+                            setFormData(prev => ({
+                              ...prev,
+                              derivation_numbers: prev.derivation_numbers.map((n, i) => i === idx ? v : n)
+                            }));
+                          }}
+                          placeholder="ej: 5491155554444"
+                          className={`flex-1 px-3 py-1.5 rounded-md border ${inputBg} text-sm`}
+                          data-testid={`derivation-number-input-${idx}`}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setFormData(prev => ({
+                            ...prev,
+                            derivation_numbers: prev.derivation_numbers.filter((_, i) => i !== idx)
+                          }))}
+                          className="p-1.5 text-slate-400 hover:text-red-400 hover:bg-red-500/10 rounded shrink-0"
+                          data-testid={`derivation-number-remove-${idx}`}
+                          title="Eliminar número"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                  <p className={`text-[11px] ${textSecondary} mt-1.5 leading-snug`}>
+                    💡 Cargá los números sin el <code className="px-1 bg-slate-800 text-amber-300 rounded">+</code>, en formato internacional. El cajero va a poder elegir cualquiera desde un desplegable en el chat.
+                  </p>
+                </div>
+              )}
+
+              {/* CBU list (only for cajero) */}
+              {formData.role === 'cajero' && (
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <label className={`block text-sm font-medium ${textSecondary}`}>
+                      CBUs <span className="text-xs text-purple-400 font-normal">(envía CBU y nombre en mensajes separados)</span>
+                      <span className="text-xs text-slate-500 font-normal ml-2">({formData.cbu_list.length})</span>
+                    </label>
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={() => setFormData(prev => ({ ...prev, cbu_list: [...prev.cbu_list, { cbu: '', name: '' }] }))}
+                      className="bg-purple-600 hover:bg-purple-500 text-white text-xs h-7 px-2"
+                      data-testid="cbu-add-btn"
+                    >
+                      <Plus className="w-3.5 h-3.5 mr-1" /> Agregar CBU
+                    </Button>
+                  </div>
+
+                  <div className="max-h-80 overflow-y-auto pr-1 space-y-2 border border-slate-700/50 rounded-lg p-2 bg-slate-900/40" data-testid="cbu-list">
+                    {formData.cbu_list.length === 0 ? (
+                      <p className="text-xs text-slate-500 text-center py-3">
+                        Sin CBUs todavía. Tocá "Agregar CBU" para empezar.
+                      </p>
+                    ) : formData.cbu_list.map((item, idx) => (
+                      <div key={idx} className="flex items-start gap-2" data-testid={`cbu-row-${idx}`}>
+                        <span className="text-xs text-slate-500 font-mono w-6 shrink-0 text-right pt-2">{idx + 1}.</span>
+                        <Landmark className="w-3.5 h-3.5 text-purple-400 shrink-0 mt-2.5" />
+                        <div className="flex-1 grid grid-cols-1 sm:grid-cols-5 gap-2">
+                          <input
+                            type="text"
+                            value={item.cbu || ''}
+                            onChange={e => {
+                              const v = e.target.value;
+                              setFormData(prev => ({
+                                ...prev,
+                                cbu_list: prev.cbu_list.map((it, i) => i === idx ? { ...it, cbu: v } : it)
+                              }));
+                            }}
+                            placeholder="CBU / Alias / Nº de cuenta"
+                            className={`sm:col-span-3 px-3 py-1.5 rounded-md border ${inputBg} text-sm font-mono`}
+                            data-testid={`cbu-input-${idx}`}
+                          />
+                          <input
+                            type="text"
+                            value={item.name || ''}
+                            onChange={e => {
+                              const v = e.target.value;
+                              setFormData(prev => ({
+                                ...prev,
+                                cbu_list: prev.cbu_list.map((it, i) => i === idx ? { ...it, name: v } : it)
+                              }));
+                            }}
+                            placeholder="A nombre de..."
+                            className={`sm:col-span-2 px-3 py-1.5 rounded-md border ${inputBg} text-sm`}
+                            data-testid={`cbu-name-${idx}`}
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setFormData(prev => ({
+                            ...prev,
+                            cbu_list: prev.cbu_list.filter((_, i) => i !== idx)
+                          }))}
+                          className="p-1.5 text-slate-400 hover:text-red-400 hover:bg-red-500/10 rounded shrink-0 mt-1"
+                          data-testid={`cbu-remove-${idx}`}
+                          title="Eliminar CBU"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                  <p className={`text-[11px] ${textSecondary} mt-1.5 leading-snug`}>
+                    💡 El cajero elige el CBU desde un desplegable (muestra el nombre). Se envían <strong>dos mensajes</strong>: primero el CBU, después el nombre — para que el cliente pueda copiar sin romper el formato.
+                  </p>
                 </div>
               )}
 

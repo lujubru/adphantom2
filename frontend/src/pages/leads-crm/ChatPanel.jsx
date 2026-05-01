@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   MessageCircle, RefreshCw, Send, X, Image as ImageIcon, Mic, DollarSign,
-  User, Users, ArrowLeft, ArrowDown,
+  User, Users, ArrowLeft, ArrowDown, Share2, Phone, Landmark,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -29,6 +29,10 @@ export const ChatPanel = ({
   const [showConversionInput, setShowConversionInput] = useState(false);
   const [adPreview, setAdPreview] = useState(null);
   const [adCollapsed, setAdCollapsed] = useState(false);
+  const [showDerivarMenu, setShowDerivarMenu] = useState(false);
+  const derivarRef = useRef(null);
+  const [showCbuMenu, setShowCbuMenu] = useState(false);
+  const cbuRef = useRef(null);
   const messagesEndRef = useRef(null);
   const messagesContainerRef = useRef(null);
   // Smart auto-scroll: only auto-scroll if cajero is near bottom. Otherwise
@@ -327,6 +331,51 @@ Le envio nuestros datos de cuenta 👇`;
     } catch { toast.error('Error enviando datos de usuario'); }
   };
 
+  const sendDerivar = async (number) => {
+    const baseMsg = (userMessages.derivation_message || '').trim()
+      || 'Genial! Para realizar la carga te pido que envíes comprobante y usuario al siguiente número:';
+    const mensaje = `${baseMsg}\n${number}`;
+    setShowDerivarMenu(false);
+    try {
+      await api.post(`/crm/leads/${lead.id}/messages`, { content: mensaje, sender: 'admin' });
+      loadMessages();
+      toast.success(`Derivado a ${number}`);
+    } catch { toast.error('Error enviando derivación'); }
+  };
+
+  const sendCbu = async (item) => {
+    setShowCbuMenu(false);
+    const cbu = (item?.cbu || '').trim();
+    const name = (item?.name || '').trim();
+    if (!cbu) { toast.error('CBU inválido'); return; }
+    try {
+      // First message: CBU alone (so client can copy without line breaks)
+      await api.post(`/crm/leads/${lead.id}/messages`, { content: cbu, sender: 'admin' });
+      // Tiny delay so the two messages arrive in order on WhatsApp
+      await new Promise(r => setTimeout(r, 350));
+      if (name) {
+        await api.post(`/crm/leads/${lead.id}/messages`, { content: name, sender: 'admin' });
+      }
+      loadMessages();
+      toast.success(name ? `CBU enviado (${name})` : 'CBU enviado');
+    } catch { toast.error('Error enviando CBU'); }
+  };
+
+  // Close derivar/cbu dropdowns on outside click
+  useEffect(() => {
+    if (!showDerivarMenu && !showCbuMenu) return;
+    const onClick = (e) => {
+      if (showDerivarMenu && derivarRef.current && !derivarRef.current.contains(e.target)) {
+        setShowDerivarMenu(false);
+      }
+      if (showCbuMenu && cbuRef.current && !cbuRef.current.contains(e.target)) {
+        setShowCbuMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', onClick);
+    return () => document.removeEventListener('mousedown', onClick);
+  }, [showDerivarMenu, showCbuMenu]);
+
   const dotColor = STATUS_CONFIG[lead.status]?.dot || 'bg-blue-400';
 
   return (
@@ -440,6 +489,87 @@ Le envio nuestros datos de cuenta 👇`;
           <Button onClick={sendUsuario} size="sm" className="bg-blue-600 hover:bg-blue-500 text-white text-xs px-2 sm:px-3 h-7">
             👤<span className="hidden sm:inline ml-1">Usuario</span>
           </Button>
+          <div className="relative" ref={derivarRef}>
+            <Button
+              onClick={() => setShowDerivarMenu(v => !v)}
+              size="sm"
+              className="bg-amber-600 hover:bg-amber-500 text-white text-xs px-2 sm:px-3 h-7"
+              data-testid="chat-derivar-btn"
+              disabled={!Array.isArray(userMessages.derivation_numbers) || userMessages.derivation_numbers.length === 0}
+              title={
+                Array.isArray(userMessages.derivation_numbers) && userMessages.derivation_numbers.length > 0
+                  ? 'Derivar a un número'
+                  : 'Cargá números de derivación en tu perfil'
+              }
+            >
+              <Share2 className="w-3.5 h-3.5" /><span className="hidden sm:inline ml-1">Derivar</span>
+            </Button>
+            {showDerivarMenu && Array.isArray(userMessages.derivation_numbers) && userMessages.derivation_numbers.length > 0 && (
+              <div
+                className="absolute right-0 top-full mt-1.5 w-64 max-h-80 overflow-y-auto rounded-lg border border-slate-700 bg-slate-900 shadow-xl z-50"
+                data-testid="chat-derivar-menu"
+              >
+                <div className="px-3 py-2 border-b border-slate-700 text-[11px] uppercase tracking-wide text-slate-400 sticky top-0 bg-slate-900">
+                  Elegí un número ({userMessages.derivation_numbers.length})
+                </div>
+                {userMessages.derivation_numbers.map((num, idx) => (
+                  <button
+                    key={`${num}-${idx}`}
+                    type="button"
+                    onClick={() => sendDerivar(num)}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-white hover:bg-amber-500/15 border-b border-slate-800 last:border-b-0 text-left"
+                    data-testid={`chat-derivar-option-${idx}`}
+                  >
+                    <Phone className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span className="font-mono">{num}</span>
+                    <span className="ml-auto text-[10px] text-slate-500">#{idx + 1}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          <div className="relative" ref={cbuRef}>
+            <Button
+              onClick={() => setShowCbuMenu(v => !v)}
+              size="sm"
+              className="bg-purple-600 hover:bg-purple-500 text-white text-xs px-2 sm:px-3 h-7"
+              data-testid="chat-cbu-btn"
+              disabled={!Array.isArray(userMessages.cbu_list) || userMessages.cbu_list.length === 0}
+              title={
+                Array.isArray(userMessages.cbu_list) && userMessages.cbu_list.length > 0
+                  ? 'Enviar CBU + nombre'
+                  : 'Cargá CBUs en tu perfil'
+              }
+            >
+              <Landmark className="w-3.5 h-3.5" /><span className="hidden sm:inline ml-1">CBU</span>
+            </Button>
+            {showCbuMenu && Array.isArray(userMessages.cbu_list) && userMessages.cbu_list.length > 0 && (
+              <div
+                className="absolute right-0 top-full mt-1.5 w-72 max-h-80 overflow-y-auto rounded-lg border border-slate-700 bg-slate-900 shadow-xl z-50"
+                data-testid="chat-cbu-menu"
+              >
+                <div className="px-3 py-2 border-b border-slate-700 text-[11px] uppercase tracking-wide text-slate-400 sticky top-0 bg-slate-900">
+                  Elegí un CBU ({userMessages.cbu_list.length})
+                </div>
+                {userMessages.cbu_list.map((item, idx) => (
+                  <button
+                    key={`${item?.cbu || ''}-${idx}`}
+                    type="button"
+                    onClick={() => sendCbu(item)}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-white hover:bg-purple-500/15 border-b border-slate-800 last:border-b-0 text-left"
+                    data-testid={`chat-cbu-option-${idx}`}
+                  >
+                    <Landmark className="w-3.5 h-3.5 text-purple-400 shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm text-white truncate">{item?.name || '(sin nombre)'}</div>
+                      <div className="text-[10px] text-slate-500 font-mono truncate">{item?.cbu}</div>
+                    </div>
+                    <span className="text-[10px] text-slate-500 shrink-0">#{idx + 1}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
           <Button onClick={loadMessages} variant="ghost" size="sm" className="text-slate-400 hover:text-white h-7 w-7 p-0">
             <RefreshCw className="w-3.5 h-3.5" />
           </Button>

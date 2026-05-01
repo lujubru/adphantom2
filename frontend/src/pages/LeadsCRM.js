@@ -1109,7 +1109,10 @@ export default function LeadsCRM() {
                 onBack={closeLead}
                 userMessages={{
                   welcome_message: currentUser?.welcome_message,
-                  user_message: currentUser?.user_message
+                  user_message: currentUser?.user_message,
+                  derivation_message: currentUser?.derivation_message,
+                  derivation_numbers: currentUser?.derivation_numbers || [],
+                  cbu_list: currentUser?.cbu_list || []
                 }}
               />
             )}

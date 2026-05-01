@@ -828,7 +828,7 @@ const TemplateCreateModal = ({ lines, onClose, onCreated }) => {
             <div>
               <Label className="text-xs text-slate-400">Nombre (snake_case)</Label>
               <Input value={name} onChange={e => setName(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, '_'))}
-                placeholder="ej: promo_recarga_X"
+                placeholder="ej: nueva_promo_recarga_v1"
                 className="bg-slate-800 border-slate-600 text-white text-sm h-9 mt-1 font-mono"
                 data-testid="template-name-input" />
             </div>
