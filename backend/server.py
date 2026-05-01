@@ -310,7 +310,7 @@ def _meta_param_builder_process(fbc: Optional[str], fbp: Optional[str], event_so
     if not _PARAM_BUILDER_AVAILABLE or (not fbc and not fbp):
         return fbc, fbp
     try:
-        domain = event_source_url or "https://blackguardian.tech/"
+        domain = event_source_url or "https://www.blackguardian.tech/"
         # Feed existing values as cookies so the SDK validates+appends the suffix
         cookie_dict = {}
         if fbc:
@@ -360,6 +360,9 @@ async def get_me(current_user=Depends(get_current_user)):
         "welcome_message": current_user.get("welcome_message", ""),
         "user_message": current_user.get("user_message", ""),
         "auto_welcome_enabled": current_user.get("auto_welcome_enabled", True),
+        "derivation_message": current_user.get("derivation_message", ""),
+        "derivation_numbers": current_user.get("derivation_numbers", []),
+        "cbu_list": current_user.get("cbu_list", []),
     }
 
 
@@ -375,6 +378,21 @@ async def get_welcome_variant(current_user=Depends(get_current_user)):
     if not raw:
         return {"message": ""}
     return {"message": _pick_welcome_variation(raw)}
+def _sanitize_cbu_list(raw) -> List[Dict]:
+    """Keep only entries with a non-empty CBU; trim whitespace on cbu and name."""
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        cbu = str(item.get("cbu") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if cbu:
+            out.append({"cbu": cbu, "name": name})
+    return out
+
+
 class UserCreate(BaseModel):
     email: str
     password: str
@@ -383,6 +401,9 @@ class UserCreate(BaseModel):
     welcome_message: Optional[str] = ""
     user_message: Optional[str] = ""
     auto_welcome_enabled: Optional[bool] = True
+    derivation_message: Optional[str] = ""
+    derivation_numbers: Optional[List[str]] = []
+    cbu_list: Optional[List[Dict]] = []  # [{cbu: "...", name: "..."}]
 
 class UserUpdate(BaseModel):
     email: Optional[str] = None
@@ -393,6 +414,9 @@ class UserUpdate(BaseModel):
     user_message: Optional[str] = None
     is_active: Optional[bool] = None
     auto_welcome_enabled: Optional[bool] = None
+    derivation_message: Optional[str] = None
+    derivation_numbers: Optional[List[str]] = None
+    cbu_list: Optional[List[Dict]] = None
 
 @api_router.post("/auth/users")
 async def create_user(data: UserCreate, current_user=Depends(get_current_user)):
@@ -411,6 +435,9 @@ async def create_user(data: UserCreate, current_user=Depends(get_current_user)):
         "welcome_message": data.welcome_message or "",
         "user_message": data.user_message or "",
         "auto_welcome_enabled": data.auto_welcome_enabled if data.auto_welcome_enabled is not None else True,
+        "derivation_message": data.derivation_message or "",
+        "derivation_numbers": [n.strip() for n in (data.derivation_numbers or []) if n and n.strip()],
+        "cbu_list": _sanitize_cbu_list(data.cbu_list or []),
         "is_active": True,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
@@ -458,6 +485,11 @@ async def update_user(user_id: str, data: UserUpdate, current_user=Depends(get_c
         elif k == "password":
             # Empty password → skip (don't overwrite existing)
             continue
+        elif k == "derivation_numbers" and v is not None:
+            # Sanitize list: trim and drop empties
+            update_data[k] = [n.strip() for n in v if n and n.strip()]
+        elif k == "cbu_list" and v is not None:
+            update_data[k] = _sanitize_cbu_list(v)
         else:
             # Allow False/0/"" through — only `None` means "no change".
             # exclude_unset already drops fields not present in the request.
@@ -8935,48 +8967,21 @@ async def startup():
         logger.error(f"MongoDB connection FAILED: {e}")
         return
     # Create admin user if not exists
-    existing = await db.users.find_one({"email": "admin@maxi.com"})
-    if not existing:
-        hashed = pwd_context.hash("Frig20060920+")
-        await db.users.insert_one({
-            "id": str(uuid.uuid4()),
-            "email": "admin@maxi.com",
-            "hashed_password": hashed,
-            "role": "admin",
-            "is_active": True,
-            "welcome_message": "",
-            "user_message": "",
-            "line_ids": [],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        })
-        logger.info("Admin user created: admin@maxi.com")
-    # Create cajero user if not exists 
-#    existing_cajero = await db.users.find_one({"email": "cajero@blackguardian.com"})
-#    if not existing_cajero:
-#        hashed_cajero = pwd_context.hash("cajero123")  # cambiá esto
-#        await db.users.insert_one({
-#            "id": str(uuid.uuid4()),
-#            "email": "cajero@blackguardian.com",
-#            "hashed_password": hashed_cajero,
-#            "role": "cajero",
-#            "is_active": True,
-#            "created_at": datetime.now(timezone.utc).isoformat(),
-#        })
-#        logger.info("Cajero user created: cajero@blackguardian.com")
-#    existing_ares = await db.users.find_one({"email": "ares@blackguardian.com"})
-#    if not existing_ares:
-#        hashed_ares = pwd_context.hash("ares123456")
-#        await db.users.insert_one({
-#            "id": str(uuid.uuid4()),
-#            "email": "ares@blackguardian.com",
-#            "hashed_password": hashed_ares,
-#            "role": "cajero",
-#            "line_ids": ["268bfa4d-a908-4d6b-a371-815a3d35b772"],
-#            "is_active": True,
-#            "created_at": datetime.now(timezone.utc).isoformat(),
-#        })
-#        logger.info("Cajero user created: ares@blackguardian.com")
-
+    # existing = await db.users.find_one({"email": "admin@adphantom.net"})
+    # if not existing:
+    #     hashed = pwd_context.hash("20060920+")
+    #     await db.users.insert_one({
+    #         "id": str(uuid.uuid4()),
+    #         "email": "admin@adphantom.net",
+    #         "hashed_password": hashed,
+    #         "role": "admin",
+    #         "is_active": True,
+    #         "welcome_message": "",
+    #         "user_message": "",
+    #         "line_ids": [],
+    #         "created_at": datetime.now(timezone.utc).isoformat(),
+    #     })
+    #     logger.info("Admin user created: admin@maxi.com")
     
     # Create indexes
     await db.clicks.create_index("campaign_id")
