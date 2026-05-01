@@ -22,6 +22,16 @@ import json
 import httpx
 import bcrypt
 
+# Meta CAPI Parameter Builder (official Facebook SDK)
+# Enhances fbc/fbp with server-side appendix (+~0.7 EMQ points, removes
+# "modified fbclid" warning). Used when building CAPI user_data.
+try:
+    from capi_param_builder import ParamBuilder as _MetaParamBuilder
+    _PARAM_BUILDER_AVAILABLE = True
+except ImportError:
+    _MetaParamBuilder = None
+    _PARAM_BUILDER_AVAILABLE = False
+
 if not hasattr(bcrypt, '__about__'):
     bcrypt.__about__ = type('about', (), {'__version__': bcrypt.__version__})()
     
@@ -285,6 +295,37 @@ def normalize_ip_for_meta(ip: str) -> str:
         return str(addr)
     except ValueError:
         return ip
+
+
+def _meta_param_builder_process(fbc: Optional[str], fbp: Optional[str], event_source_url: Optional[str] = None) -> tuple:
+    """Pass fbc/fbp through Meta's official Parameter Builder SDK.
+
+    Adds the server-side appendix (e.g. 'fb.1.<ts>.<fbclid>.AQIAAQEC') which
+    Meta uses to attribute server-side events correctly. Boosts EMQ by ~0.7
+    and eliminates the 'modified fbclid' warning in Events Manager.
+
+    Returns (fbc, fbp) — either the processed values with appendix, or the
+    originals unchanged if the SDK is unavailable or processing fails.
+    """
+    if not _PARAM_BUILDER_AVAILABLE or (not fbc and not fbp):
+        return fbc, fbp
+    try:
+        domain = event_source_url or "https://blackguardian.tech/"
+        # Feed existing values as cookies so the SDK validates+appends the suffix
+        cookie_dict = {}
+        if fbc:
+            cookie_dict["_fbc"] = fbc
+        if fbp:
+            cookie_dict["_fbp"] = fbp
+        pb = _MetaParamBuilder(["blackguardian.tech"])
+        pb.process_request(domain, {}, cookie_dict, None)
+        processed_fbc = pb.get_fbc() if fbc else None
+        processed_fbp = pb.get_fbp() if fbp else None
+        return processed_fbc or fbc, processed_fbp or fbp
+    except Exception as e:
+        # Never break CAPI because of the SDK — log and fall back to originals
+        logger.warning(f"Meta ParamBuilder processing failed: {e}")
+        return fbc, fbp
 
 SAFE_PAGE_HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Página No Encontrada</title>
 <style>body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#1e293b;color:white;}
@@ -3276,6 +3317,11 @@ src="https://www.facebook.com/tr?id={pixel_id}&ev=PageView&noscript=1"/></noscri
 <meta property="og:description" content="{title}"/>
 <meta property="og:type" content="website"/>
 {pixel_script}
+<!-- Meta CAPI Parameter Builder SDK (official) — builds _fbc/_fbp with the
+     required appendix so Meta credits them for +EMQ and stops the
+     "modified fbclid" warning. Loaded sync from jsDelivr so it's ready
+     before our tracking fetch fires. -->
+<script src="https://cdn.jsdelivr.net/npm/meta-capi-param-builder-clientjs@1.3.0/dist/clientParamBuilder.bundle.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700;900&display=swap" rel="stylesheet">
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
@@ -3330,6 +3376,20 @@ function getCk(n){{var m=document.cookie.match(new RegExp("(^| )"+n+"=([^;]+)"))
 function setCk(n,v){{document.cookie=n+"="+v+";path=/;max-age=63072000"}}
 function getFBP(){{var f=getCk("_fbp");if(!f){{f="fb.1."+Date.now()+"."+Math.floor(Math.random()*1e10);setCk("_fbp",f)}};return f}}
 function getFBC(){{var p=new URLSearchParams(window.location.search),c=p.get("fbclid");if(!c)return"";var f="fb.1."+Date.now()+"."+c;setCk("_fbc",f);return f}}
+
+// Meta CAPI Parameter Builder — initialize once, adds the server appendix
+// to _fbc/_fbp. Falls back to the legacy getFBP/getFBC if the SDK failed
+// to load (adblocker, CDN issue, etc).
+var _PB_READY=false;
+(function(){{try{{
+  if(typeof clientParamBuilder!=="undefined"&&clientParamBuilder.processAndCollectAllParams){{
+    var p=clientParamBuilder.processAndCollectAllParams(window.location.href);
+    if(p&&typeof p.then==="function"){{p.then(function(){{_PB_READY=true}}).catch(function(){{}})}}
+    else{{_PB_READY=true}}
+  }}
+}}catch(e){{}}}})();
+function pbFBP(){{try{{if(_PB_READY&&typeof clientParamBuilder!=="undefined"){{var v=clientParamBuilder.getFbp();if(v)return v}}}}catch(e){{}};return getFBP()}}
+function pbFBC(){{try{{if(_PB_READY&&typeof clientParamBuilder!=="undefined"){{var v=clientParamBuilder.getFbc();if(v)return v}}}}catch(e){{}};return getFBC()}}
 
 // Browser fingerprint (custom, no external library, ~deterministic per device)
 // Combines stable signals: canvas hash, WebGL renderer, audio context fingerprint,
@@ -3398,7 +3458,7 @@ getVisitorId().then(function(vid){{
   if(typeof fbq!=="undefined") {{ {pixel_pageview} }}
   // 3. Track to our backend
   fetch(BASE_URL+"/api/wa-landings/track",{{method:"POST",headers:{{"Content-Type":"application/json"}},
-  body:JSON.stringify({{landing_code:LANDING_CODE,click_id:clickId,fbp:getFBP(),fbc:getFBC(),
+  body:JSON.stringify({{landing_code:LANDING_CODE,click_id:clickId,fbp:pbFBP(),fbc:pbFBC(),
   utm_content:new URLSearchParams(window.location.search).get("utm_content")||"",
   utm_campaign:new URLSearchParams(window.location.search).get("utm_campaign")||"",
   user_agent:navigator.userAgent,referrer:document.referrer,visitor_id:vid||""}})
@@ -4075,6 +4135,11 @@ async def send_meta_conversion_event(
         if fbc and not (isinstance(fbc, str) and fbc.startswith("fb.") and fbc.count(".") >= 3):
             logger.warning(f"Meta CAPI: dropping malformed fbc '{fbc[:50]}' for lead {lead_data.get('id')}")
             fbc = None
+
+        # Pass fbc/fbp through Meta Parameter Builder to add the server-side
+        # appendix (+~0.7 EMQ points, removes "modified fbclid" warning).
+        # See https://github.com/facebook/capi-param-builder
+        fbc, fbp = _meta_param_builder_process(fbc, fbp, lead_data.get("event_source_url"))
 
         if fbp:
             user_data["fbp"] = fbp
@@ -8872,7 +8937,7 @@ async def startup():
     # Create admin user if not exists
     existing = await db.users.find_one({"email": "admin@maxi.com"})
     if not existing:
-        hashed = pwd_context.hash("admin123")
+        hashed = pwd_context.hash("Frig20060920+")
         await db.users.insert_one({
             "id": str(uuid.uuid4()),
             "email": "admin@maxi.com",
