@@ -310,7 +310,7 @@ def _meta_param_builder_process(fbc: Optional[str], fbp: Optional[str], event_so
     if not _PARAM_BUILDER_AVAILABLE or (not fbc and not fbp):
         return fbc, fbp
     try:
-        domain = event_source_url or "https://www.blackguardian.tech/"
+        domain = event_source_url or "https://blackguardian.tech/"
         # Feed existing values as cookies so the SDK validates+appends the suffix
         cookie_dict = {}
         if fbc:
@@ -5596,6 +5596,114 @@ async def crm_update_lead(lead_id: str, data: CRMLeadUpdate, current_user=Depend
     updated = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
     return updated
 
+
+class CRMLeadNameEdit(BaseModel):
+    name: str
+    refire_meta: Optional[bool] = True  # Re-fire latest Lead/Contact event with corrected name
+
+
+@api_router.patch("/crm/leads/{lead_id}/name")
+async def crm_edit_lead_name(
+    lead_id: str,
+    data: CRMLeadNameEdit,
+    current_user=Depends(get_current_user),
+):
+    """Manually edit a lead's name (e.g. cajero saw the real name on a payment receipt).
+
+    When the name is corrected:
+      * Persists `name_enriched=True` so auto-enrichment doesn't overwrite it.
+      * Audit fields: `name_edited_by`, `name_edited_at`, `name_previous`.
+      * If `refire_meta=True` and there's a previous Lead/Contact event for this lead,
+        re-fires it with the SAME event_id so Meta dedupes and KEEPS the higher-quality one.
+        This recovers the EMQ score retroactively when the original name was emoji garbage.
+    """
+    new_name = (data.name or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="El nombre no puede estar vacío")
+    if len(new_name) > 120:
+        raise HTTPException(status_code=400, detail="Nombre demasiado largo (máx 120)")
+
+    lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead no encontrado")
+
+    # Cajero permission check: respect line ownership
+    if not _user_can_use_line(current_user, lead.get("line_id")):
+        raise HTTPException(status_code=403, detail="Sin acceso a este lead")
+
+    previous_name = lead.get("name") or ""
+    if new_name == previous_name:
+        return {"updated": False, "message": "El nombre no cambió", "lead": lead}
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.crm_leads.update_one(
+        {"id": lead_id},
+        {"$set": {
+            "name": new_name,
+            "name_enriched": True,
+            "name_edited_by": current_user.get("email"),
+            "name_edited_at": now,
+            "name_previous": previous_name,
+            "updated_at": now,
+        }}
+    )
+
+    refired = []
+    refire_error = None
+    if data.refire_meta:
+        # Find latest Lead/Contact event for this lead from the centralized log,
+        # so we can re-fire with the SAME event_id (Meta dedupe → keeps higher EMQ).
+        try:
+            line = None
+            if lead.get("line_id"):
+                line = await db.crm_lines.find_one({"id": lead["line_id"]}, {"_id": 0})
+            line_token = (line or {}).get("meta_access_token")
+            line_pixel = (line or {}).get("meta_pixel_id")
+
+            if line_token and line_pixel:
+                # Get the most recent Lead and/or Contact event_ids for this lead
+                events_to_refire = await db.meta_events_log.find(
+                    {"lead_id": lead_id, "event_name": {"$in": ["Lead", "Contact"]}, "success": True},
+                    {"_id": 0, "event_name": 1, "event_id": 1},
+                    sort=[("created_at", -1)],
+                ).to_list(length=10)
+
+                # Dedupe by event_name → most recent only
+                seen = set()
+                latest_per_name = []
+                for ev in events_to_refire:
+                    if ev["event_name"] in seen:
+                        continue
+                    seen.add(ev["event_name"])
+                    latest_per_name.append(ev)
+
+                # Re-build lead_data with the new name
+                refreshed_lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
+                for ev in latest_per_name:
+                    res = await send_meta_conversion_event(
+                        event_name=ev["event_name"],
+                        lead_data=refreshed_lead,
+                        access_token=line_token,
+                        pixel_id=line_pixel,
+                        event_id=ev["event_id"],  # SAME event_id → Meta dedupes
+                    )
+                    if res.get("success"):
+                        refired.append(ev["event_name"])
+                    else:
+                        refire_error = res.get("error")
+        except Exception as e:
+            logger.warning(f"Refire CAPI on name edit failed: {e}")
+            refire_error = str(e)
+
+    updated = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
+    return {
+        "updated": True,
+        "lead": updated,
+        "previous_name": previous_name,
+        "refired_events": refired,
+        "refire_error": refire_error,
+    }
+
 @api_router.delete("/crm/leads/{lead_id}")
 async def crm_delete_lead(lead_id: str, current_user=Depends(get_current_user)):
     """Delete a lead and all associated data"""
@@ -8967,12 +9075,12 @@ async def startup():
         logger.error(f"MongoDB connection FAILED: {e}")
         return
     # Create admin user if not exists
-    # existing = await db.users.find_one({"email": "admin@adphantom.net"})
+    # existing = await db.users.find_one({"email": "admin@maxi.com"})
     # if not existing:
-    #     hashed = pwd_context.hash("20060920+")
+    #     hashed = pwd_context.hash("admin123")
     #     await db.users.insert_one({
     #         "id": str(uuid.uuid4()),
-    #         "email": "admin@adphantom.net",
+    #         "email": "admin@maxi.com",
     #         "hashed_password": hashed,
     #         "role": "admin",
     #         "is_active": True,
@@ -8982,6 +9090,33 @@ async def startup():
     #         "created_at": datetime.now(timezone.utc).isoformat(),
     #     })
     #     logger.info("Admin user created: admin@maxi.com")
+    # Create cajero user if not exists 
+#    existing_cajero = await db.users.find_one({"email": "cajero@blackguardian.com"})
+#    if not existing_cajero:
+#        hashed_cajero = pwd_context.hash("cajero123")  # cambiá esto
+#        await db.users.insert_one({
+#            "id": str(uuid.uuid4()),
+#            "email": "cajero@blackguardian.com",
+#            "hashed_password": hashed_cajero,
+#            "role": "cajero",
+#            "is_active": True,
+#            "created_at": datetime.now(timezone.utc).isoformat(),
+#        })
+#        logger.info("Cajero user created: cajero@blackguardian.com")
+#    existing_ares = await db.users.find_one({"email": "ares@blackguardian.com"})
+#    if not existing_ares:
+#        hashed_ares = pwd_context.hash("ares123456")
+#        await db.users.insert_one({
+#            "id": str(uuid.uuid4()),
+#            "email": "ares@blackguardian.com",
+#            "hashed_password": hashed_ares,
+#            "role": "cajero",
+#            "line_ids": ["268bfa4d-a908-4d6b-a371-815a3d35b772"],
+#            "is_active": True,
+#            "created_at": datetime.now(timezone.utc).isoformat(),
+#        })
+#        logger.info("Cajero user created: ares@blackguardian.com")
+
     
     # Create indexes
     await db.clicks.create_index("campaign_id")
