@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   MessageCircle, RefreshCw, Send, X, Image as ImageIcon, Mic, DollarSign,
-  User, Users, ArrowLeft, ArrowDown, Share2, Phone, Landmark,
+  User, Users, ArrowLeft, ArrowDown, Share2, Phone, Landmark, Pencil, Check as CheckIcon,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -21,6 +21,7 @@ export const ChatPanel = ({
   onBack,
   showBackButton = false,
   userMessages = {},
+  onLeadUpdated,
 }) => {
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState('');
@@ -33,6 +34,9 @@ export const ChatPanel = ({
   const derivarRef = useRef(null);
   const [showCbuMenu, setShowCbuMenu] = useState(false);
   const cbuRef = useRef(null);
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState('');
+  const [savingName, setSavingName] = useState(false);
   const messagesEndRef = useRef(null);
   const messagesContainerRef = useRef(null);
   // Smart auto-scroll: only auto-scroll if cajero is near bottom. Otherwise
@@ -361,6 +365,42 @@ Le envio nuestros datos de cuenta 👇`;
     } catch { toast.error('Error enviando CBU'); }
   };
 
+  const startEditName = () => {
+    setNameDraft(lead.name || '');
+    setEditingName(true);
+  };
+
+  const cancelEditName = () => {
+    setEditingName(false);
+    setNameDraft('');
+  };
+
+  const saveEditName = async () => {
+    const trimmed = nameDraft.trim();
+    if (!trimmed) { toast.error('El nombre no puede estar vacío'); return; }
+    if (trimmed === (lead.name || '').trim()) { cancelEditName(); return; }
+    setSavingName(true);
+    try {
+      const { data } = await api.patch(`/crm/leads/${lead.id}/name`, {
+        name: trimmed,
+        refire_meta: true,
+      });
+      const refired = Array.isArray(data?.refired_events) ? data.refired_events : [];
+      if (refired.length > 0) {
+        toast.success(`Nombre actualizado · Meta re-enviado (${refired.join(', ')})`);
+      } else {
+        toast.success('Nombre actualizado');
+      }
+      setEditingName(false);
+      setNameDraft('');
+      if (onLeadUpdated && data?.lead) onLeadUpdated(data.lead);
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || 'Error guardando el nombre');
+    } finally {
+      setSavingName(false);
+    }
+  };
+
   // Close derivar/cbu dropdowns on outside click
   useEffect(() => {
     if (!showDerivarMenu && !showCbuMenu) return;
@@ -400,7 +440,58 @@ Le envio nuestros datos de cuenta 👇`;
             <span className={`absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-slate-900 ${dotColor}`} />
           </div>
           <div className="min-w-0 flex-1">
-            <p className="text-sm font-semibold text-white leading-tight truncate">{lead.name || lead.phone}</p>
+            {editingName ? (
+              <div className="flex items-center gap-1.5">
+                <Input
+                  value={nameDraft}
+                  onChange={e => setNameDraft(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') { e.preventDefault(); saveEditName(); }
+                    else if (e.key === 'Escape') { e.preventDefault(); cancelEditName(); }
+                  }}
+                  autoFocus
+                  disabled={savingName}
+                  placeholder="Nombre real del cliente"
+                  className="h-7 text-sm bg-slate-800 border-slate-600 text-white px-2 py-0"
+                  data-testid="lead-name-input"
+                />
+                <button
+                  type="button"
+                  onClick={saveEditName}
+                  disabled={savingName || !nameDraft.trim()}
+                  className="p-1 text-emerald-400 hover:text-emerald-300 disabled:opacity-40 rounded hover:bg-emerald-500/10"
+                  data-testid="lead-name-save"
+                  title="Guardar (Enter)"
+                >
+                  <CheckIcon className="w-4 h-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={cancelEditName}
+                  disabled={savingName}
+                  className="p-1 text-slate-400 hover:text-red-400 rounded hover:bg-red-500/10"
+                  data-testid="lead-name-cancel"
+                  title="Cancelar (Esc)"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1 group">
+                <p className="text-sm font-semibold text-white leading-tight truncate" data-testid="lead-name-display">
+                  {lead.name || lead.phone}
+                </p>
+                <button
+                  type="button"
+                  onClick={startEditName}
+                  className="p-0.5 text-slate-500 hover:text-blue-400 opacity-60 hover:opacity-100 rounded shrink-0"
+                  data-testid="lead-name-edit-btn"
+                  title="Editar nombre del lead (re-envía a Meta con fn/ln corregidos)"
+                >
+                  <Pencil className="w-3 h-3" />
+                </button>
+              </div>
+            )}
             <p className="text-xs text-slate-400 truncate">{lead.phone}{lead.line_name ? ` · ${lead.line_name}` : ''}</p>
           </div>
         </div>
