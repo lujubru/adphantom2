@@ -1107,6 +1107,10 @@ export default function LeadsCRM() {
                 showCloseButton={false}
                 showBackButton={isMobile}
                 onBack={closeLead}
+                onLeadUpdated={(updated) => {
+                  setSelectedLead(prev => prev && prev.id === updated.id ? { ...prev, ...updated } : prev);
+                  setLeads(prev => prev.map(l => l.id === updated.id ? { ...l, ...updated } : l));
+                }}
                 userMessages={{
                   welcome_message: currentUser?.welcome_message,
                   user_message: currentUser?.user_message,
