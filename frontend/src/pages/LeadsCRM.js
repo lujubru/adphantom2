@@ -754,8 +754,38 @@ export default function LeadsCRM() {
   useEffect(() => { loadLeads(); loadLines(); loadFunnel(); }, [loadLeads, loadLines, loadFunnel]);
 
   useEffect(() => {
-    const interval = setInterval(() => { loadLeads(); loadFunnel(); }, 5000);
-    return () => clearInterval(interval);
+    // Polling de leads/funnel: pausa cuando la pestaña está oculta para
+    // ahorrar egress (Railway). Cuando la pestaña vuelve a foco, refresca al
+    // toque. Intervalo 10s (antes 5s) — sigue siendo casi-real-time para CRM.
+    let interval = null;
+    const POLL_MS = 10000;
+
+    const tick = () => { loadLeads(); loadFunnel(); };
+    const start = () => {
+      if (interval) return;
+      interval = setInterval(tick, POLL_MS);
+    };
+    const stop = () => {
+      if (interval) { clearInterval(interval); interval = null; }
+    };
+
+    if (document.visibilityState === 'visible') start();
+
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        // Catch-up inmediato al volver a la pestaña, después reanudar polling
+        tick();
+        start();
+      } else {
+        stop();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      stop();
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, [loadLeads, loadFunnel]);
 
   useEffect(() => {
