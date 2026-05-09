@@ -88,8 +88,35 @@ export const ChatPanel = ({
     loadMessages();
     loadAdPreview();
     setAdCollapsed(true); // contraído por default — el cajero lo despliega si quiere
-    const interval = setInterval(loadMessages, 5000);
-    return () => clearInterval(interval);
+
+    // Polling de mensajes: pausa cuando la pestaña está oculta (ahorra egress
+    // Railway). Catch-up inmediato al volver al foco. Intervalo 10s (antes 5s).
+    let interval = null;
+    const POLL_MS = 10000;
+    const start = () => {
+      if (interval) return;
+      interval = setInterval(loadMessages, POLL_MS);
+    };
+    const stop = () => {
+      if (interval) { clearInterval(interval); interval = null; }
+    };
+
+    if (document.visibilityState === 'visible') start();
+
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        loadMessages();
+        start();
+      } else {
+        stop();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      stop();
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, [loadMessages, loadAdPreview]);
 
   useEffect(() => {
