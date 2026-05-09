@@ -9058,6 +9058,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# GZip compression: reduces JSON payload egress by ~70% on lead lists,
+# message threads, and stats endpoints. Transparent to clients (browsers
+# auto-decompress via the standard Accept-Encoding header). minimum_size=1000
+# avoids compressing tiny responses where overhead outweighs savings.
+from starlette.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
 app.include_router(go_router)
 # Note: api_router is included at the END of the file after ALL routes
 # have been registered (including the Marketing Dashboard endpoints).
