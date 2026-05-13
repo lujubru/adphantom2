@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { UserPlus, Edit2, Trash2, X, Check, Plus, Phone, Landmark } from 'lucide-react';
+import { UserPlus, Edit2, Trash2, X, Check, Plus, Phone, Landmark, Megaphone, Zap } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import api from '@/utils/api';
 import { toast } from 'sonner';
@@ -12,6 +12,9 @@ const UserManagement = () => {
   const [loading, setLoading] = useState(true);
   const [showModal, setShowModal] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
+  const [editingUserQuota, setEditingUserQuota] = useState(null);  // {used, quota, base, extra, period, remaining}
+  const [topupAmount, setTopupAmount] = useState('');
+  const [topupSaving, setTopupSaving] = useState(false);
   const [formData, setFormData] = useState({
     email: '',
     password: '',
@@ -36,6 +39,7 @@ Le envio nuestros datos de cuenta 👇`,
     derivation_message: 'Genial! Para realizar la carga te pido que envíes comprobante y usuario al siguiente número:',
     derivation_numbers: [],
     cbu_list: [],
+    broadcast_monthly_quota: 0,
   });
 
   useEffect(() => {
@@ -76,6 +80,21 @@ Le envio nuestros datos de cuenta 👇`,
     }
   };
 
+  const handleTopup = async () => {
+    if (!editingUser?.id) return;
+    const n = parseInt(topupAmount, 10);
+    if (!n || n <= 0) { toast.error('Ingresá un número válido > 0'); return; }
+    setTopupSaving(true);
+    try {
+      const { data } = await api.post(`/broadcasts/quota/${editingUser.id}/topup`, { extra: n });
+      setEditingUserQuota(data?.state || null);
+      setTopupAmount('');
+      toast.success(`+${n} créditos añadidos a este período`);
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || 'Error en la recarga');
+    } finally { setTopupSaving(false); }
+  };
+
   const handleDelete = async (userId) => {
     if (!window.confirm('¿Eliminar este usuario?')) return;
     try {
@@ -87,8 +106,17 @@ Le envio nuestros datos de cuenta 👇`,
     }
   };
 
-  const handleEdit = (user) => {
+  const handleEdit = async (user) => {
     setEditingUser(user);
+    setEditingUserQuota(null);
+    setTopupAmount('');
+    if (user.role === 'cajero' && user.id) {
+      // Pre-cargar el estado de cupo actual del cajero (para mostrar el "usados / cupo")
+      try {
+        const { data } = await api.get(`/broadcasts/quota/${user.id}`);
+        setEditingUserQuota(data);
+      } catch { /* admin viendo otro admin → ignorable */ }
+    }
     setFormData({
       email: user.email,
       password: '',
@@ -100,6 +128,7 @@ Le envio nuestros datos de cuenta 👇`,
       derivation_message: user.derivation_message || 'Genial! Para realizar la carga te pido que envíes comprobante y usuario al siguiente número:',
       derivation_numbers: Array.isArray(user.derivation_numbers) ? user.derivation_numbers : [],
       cbu_list: Array.isArray(user.cbu_list) ? user.cbu_list : [],
+      broadcast_monthly_quota: Number(user.broadcast_monthly_quota || 0),
     });
     setShowModal(true);
   };
@@ -129,6 +158,7 @@ Le envio nuestros datos de cuenta 👇`,
       derivation_message: 'Genial! Para realizar la carga te pido que envíes comprobante y usuario al siguiente número:',
       derivation_numbers: [],
       cbu_list: [],
+      broadcast_monthly_quota: 0,
     });
   };
 
@@ -517,6 +547,87 @@ Le envio nuestros datos de cuenta 👇`,
                   </div>
                   <p className={`text-[11px] ${textSecondary} mt-1.5 leading-snug`}>
                     💡 El cajero elige el CBU desde un desplegable (muestra el nombre). Se envían <strong>dos mensajes</strong>: primero el CBU, después el nombre — para que el cliente pueda copiar sin romper el formato.
+                  </p>
+                </div>
+              )}
+
+              {/* Broadcast monthly quota (only for cajero) */}
+              {formData.role === 'cajero' && (
+                <div className="rounded-lg border border-purple-700/40 bg-purple-900/10 p-3">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Megaphone className="w-4 h-4 text-purple-400" />
+                    <label className={`text-sm font-semibold ${textSecondary}`}>
+                      Cupo mensual de mensajes masivos (Broadcasts)
+                    </label>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={0}
+                      step={50}
+                      value={formData.broadcast_monthly_quota}
+                      onChange={e => setFormData(prev => ({ ...prev, broadcast_monthly_quota: Math.max(0, parseInt(e.target.value || '0', 10) || 0) }))}
+                      placeholder="500"
+                      className={`w-32 px-3 py-2 rounded-md border ${inputBg} text-sm font-mono`}
+                      data-testid="user-broadcast-quota-input"
+                    />
+                    <span className={`text-xs ${textSecondary}`}>mensajes / mes</span>
+                  </div>
+
+                  {editingUser && editingUserQuota && (
+                    <div className="mt-3 space-y-2">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className={textSecondary}>
+                          Período <span className="font-mono text-slate-200">{editingUserQuota.period}</span>
+                        </span>
+                        <span className={textSecondary}>
+                          {editingUserQuota.used} / {editingUserQuota.quota} usados
+                          {editingUserQuota.extra > 0 && (
+                            <span className="ml-1 text-amber-400">(+{editingUserQuota.extra} extras)</span>
+                          )}
+                        </span>
+                      </div>
+                      <div className="h-2 rounded-full bg-slate-700/60 overflow-hidden">
+                        <div
+                          className="h-full bg-gradient-to-r from-purple-500 to-pink-500 transition-all"
+                          style={{ width: `${editingUserQuota.quota > 0 ? Math.min(100, (editingUserQuota.used / editingUserQuota.quota) * 100) : 0}%` }}
+                          data-testid="user-quota-bar"
+                        />
+                      </div>
+
+                      {/* Admin top-up */}
+                      <div className="mt-2 flex items-center gap-2">
+                        <Zap className="w-3.5 h-3.5 text-amber-400" />
+                        <input
+                          type="number"
+                          min={1}
+                          step={50}
+                          placeholder="ej. 100"
+                          value={topupAmount}
+                          onChange={e => setTopupAmount(e.target.value)}
+                          className={`w-24 px-2 py-1 rounded-md border ${inputBg} text-xs font-mono`}
+                          data-testid="user-topup-input"
+                        />
+                        <Button
+                          type="button"
+                          size="sm"
+                          onClick={handleTopup}
+                          disabled={topupSaving || !topupAmount}
+                          className="bg-amber-600 hover:bg-amber-500 text-white text-xs h-7"
+                          data-testid="user-topup-btn"
+                        >
+                          {topupSaving ? '...' : '+ Recargar este mes'}
+                        </Button>
+                      </div>
+                      <p className="text-[10px] text-slate-500 leading-snug">
+                        Las recargas extras solo valen para <strong>{editingUserQuota.period}</strong> y se reinician cuando arranca el siguiente mes (ART).
+                      </p>
+                    </div>
+                  )}
+
+                  <p className={`text-[11px] ${textSecondary} mt-2 leading-snug`}>
+                    💡 0 = el cajero no puede crear campañas. Plan típico: 500/1000/2000 según el monto que pague el cliente. El cupo se renueva el día 1 de cada mes (ART).
                   </p>
                 </div>
               )}

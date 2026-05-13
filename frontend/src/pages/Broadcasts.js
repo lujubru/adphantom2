@@ -97,6 +97,18 @@ const AudienceUploader = ({ lines, onUploaded }) => {
       });
       const a = data.audience;
       toast.success(`Audiencia "${a.name}" creada con ${a.total_contacts} contactos válidos`);
+
+      // Quota preview: warn if the audience exceeds remaining monthly quota
+      try {
+        const { data: prev } = await api.post('/broadcasts/quota/preview', { target_count: a.total_contacts });
+        if (!prev.is_admin && prev.limited && prev.excluded > 0) {
+          const reason = prev.state.quota === 0
+            ? 'Tu usuario no tiene cupo de mensajes asignado este mes.'
+            : `Solo se enviarán los primeros ${prev.will_send} (cupo restante: ${prev.state.remaining} de ${prev.state.quota}).`;
+          toast.warning(`⚠️ Tu CSV tiene ${a.total_contacts} contactos. ${reason}`, { duration: 12000, style: { maxWidth: '480px' } });
+        }
+      } catch { /* silent — preview is best-effort */ }
+
       onUploaded?.();
       close();
     } catch (e) {
@@ -347,8 +359,16 @@ const CampaignWizard = ({ lines, audiences, prefilledAudience, onClose, onCreate
         body.audience_id = audienceId;
       }
       const { data } = await api.post('/broadcasts/campaigns', body);
-      toast.success(`Campaña "${data.campaign.name}" creada (${data.campaign.target_count} contactos)`);
-      onCreated?.(data.campaign);
+      const camp = data.campaign;
+      if (data.quota_truncated && data.quota_excluded > 0) {
+        toast.warning(
+          `Campaña "${camp.name}" creada con ${camp.target_count} contactos · ⚠️ ${data.quota_excluded} contactos quedaron fuera por límite de cupo (${data.quota_state?.used}/${data.quota_state?.quota}).`,
+          { duration: 12000, style: { maxWidth: '520px' } }
+        );
+      } else {
+        toast.success(`Campaña "${camp.name}" creada (${camp.target_count} contactos)`);
+      }
+      onCreated?.(camp);
       onClose?.();
     } catch (e) {
       toast.error(e?.response?.data?.detail || 'Error creando campaña');
@@ -828,7 +848,7 @@ const TemplateCreateModal = ({ lines, onClose, onCreated }) => {
             <div>
               <Label className="text-xs text-slate-400">Nombre (snake_case)</Label>
               <Input value={name} onChange={e => setName(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, '_'))}
-                placeholder="ej: nueva_promo_recarga_v1"
+                placeholder="ej: betwin_promo_recarga_v1"
                 className="bg-slate-800 border-slate-600 text-white text-sm h-9 mt-1 font-mono"
                 data-testid="template-name-input" />
             </div>
@@ -1150,6 +1170,7 @@ const Broadcasts = () => {
   const [tab, setTab] = useState('audiences');
   const [audiences, setAudiences] = useState([]);
   const [prefilledAudience, setPrefilledAudience] = useState(null);
+  const [quota, setQuota] = useState(null);
 
   const reloadAudiences = useCallback(async () => {
     try {
@@ -1158,7 +1179,14 @@ const Broadcasts = () => {
     } catch { /* silent */ }
   }, []);
 
-  useEffect(() => { reloadAudiences(); }, [reloadAudiences]);
+  const reloadQuota = useCallback(async () => {
+    try {
+      const { data } = await api.get('/broadcasts/quota/me');
+      setQuota(data);
+    } catch { /* silent */ }
+  }, []);
+
+  useEffect(() => { reloadAudiences(); reloadQuota(); }, [reloadAudiences, reloadQuota]);
 
   const useAudience = (a) => {
     setPrefilledAudience(a);
@@ -1177,6 +1205,48 @@ const Broadcasts = () => {
             <p className="text-xs text-slate-400">Subí audiencias por CSV, mandá plantillas Meta a tus clientes (cauta + pausa nocturna).</p>
           </div>
         </div>
+
+        {/* Quota card (cajeros — admins son ilimitados) */}
+        {quota && me?.role !== 'admin' && (
+          <div className="mb-4 rounded-lg border border-purple-700/40 bg-gradient-to-br from-purple-900/15 to-slate-900/50 p-3 sm:p-4" data-testid="broadcast-quota-card">
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                <Megaphone className="w-4 h-4 text-purple-400" />
+                <span className="text-xs sm:text-sm font-semibold text-white">
+                  Cupo mensual · <span className="font-mono text-slate-300">{quota.period}</span>
+                </span>
+              </div>
+              <div className="text-xs sm:text-sm text-slate-200">
+                <span className="font-mono font-bold text-white">{quota.used}</span>
+                <span className="text-slate-500"> / </span>
+                <span className="font-mono">{quota.quota}</span>
+                {quota.extra > 0 && (
+                  <span className="ml-2 px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px]">+{quota.extra} extras</span>
+                )}
+              </div>
+            </div>
+            <div className="h-2 rounded-full bg-slate-700/60 overflow-hidden">
+              <div
+                className={`h-full transition-all ${quota.remaining === 0 ? 'bg-red-500' : quota.remaining < (quota.quota * 0.2) ? 'bg-gradient-to-r from-amber-500 to-orange-500' : 'bg-gradient-to-r from-purple-500 to-pink-500'}`}
+                style={{ width: `${quota.quota > 0 ? Math.min(100, (quota.used / quota.quota) * 100) : 0}%` }}
+                data-testid="broadcast-quota-bar"
+              />
+            </div>
+            <div className="mt-2 flex items-center justify-between text-[11px]">
+              <span className="text-slate-400">
+                {quota.quota === 0
+                  ? '⚠️ Tu usuario no tiene cupo asignado. Pedile a un admin que te asigne uno.'
+                  : quota.remaining === 0
+                    ? '🛑 Llegaste al límite de este mes. Pedí una recarga al admin.'
+                    : `Te quedan ${quota.remaining} mensajes este mes.`
+                }
+              </span>
+              <button onClick={reloadQuota} className="text-slate-500 hover:text-slate-300" title="Actualizar">
+                <RefreshCw className="w-3 h-3" />
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Tabs */}
         <div className="flex gap-1 border-b border-slate-800 mb-4 overflow-x-auto">
