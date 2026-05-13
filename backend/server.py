@@ -363,6 +363,7 @@ async def get_me(current_user=Depends(get_current_user)):
         "derivation_message": current_user.get("derivation_message", ""),
         "derivation_numbers": current_user.get("derivation_numbers", []),
         "cbu_list": current_user.get("cbu_list", []),
+        "broadcast_monthly_quota": int(current_user.get("broadcast_monthly_quota", 0) or 0),
     }
 
 
@@ -404,6 +405,7 @@ class UserCreate(BaseModel):
     derivation_message: Optional[str] = ""
     derivation_numbers: Optional[List[str]] = []
     cbu_list: Optional[List[Dict]] = []  # [{cbu: "...", name: "..."}]
+    broadcast_monthly_quota: Optional[int] = 0  # 0 = sin permiso de broadcasts; >0 = cupo base mensual
 
 class UserUpdate(BaseModel):
     email: Optional[str] = None
@@ -417,6 +419,7 @@ class UserUpdate(BaseModel):
     derivation_message: Optional[str] = None
     derivation_numbers: Optional[List[str]] = None
     cbu_list: Optional[List[Dict]] = None
+    broadcast_monthly_quota: Optional[int] = None
 
 @api_router.post("/auth/users")
 async def create_user(data: UserCreate, current_user=Depends(get_current_user)):
@@ -438,6 +441,7 @@ async def create_user(data: UserCreate, current_user=Depends(get_current_user)):
         "derivation_message": data.derivation_message or "",
         "derivation_numbers": [n.strip() for n in (data.derivation_numbers or []) if n and n.strip()],
         "cbu_list": _sanitize_cbu_list(data.cbu_list or []),
+        "broadcast_monthly_quota": int(data.broadcast_monthly_quota or 0),
         "is_active": True,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
@@ -490,6 +494,11 @@ async def update_user(user_id: str, data: UserUpdate, current_user=Depends(get_c
             update_data[k] = [n.strip() for n in v if n and n.strip()]
         elif k == "cbu_list" and v is not None:
             update_data[k] = _sanitize_cbu_list(v)
+        elif k == "broadcast_monthly_quota" and v is not None:
+            try:
+                update_data[k] = max(0, int(v))
+            except (TypeError, ValueError):
+                update_data[k] = 0
         else:
             # Allow False/0/"" through — only `None` means "no change".
             # exclude_unset already drops fields not present in the request.
@@ -5439,6 +5448,88 @@ async def crm_get_all_leads(
         "pages": (total + limit - 1) // limit if total > 0 else 1
     }
 
+
+async def _enrich_lead_for_list(lead: dict) -> dict:
+    """Add line_name/line_type, has_unread_messages and ad_badge to a lead dict."""
+    if lead.get("line_id"):
+        line = await db.crm_lines.find_one({"id": lead["line_id"]}, {"_id": 0, "name": 1, "line_type": 1})
+        lead["line_name"] = line["name"] if line else None
+        lead["line_type"] = line["line_type"] if line else None
+    lead["has_unread_messages"] = lead.get("unread_count", 0) > 0
+    referral = lead.get("referral") or {}
+    has_ctwa = bool(lead.get("ctwa_clid") or referral.get("ctwa_clid"))
+    has_landing = bool(lead.get("landing_code"))
+    has_utm = bool(lead.get("ad_source") or lead.get("utm_content"))
+    lead["has_ad_attribution"] = has_ctwa or has_landing or has_utm
+    if has_ctwa:
+        lead["ad_badge"] = {"label": "Anuncio Meta", "color": "blue", "source": "ctwa"}
+    elif has_landing:
+        lead["ad_badge"] = {"label": f"Landing {lead.get('landing_code')}", "color": "emerald", "source": "landing"}
+    elif has_utm:
+        lead["ad_badge"] = {"label": lead.get("ad_source") or lead.get("utm_content"), "color": "amber", "source": "utm"}
+    return lead
+
+
+@api_router.get("/crm/leads/changed")
+async def crm_get_leads_changed(
+    since: str = Query(..., description="ISO timestamp; only leads with last_interaction or updated_at > since are returned"),
+    line_id: Optional[str] = None,
+    limit: int = Query(200, ge=1, le=500),
+    current_user=Depends(get_current_user),
+):
+    """Delta sync endpoint — returns ONLY leads that changed since `since`.
+
+    Use case: frontend polling. Instead of pulling 500 leads every 10s, the
+    client asks "what changed since I last synced?". Drastically reduces
+    egress (~90% on idle CRMs).
+
+    Server returns server_now so the client knows what to send as `since` next
+    time (avoids client/server clock drift).
+    """
+    # Parse since timestamp safely
+    try:
+        # Accept both with and without 'Z'; we just compare as ISO strings
+        # since we store them as ISO strings ourselves.
+        if since.endswith("Z"):
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        else:
+            since_dt = datetime.fromisoformat(since)
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="`since` debe ser un timestamp ISO 8601 válido")
+
+    since_iso = since_dt.isoformat()
+
+    query: Dict = {
+        "$or": [
+            {"last_interaction": {"$gt": since_iso}},
+            {"updated_at": {"$gt": since_iso}},
+        ]
+    }
+
+    # Cajero scoping (idéntico al endpoint /crm/leads)
+    user_line_ids = current_user.get("line_ids", [])
+    if current_user.get("role") == "cajero" and user_line_ids:
+        if line_id and line_id in user_line_ids:
+            query["line_id"] = line_id
+        else:
+            query["line_id"] = {"$in": user_line_ids}
+    elif current_user.get("role") == "cajero" and not user_line_ids:
+        return {"leads": [], "server_now": datetime.now(timezone.utc).isoformat(), "count": 0}
+    elif line_id:
+        query["line_id"] = line_id
+
+    leads = await db.crm_leads.find(query, {"_id": 0}).sort("last_interaction", -1).limit(limit).to_list(limit)
+    for lead in leads:
+        await _enrich_lead_for_list(lead)
+
+    return {
+        "leads": leads,
+        "server_now": datetime.now(timezone.utc).isoformat(),
+        "count": len(leads),
+    }
+
 @api_router.post("/crm/leads")
 async def crm_create_lead(data: CRMLeadCreate, current_user=Depends(get_current_user)):
     """Create a new CRM lead manually"""
@@ -7428,6 +7519,162 @@ def _user_can_use_line(user: dict, line_id: str) -> bool:
     return line_id in (user.get("line_ids") or [])
 
 
+# === Broadcast monthly quota helpers ============================================
+# Period = current month in ART (Argentina is the operator timezone). Used to
+# enforce per-user monthly broadcast caps. Usage is stored per (email, period)
+# in `broadcast_quota_usage` so history is preserved and the counter "resets"
+# automatically each month (we just look at the new period — old docs stay).
+
+def _quota_current_period() -> str:
+    """Return current period as 'YYYY-MM' in Argentina timezone (UTC-3)."""
+    now_ar = datetime.now(timezone.utc) - timedelta(hours=3)
+    return now_ar.strftime("%Y-%m")
+
+
+async def _quota_get_state(user: dict) -> dict:
+    """Return {quota, base, extra, used, remaining, period} for a user.
+    extra rolls over to 0 when the period changes (we only count `extra` if
+    the stored `broadcast_quota_period` matches the current one).
+    """
+    period = _quota_current_period()
+    base = int(user.get("broadcast_monthly_quota") or 0)
+    stored_period = user.get("broadcast_quota_period")
+    extra = int(user.get("broadcast_quota_extra") or 0) if stored_period == period else 0
+
+    usage_doc = await db.broadcast_quota_usage.find_one(
+        {"email": user.get("email"), "period": period}, {"_id": 0, "count": 1}
+    )
+    used = int((usage_doc or {}).get("count") or 0)
+    quota = base + extra
+    remaining = max(0, quota - used)
+    return {
+        "period": period,
+        "base": base,
+        "extra": extra,
+        "quota": quota,
+        "used": used,
+        "remaining": remaining,
+    }
+
+
+async def _quota_increment(email: str, by: int = 1) -> int:
+    """Atomically increment usage for the user in the current period; returns new count."""
+    if not email or by <= 0:
+        return 0
+    period = _quota_current_period()
+    res = await db.broadcast_quota_usage.find_one_and_update(
+        {"email": email, "period": period},
+        {"$inc": {"count": by}, "$setOnInsert": {"email": email, "period": period, "created_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+        return_document=True,
+        projection={"_id": 0, "count": 1},
+    )
+    return int((res or {}).get("count") or by)
+
+
+async def _quota_reset_extra_if_new_period(user: dict) -> None:
+    """Lazy reset: if stored period != current, zero out `broadcast_quota_extra`."""
+    period = _quota_current_period()
+    if user.get("broadcast_quota_period") != period:
+        await db.users.update_one(
+            {"id": user.get("id")},
+            {"$set": {"broadcast_quota_extra": 0, "broadcast_quota_period": period}}
+        )
+
+
+@api_router.get("/broadcasts/quota/me")
+async def broadcasts_quota_me(current_user=Depends(get_current_user)):
+    """Current user's broadcast quota snapshot for the active period."""
+    await _quota_reset_extra_if_new_period(current_user)
+    refreshed = await db.users.find_one({"id": current_user.get("id")}, {"_id": 0})
+    state = await _quota_get_state(refreshed or current_user)
+    return state
+
+
+class BroadcastQuotaTopup(BaseModel):
+    extra: int  # additional credits to add to the current period
+
+
+@api_router.post("/broadcasts/quota/{user_id}/topup")
+async def broadcasts_quota_topup(
+    user_id: str,
+    payload: BroadcastQuotaTopup,
+    current_user=Depends(get_current_user),
+):
+    """Admin-only: add extra broadcast credits to a user's current period.
+    Extras automatically reset to 0 when a new month starts.
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Solo admins pueden recargar cupos")
+    if payload.extra <= 0:
+        raise HTTPException(status_code=400, detail="extra debe ser > 0")
+
+    target = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    period = _quota_current_period()
+    stored_period = target.get("broadcast_quota_period")
+    # If the stored period is from a previous month, treat current extra as 0
+    current_extra = int(target.get("broadcast_quota_extra") or 0) if stored_period == period else 0
+    new_extra = current_extra + int(payload.extra)
+
+    await db.users.update_one(
+        {"id": user_id},
+        {"$set": {
+            "broadcast_quota_extra": new_extra,
+            "broadcast_quota_period": period,
+            "broadcast_quota_extra_last_topup_at": datetime.now(timezone.utc).isoformat(),
+            "broadcast_quota_extra_last_topup_by": current_user.get("email"),
+        }}
+    )
+
+    refreshed = await db.users.find_one({"id": user_id}, {"_id": 0})
+    state = await _quota_get_state(refreshed)
+    return {"ok": True, "user_id": user_id, "added_extra": int(payload.extra), "state": state}
+
+
+@api_router.get("/broadcasts/quota/{user_id}")
+async def broadcasts_quota_admin_get(user_id: str, current_user=Depends(get_current_user)):
+    """Admin-only: read another user's quota state."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Sólo admins")
+    target = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    return await _quota_get_state(target)
+
+
+class BroadcastQuotaPreview(BaseModel):
+    target_count: int
+
+
+@api_router.post("/broadcasts/quota/preview")
+async def broadcasts_quota_preview(
+    payload: BroadcastQuotaPreview,
+    current_user=Depends(get_current_user),
+):
+    """Preview how many of `target_count` will actually be sent given the
+    user's remaining quota. Used by the UI on CSV upload to warn the user
+    BEFORE creating the campaign."""
+    state = await _quota_get_state(current_user)
+    n = max(0, int(payload.target_count or 0))
+    role_admin = current_user.get("role") == "admin"
+    if role_admin:
+        # Admins are unlimited
+        return {"will_send": n, "excluded": 0, "limited": False, "state": state, "is_admin": True}
+    if state["quota"] == 0:
+        return {"will_send": 0, "excluded": n, "limited": True, "state": state, "is_admin": False, "reason": "no_quota"}
+    will_send = min(n, state["remaining"])
+    return {
+        "will_send": will_send,
+        "excluded": max(0, n - will_send),
+        "limited": will_send < n,
+        "state": state,
+        "is_admin": False,
+    }
+
+
 @api_router.get("/broadcasts/templates")
 async def broadcasts_list_templates(
     line_id: str,
@@ -7985,6 +8232,28 @@ async def broadcasts_create_campaign(
     if target_count == 0:
         raise HTTPException(status_code=400, detail="Sin contactos para esta campaña (audiencia/segmento vacío)")
 
+    # Quota enforcement: cap target_count by the user's remaining quota for the period
+    quota_state = await _quota_get_state(current_user)
+    quota_truncated = False
+    quota_excluded = 0
+    if quota_state["quota"] > 0:
+        remaining = quota_state["remaining"]
+        if remaining <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Sin cupo de mensajes este mes ({quota_state['used']}/{quota_state['quota']}). Pedile a un admin que recargue créditos extras.",
+            )
+        if target_count > remaining:
+            quota_excluded = target_count - remaining
+            quota_truncated = True
+            target_count = remaining
+    elif quota_state["base"] == 0 and current_user.get("role") != "admin":
+        # No quota assigned at all → block (admins are unlimited)
+        raise HTTPException(
+            status_code=403,
+            detail="Tu usuario no tiene cupo de mensajes masivos asignado. Pedile a un admin que te asigne uno.",
+        )
+
     status = "scheduled" if payload.scheduled_at else "draft"
     campaign = {
         "id": str(uuid.uuid4()),
@@ -8002,6 +8271,8 @@ async def broadcasts_create_campaign(
         "resend_template_name": payload.resend_template_name,
         "status": status,
         "target_count": target_count,
+        "quota_truncated": quota_truncated,
+        "quota_excluded": quota_excluded,
         "stats": {"sent": 0, "delivered": 0, "read": 0, "failed": 0, "replied": 0, "skipped_optout": 0},
         "created_by": current_user.get("id"),
         "created_by_email": current_user.get("email"),
@@ -8017,7 +8288,12 @@ async def broadcasts_create_campaign(
         # Spawn a sleeper task that wakes at scheduled_at and starts the worker
         asyncio.create_task(_csv_campaign_scheduler(campaign["id"]))
 
-    return {"campaign": campaign}
+    return {
+        "campaign": campaign,
+        "quota_truncated": quota_truncated,
+        "quota_excluded": quota_excluded,
+        "quota_state": quota_state,
+    }
 
 
 @api_router.get("/broadcasts/campaigns")
@@ -8216,6 +8492,25 @@ async def _csv_campaign_worker(campaign_id: str):
                 {"id": campaign_id}, {"$set": {"paused_reason": None}}
             )
 
+            # Quota enforcement at send-time. Re-check on every iteration so a
+            # mid-campaign month rollover or admin top-up applies live.
+            owner_email = c.get("created_by_email")
+            owner_user = None
+            if owner_email:
+                owner_user = await db.users.find_one({"email": owner_email}, {"_id": 0})
+            if owner_user and owner_user.get("role") != "admin":
+                qstate = await _quota_get_state(owner_user)
+                if qstate["quota"] > 0 and qstate["used"] >= qstate["quota"]:
+                    await db.broadcast_campaigns.update_one(
+                        {"id": campaign_id},
+                        {"$set": {
+                            "status": "paused",
+                            "paused_reason": f"Cupo mensual alcanzado ({qstate['used']}/{qstate['quota']}). Pedile a un admin que recargue.",
+                        }}
+                    )
+                    logger.info(f"campaign {campaign_id} paused: monthly quota reached for {owner_email}")
+                    return
+
             # Build template variables
             tpl_vars: List[str] = []
             for col in var_mapping:
@@ -8263,6 +8558,10 @@ async def _csv_campaign_worker(campaign_id: str):
             await db.broadcast_messages.insert_one(doc)
             inc = {"stats.sent": 1} if success else {"stats.failed": 1}
             await db.broadcast_campaigns.update_one({"id": campaign_id}, {"$inc": inc})
+
+            # Increment quota usage on successful send (skip admins — unlimited)
+            if success and owner_email and owner_user and owner_user.get("role") != "admin":
+                await _quota_increment(owner_email, by=1)
 
             # Auto-pause on Meta rate-limit (#80007 / #131056) or auth error
             if err and any(k in err for k in ("131056", "80007", "rate", "OAuthException")):
