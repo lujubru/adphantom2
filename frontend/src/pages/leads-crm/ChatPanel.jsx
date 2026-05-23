@@ -92,10 +92,13 @@ export const ChatPanel = ({
     // Polling de mensajes: pausa cuando la pestaña está oculta (ahorra egress
     // Railway). Catch-up inmediato al volver al foco. Intervalo 10s (antes 5s).
     let interval = null;
+    let lastTickAt = Date.now();
     const POLL_MS = 10000;
+    const STALE_MS = 8000;
+    const tick = () => { lastTickAt = Date.now(); loadMessages(); };
     const start = () => {
       if (interval) return;
-      interval = setInterval(loadMessages, POLL_MS);
+      interval = setInterval(tick, POLL_MS);
     };
     const stop = () => {
       if (interval) { clearInterval(interval); interval = null; }
@@ -103,19 +106,32 @@ export const ChatPanel = ({
 
     if (document.visibilityState === 'visible') start();
 
+    // visibilitychange no es 100% confiable en Safari iOS / Chrome Android.
+    // Reforzamos con focus / pageshow / online para garantizar catch-up.
+    const catchUp = () => {
+      if (document.visibilityState !== 'visible') return;
+      const now = Date.now();
+      if (now - lastTickAt >= STALE_MS) tick();
+      start();
+    };
     const onVisibility = () => {
       if (document.visibilityState === 'visible') {
-        loadMessages();
-        start();
+        catchUp();
       } else {
         stop();
       }
     };
     document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('focus', catchUp);
+    window.addEventListener('pageshow', catchUp);
+    window.addEventListener('online', catchUp);
 
     return () => {
       stop();
       document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('focus', catchUp);
+      window.removeEventListener('pageshow', catchUp);
+      window.removeEventListener('online', catchUp);
     };
   }, [loadMessages, loadAdPreview]);
 
