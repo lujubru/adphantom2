@@ -124,14 +124,141 @@ const FunnelDisplay = ({ funnel, conversionRates, totals, period, onFilterChange
 
 // ─── Lines Manager (admin only) ────────────────────────────────────
 
+const WaRegisterBlock = ({ lineId, phoneNumber, alreadyRegisteredAt, wabaIdFromForm, tokenFromForm }) => {
+  const [busy, setBusy] = useState(false);
+  const [method, setMethod] = useState('SMS');
+  const [otp, setOtp] = useState('');
+  const [pin, setPin] = useState('');
+  const [showRegister, setShowRegister] = useState(false);
+  const [subscribing, setSubscribing] = useState(false);
+
+  const subscribeApp = async () => {
+    if (!wabaIdFromForm) {
+      toast.error('Pegá el WABA ID en el campo de arriba antes de suscribir', { duration: 6000 });
+      return;
+    }
+    setSubscribing(true);
+    try {
+      const { data } = await api.post(`/crm/lines/${lineId}/wa-subscribe-app`, {
+        waba_id: wabaIdFromForm,
+        token: tokenFromForm,
+      });
+      const count = (data?.subscribed_apps || []).length;
+      toast.success(`✅ WABA suscrita a la App. ${count} app${count === 1 ? '' : 's'} suscrita${count === 1 ? '' : 's'}. Ya deberían empezar a llegar webhooks.`, { duration: 10000, style: { maxWidth: '520px' } });
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || 'Error suscribiendo WABA', { duration: 15000, style: { maxWidth: '520px' } });
+    } finally { setSubscribing(false); }
+  };
+
+  const requestCode = async () => {
+    setBusy(true);
+    try {
+      await api.post(`/crm/lines/${lineId}/wa-request-code`, { code_method: method, language: 'es' });
+      toast.success(`Código ${method} enviado a ${phoneNumber}. Revisá el celular.`, { duration: 8000 });
+      setShowRegister(true);
+    } catch (e) {
+      const detail = e?.response?.data?.detail || 'Error pidiendo código';
+      toast.error(detail, { duration: 12000, style: { maxWidth: '520px' } });
+      // Si Meta dijo "ya verificado", igual mostrar el register form (sin OTP)
+      if (detail.includes('ya está verificado') || detail.includes('136025')) setShowRegister(true);
+    } finally { setBusy(false); }
+  };
+
+  const doRegister = async () => {
+    if (!/^\d{6}$/.test(pin)) { toast.error('El PIN debe ser de 6 dígitos numéricos'); return; }
+    setBusy(true);
+    try {
+      const body = { pin };
+      if (otp.trim()) body.code = otp.trim();
+      await api.post(`/crm/lines/${lineId}/wa-register`, body);
+      toast.success('✅ Número registrado. En 1-2 minutos pasa a "Conectado" en Meta y queda listo para recibir mensajes.', { duration: 12000, style: { maxWidth: '520px' } });
+      setShowRegister(false);
+      setOtp(''); setPin('');
+    } catch (e) {
+      const detail = e?.response?.data?.detail || 'Error registrando';
+      toast.error(detail, { duration: 15000, style: { maxWidth: '520px' } });
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="pt-2 border-t border-slate-600">
+      <p className="text-xs text-slate-400 mb-2">🔓 Registro del número en WhatsApp Cloud API</p>
+
+      {/* Subscribe WABA to App — must run for webhooks to be delivered */}
+      <div className="mb-3 rounded border border-purple-700/40 bg-purple-900/15 p-2">
+        <p className="text-[11px] text-slate-300 leading-snug mb-2">
+          🛰️ <strong>Suscribir WABA a la App de Meta</strong> — paso silencioso que Meta NO hace solo cuando agregás un número. Si los mensajes "llegan al teléfono" pero no aparecen en el CRM, casi siempre es esto.
+        </p>
+        <Button type="button" size="sm" onClick={subscribeApp} disabled={subscribing} className="bg-purple-600 hover:bg-purple-500 text-white text-xs h-8 w-full" data-testid="wa-subscribe-app-btn">
+          {subscribing ? 'Suscribiendo...' : '🛰️ Suscribir WABA a la App (activar webhooks)'}
+        </Button>
+      </div>
+
+      {alreadyRegisteredAt ? (
+        <div className="text-[11px] text-emerald-400 bg-emerald-900/15 border border-emerald-700/30 rounded p-2 mb-2">
+          ✅ Registrado el {new Date(alreadyRegisteredAt).toLocaleDateString('es-AR')}. Si Meta lo muestra "Pendiente", podés volver a registrarlo abajo.
+        </div>
+      ) : (
+        <p className="text-[11px] text-amber-400 bg-amber-900/15 border border-amber-700/30 rounded p-2 mb-2">
+          ⚠️ Si en Meta aparece "Pendiente" pese a haber verificado el número, usá los botones de abajo.
+        </p>
+      )}
+
+      <div className="flex items-center gap-2 mb-2 flex-wrap">
+        <select value={method} onChange={e => setMethod(e.target.value)} className="bg-slate-700 border border-slate-600 rounded h-8 px-2 text-xs text-white">
+          <option value="SMS">📩 SMS</option>
+          <option value="VOICE">📞 Llamada</option>
+        </select>
+        <Button type="button" size="sm" onClick={requestCode} disabled={busy} className="bg-blue-600 hover:bg-blue-500 text-white text-xs h-8" data-testid="wa-request-code-btn">
+          1. Pedir código a {phoneNumber}
+        </Button>
+        <Button type="button" size="sm" onClick={() => setShowRegister(true)} disabled={busy} variant="outline" className="border-slate-600 text-slate-300 text-xs h-8" data-testid="wa-skip-otp-btn">
+          Ya verificado → Registrar
+        </Button>
+      </div>
+
+      {showRegister && (
+        <div className="rounded border border-blue-700/40 bg-blue-900/15 p-2 space-y-2" data-testid="wa-register-form">
+          <div className="grid grid-cols-2 gap-2">
+            <Input
+              placeholder="OTP (6 dígitos del SMS)"
+              value={otp}
+              onChange={e => setOtp(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              maxLength={6}
+              className="bg-slate-700 border-slate-600 text-xs font-mono"
+              data-testid="wa-otp-input"
+            />
+            <Input
+              placeholder="PIN nuevo (6 dígitos, inventalo)"
+              value={pin}
+              onChange={e => setPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              maxLength={6}
+              className="bg-slate-700 border-slate-600 text-xs font-mono"
+              data-testid="wa-pin-input"
+            />
+          </div>
+          <p className="text-[10px] text-slate-400 leading-snug">
+            ⚠️ Anotate el PIN — Meta te lo va a pedir si después querés mover el número. Si el número estaba en API y conoces el PIN viejo, usá ese y dejá el OTP vacío.
+          </p>
+          <Button type="button" size="sm" onClick={doRegister} disabled={busy || !pin} className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs h-8 w-full" data-testid="wa-register-btn">
+            2. Registrar número en API
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+};
+
 const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
   const [showCreate, setShowCreate] = useState(false);
   const [editingLine, setEditingLine] = useState(null);
   const [saving, setSaving] = useState(false);
+  const [numberPicker, setNumberPicker] = useState({ open: false, numbers: [] });
   const emptyForm = {
     name: '', line_type: 'publi', whatsapp_number: '',
     whatsapp_token: '', phone_number_id: '', verify_token: '',
     whatsapp_business_account_id: '',
+    webhook_parent_line_id: '',
     meta_access_token: '', meta_pixel_id: '', description: ''
   };
   const [form, setForm] = useState(emptyForm);
@@ -146,6 +273,7 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
       phone_number_id: line.phone_number_id || '',
       verify_token: line.verify_token || '',
       whatsapp_business_account_id: line.whatsapp_business_account_id || '',
+      webhook_parent_line_id: line.webhook_parent_line_id || '',
       meta_access_token: line.meta_access_token || '',
       meta_pixel_id: line.meta_pixel_id || '',
       description: line.description || '',
@@ -159,10 +287,19 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
     if (!form.name || !form.whatsapp_number) { toast.error('Nombre y número son requeridos'); return; }
     setSaving(true);
     try {
-      if (editingLine) { await api.put(`/crm/lines/${editingLine.id}`, form); toast.success('Línea actualizada'); }
-      else { await api.post('/crm/lines', form); toast.success('Línea creada'); }
+      // Normalize: empty parent id → null (so backend doesn't try to lookup '')
+      const payload = {
+        ...form,
+        webhook_parent_line_id: form.webhook_parent_line_id || null,
+      };
+      if (editingLine) { await api.put(`/crm/lines/${editingLine.id}`, payload); toast.success('Línea actualizada'); }
+      else { await api.post('/crm/lines', payload); toast.success('Línea creada'); }
       setShowCreate(false); setEditingLine(null); resetForm(); onRefresh();
-    } catch { toast.error('Error guardando línea'); }
+    } catch (err) {
+      const detail = err?.response?.data?.detail || err?.message || 'Error desconocido';
+      toast.error(`Error guardando línea: ${detail}`, { duration: 8000, style: { maxWidth: '480px' } });
+      console.error('saveLine error', err);
+    }
     finally { setSaving(false); }
   };
 
@@ -172,8 +309,15 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
     catch { toast.error('Error eliminando línea'); }
   };
 
+  // Returns the webhook URL the user must paste in Meta for a given line.
+  // If the line shares webhook with a parent, returns the parent's URL.
+  const webhookUrlFor = (line) => {
+    const ownerId = line?.webhook_parent_line_id || line?.id;
+    return `${BACKEND_URL}/api/crm/webhook/${ownerId}`;
+  };
+
   const copyWebhook = (line) => {
-    navigator.clipboard.writeText(`${BACKEND_URL}/api/crm/webhook/${line.id}`);
+    navigator.clipboard.writeText(webhookUrlFor(line));
     toast.success('URL copiada');
   };
 
@@ -201,25 +345,131 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
           </div>
           <div className="pt-2 border-t border-slate-600">
             <p className="text-xs text-slate-400 mb-2">📱 WhatsApp Business API</p>
+
+            {/* Webhook sharing — multi-line con UNA sola Meta App */}
+            {(() => {
+              const eligibleParents = lines.filter(l => l.id !== editingLine?.id && l.verify_token && l.phone_number_id);
+              const parent = form.webhook_parent_line_id ? lines.find(l => l.id === form.webhook_parent_line_id) : null;
+              const apiBase = process.env.REACT_APP_BACKEND_URL || '';
+              const webhookOwnerId = parent?.id || editingLine?.id;
+              const webhookUrl = webhookOwnerId ? `${apiBase}/api/crm/webhook/${webhookOwnerId}` : '';
+              return (
+                <div className="mb-3 rounded border border-blue-700/40 bg-blue-900/15 p-2">
+                  <label className="text-[11px] text-slate-300 font-medium block mb-1">
+                    🔗 Compartir webhook con otra línea (opcional)
+                  </label>
+                  <select
+                    value={form.webhook_parent_line_id || ''}
+                    onChange={e => setForm({ ...form, webhook_parent_line_id: e.target.value })}
+                    className="w-full bg-slate-700 border border-slate-600 rounded h-8 px-2 text-xs text-white"
+                    data-testid="line-webhook-parent-select"
+                  >
+                    <option value="">— Webhook propio (línea nueva en Meta) —</option>
+                    {eligibleParents.map(l => (
+                      <option key={l.id} value={l.id}>Usar webhook de: {l.name}</option>
+                    ))}
+                  </select>
+                  {parent && (
+                    <div className="mt-2 space-y-1 text-[11px] text-slate-400 leading-snug">
+                      <p>✅ Esta línea va a heredar el <strong>Verify Token</strong>, el <strong>WhatsApp Token</strong> y el <strong>WABA ID</strong> de <span className="text-blue-300">{parent.name}</span>.</p>
+                      <p>📌 En Meta Business Manager, agregá este número al mismo <strong>App</strong> que tiene <span className="text-blue-300">{parent.name}</span> y pegá su <strong>Phone Number ID</strong> abajo.</p>
+                      <div className="mt-1.5 flex items-center gap-1">
+                        <span className="text-slate-500 shrink-0">Webhook URL:</span>
+                        <code className="flex-1 px-1.5 py-0.5 rounded bg-slate-800 text-blue-300 font-mono text-[10px] truncate">{webhookUrl}</code>
+                        <button
+                          type="button"
+                          onClick={() => { navigator.clipboard?.writeText(webhookUrl); toast.success('URL copiada'); }}
+                          className="text-blue-400 hover:text-blue-300 px-1"
+                          title="Copiar URL"
+                          data-testid="copy-webhook-url-btn"
+                        >📋</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
             <Input placeholder="Número WhatsApp (ej: 5491155554444)" value={form.whatsapp_number} onChange={e => setForm({ ...form, whatsapp_number: e.target.value })} className="bg-slate-700 border-slate-600 mb-2" />
             <div className="grid grid-cols-2 gap-2">
-              <Input placeholder="WhatsApp Token" value={form.whatsapp_token} onChange={e => setForm({ ...form, whatsapp_token: e.target.value })} className="bg-slate-700 border-slate-600 text-xs" />
-              <Input placeholder="Phone Number ID" value={form.phone_number_id} onChange={e => setForm({ ...form, phone_number_id: e.target.value })} className="bg-slate-700 border-slate-600 text-xs" />
+              <Input
+                placeholder={form.webhook_parent_line_id ? 'Heredado del padre' : 'WhatsApp Token'}
+                value={form.whatsapp_token}
+                onChange={e => setForm({ ...form, whatsapp_token: e.target.value })}
+                className="bg-slate-700 border-slate-600 text-xs disabled:opacity-50"
+                disabled={!!form.webhook_parent_line_id}
+              />
+              <div className="relative">
+                <Input placeholder="Phone Number ID (único por número)" value={form.phone_number_id} onChange={e => setForm({ ...form, phone_number_id: e.target.value })} className="bg-slate-700 border-slate-600 text-xs pr-8" />
+                {form.webhook_parent_line_id && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        const { data } = await api.post('/crm/wa-list-numbers', { parent_line_id: form.webhook_parent_line_id });
+                        const nums = data?.numbers || [];
+                        if (nums.length === 0) { toast.error('La WABA no tiene números registrados'); return; }
+                        setNumberPicker({ open: true, numbers: nums });
+                      } catch (e) {
+                        toast.error(e?.response?.data?.detail || 'Error listando números');
+                      }
+                    }}
+                    className="absolute right-1 top-1/2 -translate-y-1/2 px-1.5 py-0.5 rounded bg-blue-600 hover:bg-blue-500 text-white text-[10px]"
+                    title="Listar números de la WABA padre"
+                    data-testid="line-list-numbers-btn"
+                  >📞</button>
+                )}
+              </div>
             </div>
-            <Input placeholder="Verify Token (webhook)" value={form.verify_token} onChange={e => setForm({ ...form, verify_token: e.target.value })} className="bg-slate-700 border-slate-600 text-xs mt-2" />
+            <Input
+              placeholder={form.webhook_parent_line_id ? 'Verify Token heredado del padre' : 'Verify Token (webhook)'}
+              value={form.verify_token}
+              onChange={e => setForm({ ...form, verify_token: e.target.value })}
+              className="bg-slate-700 border-slate-600 text-xs mt-2 disabled:opacity-50"
+              disabled={!!form.webhook_parent_line_id}
+            />
             <div className="mt-2">
               <Input
                 data-testid="line-waba-id-input"
-                placeholder="WhatsApp Business Account ID (WABA ID) — requerido para Broadcasts"
+                placeholder={form.webhook_parent_line_id ? 'WABA ID del nuevo número (puede ser distinto al del padre)' : 'WhatsApp Business Account ID (WABA ID) — requerido para Broadcasts'}
                 value={form.whatsapp_business_account_id}
                 onChange={e => setForm({ ...form, whatsapp_business_account_id: e.target.value })}
                 className="bg-slate-700 border-slate-600 text-xs"
               />
               <p className="text-[10px] text-slate-500 mt-1 leading-snug">
-                💡 Obtenelo en <a href="https://business.facebook.com/wa/manage/home/" target="_blank" rel="noreferrer" className="text-blue-400 hover:underline">Meta Business Manager → Cuentas de WhatsApp → Configuración</a>. Aparece como "ID de la cuenta" (numérico, distinto al Phone Number ID). Necesario para enviar campañas masivas con plantillas.
+                💡 Obtenelo en <a href="https://business.facebook.com/wa/manage/home/" target="_blank" rel="noreferrer" className="text-blue-400 hover:underline">Meta Business Manager → Cuentas de WhatsApp → Configuración</a>. Aparece como "ID de la cuenta" (numérico, distinto al Phone Number ID). {form.webhook_parent_line_id && <span className="text-amber-400">⚠️ Si el nuevo número está en otra WABA, ponele su WABA propio acá (si dejás vacío hereda del padre).</span>}
               </p>
             </div>
           </div>
+
+          {/* WhatsApp Cloud API — number registration */}
+          {form.phone_number_id && form.whatsapp_token && (
+            editingLine ? (
+              <WaRegisterBlock
+                lineId={editingLine.id}
+                phoneNumber={form.whatsapp_number}
+                alreadyRegisteredAt={editingLine.wa_registered_at}
+                wabaIdFromForm={
+                  form.whatsapp_business_account_id ||
+                  (form.webhook_parent_line_id
+                    ? (lines.find(l => l.id === form.webhook_parent_line_id)?.whatsapp_business_account_id || '')
+                    : '')
+                }
+                tokenFromForm={form.whatsapp_token}
+              />
+            ) : (
+              <div className="pt-2 border-t border-slate-600">
+                <p className="text-xs text-slate-400 mb-2">🔓 Registro del número en WhatsApp Cloud API</p>
+                <div className="rounded border border-blue-700/40 bg-blue-900/15 p-2.5">
+                  <p className="text-[11px] text-blue-300 leading-snug">
+                    💡 Primero <strong>guardá la línea</strong> con "Crear". Después abrila para editar y vas a ver los botones para:
+                    <br />• 🛰️ Suscribir WABA a la App de Meta
+                    <br />• 📩 Pedir código y registrar el número
+                  </p>
+                </div>
+              </div>
+            )
+          )}
           <div className="pt-2 border-t border-slate-600">
             <p className="text-xs text-slate-400 mb-2">📊 Meta Pixel</p>
             <div className="grid grid-cols-2 gap-2">
@@ -232,6 +482,54 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
             <Button type="submit" size="sm" disabled={saving} className="bg-emerald-600 hover:bg-emerald-700">{saving ? 'Guardando...' : editingLine ? 'Actualizar' : 'Crear Línea'}</Button>
           </div>
         </form>
+      )}
+
+      {/* Number picker modal — shows phone numbers of the parent's WABA */}
+      {numberPicker.open && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={() => setNumberPicker({ open: false, numbers: [] })}>
+          <div className="bg-slate-800 border border-slate-700 rounded-lg max-w-lg w-full max-h-[80vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+            <div className="sticky top-0 bg-slate-800 border-b border-slate-700 p-3 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-white">📞 Elegí el número del nuevo Phone Number ID</h3>
+              <button onClick={() => setNumberPicker({ open: false, numbers: [] })} className="text-slate-400 hover:text-white"><X className="w-4 h-4" /></button>
+            </div>
+            <div className="p-2 space-y-1">
+              {numberPicker.numbers.map(n => {
+                const verified = n.code_verification_status === 'VERIFIED';
+                return (
+                  <button
+                    key={n.id}
+                    type="button"
+                    onClick={() => {
+                      setForm({
+                        ...form,
+                        phone_number_id: n.id,
+                        whatsapp_number: form.whatsapp_number || (n.display_phone_number || '').replace(/\D/g, ''),
+                      });
+                      setNumberPicker({ open: false, numbers: [] });
+                      toast.success(`Seleccionado: ${n.display_phone_number}`);
+                    }}
+                    className="w-full text-left p-2.5 rounded hover:bg-blue-500/10 border border-transparent hover:border-blue-700/40"
+                    data-testid={`number-picker-option-${n.id}`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm text-white truncate">{n.display_phone_number || '(sin número)'}</p>
+                        <p className="text-[10px] text-slate-500 font-mono truncate">ID: {n.id}</p>
+                        {n.verified_name && <p className="text-[10px] text-slate-400 truncate">{n.verified_name}</p>}
+                      </div>
+                      <div className="flex flex-col items-end gap-1 shrink-0">
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded ${verified ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-500/20 text-amber-300'}`}>
+                          {verified ? '✅ Verificado' : '⏳ Pendiente'}
+                        </span>
+                        {n.quality_rating && <span className="text-[10px] text-slate-500">Q: {n.quality_rating}</span>}
+                      </div>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
       )}
 
       <div className="divide-y divide-slate-700 max-h-[400px] overflow-y-auto">
@@ -267,10 +565,20 @@ const LinesManager = ({ lines, onRefresh, onSelectLine, selectedLineId }) => {
               {line.verify_token && (
                 <div className="mt-2 p-2 bg-slate-700/50 rounded text-xs">
                   <div className="flex items-center justify-between mb-1">
-                    <span className="text-slate-400">Webhook URL:</span>
+                    <span className="text-slate-400">
+                      Webhook URL{line.webhook_parent_line_id ? ' (compartido)' : ''}:
+                    </span>
                     <button onClick={e => { e.stopPropagation(); copyWebhook(line); }} className="text-blue-400 hover:text-blue-300 flex items-center gap-1"><Copy className="w-3 h-3" /> Copiar</button>
                   </div>
-                  <code className="text-slate-300 break-all">{BACKEND_URL}/api/crm/webhook/{line.id}</code>
+                  <code className="text-slate-300 break-all">{webhookUrlFor(line)}</code>
+                  {line.webhook_parent_line_id && (() => {
+                    const parent = lines.find(l => l.id === line.webhook_parent_line_id);
+                    return (
+                      <p className="text-[10px] text-blue-400 mt-1">
+                        🔗 Hereda de <strong>{parent?.name || line.webhook_parent_line_id}</strong>
+                      </p>
+                    );
+                  })()}
                   <p className="text-slate-500 mt-1">Verify Token: <code className="text-slate-300">{line.verify_token}</code></p>
                 </div>
               )}
@@ -700,11 +1008,18 @@ export default function LeadsCRM() {
       const triggeredLeads = [];
       list.forEach(l => {
         const count = Number(l.unread_count || 0);
-        const hasUnread = count > 0 || l.has_unread_messages;
-        if (hasUnread) {
+        // Sólo consideramos "unread" cuando hay count real > 0. Antes usábamos
+        // also `has_unread_messages` como respaldo, pero generaba notificaciones
+        // fantasma cuando el backend devolvía count=0 con el flag aún true
+        // (race-condition entre marcar como leído y refresco del flag).
+        if (count > 0) {
           currentUnreadMap.set(l.id, count);
+          const wasInMap = prevUnreadMap.current.has(l.id);
           const prevCount = prevUnreadMap.current.get(l.id) || 0;
-          if (count > prevCount || (prevCount === 0 && hasUnread)) {
+          // Disparar SOLO cuando:
+          // - El lead no estaba en el map previo (nuevo unread), o
+          // - El contador subió (llegó un mensaje nuevo encima de los previos).
+          if (!wasInMap || count > prevCount) {
             triggeredLeads.push(l);
           }
         }
@@ -753,14 +1068,26 @@ export default function LeadsCRM() {
 
   useEffect(() => { loadLeads(); loadLines(); loadFunnel(); }, [loadLeads, loadLines, loadFunnel]);
 
+  // Reset del tracking de unread al cambiar de línea: el set de leads visibles
+  // cambia, así que prevUnreadMap quedaría obsoleto y dispararía sonidos
+  // fantasma al "redescubrir" leads de otra línea.
+  useEffect(() => {
+    prevUnreadMap.current = new Map();
+    firstLoadDone.current = false;
+  }, [selectedLineId]);
+
   useEffect(() => {
     // Polling de leads/funnel: pausa cuando la pestaña está oculta para
     // ahorrar egress (Railway). Cuando la pestaña vuelve a foco, refresca al
     // toque. Intervalo 10s (antes 5s) — sigue siendo casi-real-time para CRM.
     let interval = null;
+    let lastTickAt = Date.now();
     const POLL_MS = 10000;
+    // Si el navegador pausa setInterval (background tabs en Chrome/Safari),
+    // al volver al foreground forzamos catch-up si pasó más que el intervalo.
+    const STALE_MS = 8000;
 
-    const tick = () => { loadLeads(); loadFunnel(); };
+    const tick = () => { lastTickAt = Date.now(); loadLeads(); loadFunnel(); };
     const start = () => {
       if (interval) return;
       interval = setInterval(tick, POLL_MS);
@@ -771,20 +1098,36 @@ export default function LeadsCRM() {
 
     if (document.visibilityState === 'visible') start();
 
+    // Catch-up unificado: dispara fetch inmediato si pasó suficiente tiempo
+    // desde el último tick. Se invoca desde visibilitychange + focus +
+    // pageshow porque algunos navegadores (Safari iOS, Chrome Android) no
+    // disparan visibilitychange de forma confiable al volver de background.
+    const catchUp = () => {
+      if (document.visibilityState !== 'visible') return;
+      const now = Date.now();
+      if (now - lastTickAt >= STALE_MS) {
+        tick();
+      }
+      start();
+    };
     const onVisibility = () => {
       if (document.visibilityState === 'visible') {
-        // Catch-up inmediato al volver a la pestaña, después reanudar polling
-        tick();
-        start();
+        catchUp();
       } else {
         stop();
       }
     };
     document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('focus', catchUp);
+    window.addEventListener('pageshow', catchUp);
+    window.addEventListener('online', catchUp);
 
     return () => {
       stop();
       document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('focus', catchUp);
+      window.removeEventListener('pageshow', catchUp);
+      window.removeEventListener('online', catchUp);
     };
   }, [loadLeads, loadFunnel]);
 
