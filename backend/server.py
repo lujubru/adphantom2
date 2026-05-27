@@ -7841,6 +7841,7 @@ _broadcast_workers: Dict[str, "asyncio.Task"] = {}
 
 class FinanzasBonusRateUpdate(BaseModel):
     percentage: float  # 0..100
+    apply_retroactive: bool = False  # si True, aplica a TODO el histórico (borra versiones previas)
 
 
 class FinanzasExpenseCreate(BaseModel):
@@ -7882,8 +7883,10 @@ def _finanzas_resolve_date_range(
     start_date: Optional[str],
     end_date: Optional[str],
 ) -> tuple:
-    """Resuelve un rango de fechas YYYY-MM-DD (inclusive) según el filtro."""
-    today = datetime.now(timezone.utc).date()
+    """Resuelve un rango de fechas YYYY-MM-DD (inclusive) según el filtro.
+    Usa timezone Argentina (UTC-3) para que coincida con el embudo de conversión."""
+    AR_OFFSET = timedelta(hours=-3)
+    today = (datetime.now(timezone.utc) + AR_OFFSET).date()
     if filter_type == "custom" and start_date and end_date:
         return start_date, end_date
     if filter_type == "diario":
@@ -7907,8 +7910,10 @@ def _finanzas_resolve_date_range(
 
 
 async def _finanzas_ingresos_by_day(user_id: str, start_iso: str, end_iso: str) -> Dict[str, float]:
-    """Suma de conversion_value por día (YYYY-MM-DD) de leads marcados como `valido`
-    asignados a este cajero. Si el cajero tiene `line_ids`, filtra por esas líneas."""
+    """Suma de charge_amount por día (YYYY-MM-DD) de leads marcados como `valido`
+    asignados a este cajero. Si el cajero tiene `line_ids`, filtra por esas líneas.
+    NOTA: usa `charge_amount` + `created_at` igual que el embudo de conversión
+    (`/api/crm/funnel/stats`) para mantener consistencia con lo que el cajero ve."""
     user = await db.users.find_one({"id": user_id}, {"_id": 0, "line_ids": 1, "role": 1})
     line_filter: Dict = {}
     if user and user.get("role") not in ("admin", "superadmin"):
@@ -7922,17 +7927,17 @@ async def _finanzas_ingresos_by_day(user_id: str, start_iso: str, end_iso: str) 
     query = {
         **line_filter,
         "status": "valido",
-        "classified_at": {"$gte": start_dt, "$lte": end_dt},
-        "conversion_value": {"$ne": None, "$gt": 0},
+        "created_at": {"$gte": start_dt, "$lte": end_dt},
+        "charge_amount": {"$gt": 0},
     }
     by_day: Dict[str, float] = {}
-    cursor = db.crm_leads.find(query, {"_id": 0, "classified_at": 1, "conversion_value": 1})
+    cursor = db.crm_leads.find(query, {"_id": 0, "created_at": 1, "charge_amount": 1})
     async for lead in cursor:
-        d = (lead.get("classified_at") or "")[:10]
+        d = (lead.get("created_at") or "")[:10]
         if not d:
             continue
         try:
-            by_day[d] = by_day.get(d, 0.0) + float(lead.get("conversion_value") or 0)
+            by_day[d] = by_day.get(d, 0.0) + float(lead.get("charge_amount") or 0)
         except Exception:
             pass
     return by_day
@@ -7973,8 +7978,8 @@ async def _finanzas_get_cargas_list(user_id: str, start_iso: str, end_iso: str) 
     query = {
         **line_filter,
         "status": "valido",
-        "classified_at": {"$gte": start_dt, "$lte": end_dt},
-        "conversion_value": {"$ne": None, "$gt": 0},
+        "created_at": {"$gte": start_dt, "$lte": end_dt},
+        "charge_amount": {"$gt": 0},
     }
     # Cache de rates por día para no consultar 1 vez por carga (puede haber muchas)
     rate_cache: Dict[str, float] = {}
@@ -7988,14 +7993,14 @@ async def _finanzas_get_cargas_list(user_id: str, start_iso: str, end_iso: str) 
     cursor = db.crm_leads.find(
         query,
         {"_id": 0, "id": 1, "name": 1, "phone": 1, "line_id": 1, "line_name": 1,
-         "classified_at": 1, "conversion_value": 1},
-    ).sort("classified_at", -1)
+         "created_at": 1, "charge_amount": 1},
+    ).sort("created_at", -1)
     async for lead in cursor:
         try:
-            value = float(lead.get("conversion_value") or 0)
+            value = float(lead.get("charge_amount") or 0)
         except Exception:
             value = 0
-        day = (lead.get("classified_at") or "")[:10]
+        day = (lead.get("created_at") or "")[:10]
         rate = await _rate_for(day) if day else 0
         bono = round(value * rate / 100.0, 2) if rate > 0 else 0.0
         cargas.append({
@@ -8004,7 +8009,7 @@ async def _finanzas_get_cargas_list(user_id: str, start_iso: str, end_iso: str) 
             "phone": lead.get("phone"),
             "line_id": lead.get("line_id"),
             "line_name": lead.get("line_name"),
-            "classified_at": lead.get("classified_at"),
+            "classified_at": lead.get("created_at"),
             "monto": round(value, 2),
             "bono_pct": rate,
             "bono": bono,
@@ -8058,14 +8063,48 @@ async def finanzas_update_bonus_rate(
     payload: FinanzasBonusRateUpdate,
     current_user=Depends(get_current_user),
 ):
-    """Actualizar % de bono. El nuevo valor rige desde HOY (UTC).
-    Si ya hubo un cambio HOY, lo reemplaza en lugar de acumular."""
+    """Actualizar % de bono.
+    - PRIMERA vez (no hay rates históricos): aplica desde 2020-01-01 → se proyecta
+      a todo el histórico previo del cajero. Así obtiene una estimación retroactiva.
+    - Cambios POSTERIORES: el nuevo % rige desde HOY (los días previos conservan
+      el % que estuvo vigente en su momento — no se recalculan).
+    - Si ya hubo un cambio HOY mismo, lo reemplaza in-place sin acumular versiones."""
     pct = float(payload.percentage)
     if pct < 0 or pct > 200:
         raise HTTPException(status_code=400, detail="El bono debe estar entre 0 y 200%")
     user_id = current_user["id"]
     today = _today_utc_iso_date()
 
+    # Aplicar retroactivo: borra todo el histórico y crea uno único desde 2020.
+    # El cajero lo elige explícitamente con un checkbox en el modal.
+    if payload.apply_retroactive:
+        await db.cajero_bonus_rates.delete_many({"user_id": user_id})
+        await db.cajero_bonus_rates.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "percentage": pct,
+            "effective_from": "2020-01-01",
+            "effective_to": None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "retroactive": True,
+        })
+        return {"percentage": pct, "effective_from": "2020-01-01", "retroactive": True}
+
+    # ¿Es la primera vez? → también retro a todo el histórico previo.
+    has_history = await db.cajero_bonus_rates.find_one({"user_id": user_id})
+    if not has_history:
+        await db.cajero_bonus_rates.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "percentage": pct,
+            "effective_from": "2020-01-01",
+            "effective_to": None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "retroactive": True,
+        })
+        return {"percentage": pct, "effective_from": "2020-01-01", "retroactive": True}
+
+    # Ya tiene historial — comportamiento estándar (rige desde HOY)
     existing_today = await db.cajero_bonus_rates.find_one(
         {"user_id": user_id, "effective_from": today, "effective_to": None}
     )
@@ -8126,8 +8165,8 @@ async def finanzas_summary(
         total_cargas = await db.crm_leads.count_documents({
             **line_filter,
             "status": "valido",
-            "classified_at": {"$gte": f"{start_iso}T00:00:00", "$lte": f"{end_iso}T23:59:59.999"},
-            "conversion_value": {"$ne": None, "$gt": 0},
+            "created_at": {"$gte": f"{start_iso}T00:00:00", "$lte": f"{end_iso}T23:59:59.999"},
+            "charge_amount": {"$gt": 0},
         })
     avg_por_carga = round(total_ingresos / total_cargas, 2) if total_cargas > 0 else 0.0
 
