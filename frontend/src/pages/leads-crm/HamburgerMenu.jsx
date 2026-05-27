@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Menu, X, BarChart3, Sun, Moon, RefreshCw, Radio, LogOut,
-  Download, Bell, BellOff, Volume2, VolumeX, Megaphone, Wallet,
+  Download, Bell, BellOff, Volume2, VolumeX, Megaphone,
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
@@ -50,7 +50,6 @@ export const HamburgerMenu = ({
   pwaInstalled,
   onInstall,
   onBroadcast,
-  onFinanzas,
   onRefresh,
   onContactsExport,
   unreadCount = 0,
@@ -271,11 +270,6 @@ export const HamburgerMenu = ({
                   <span>Envío masivo</span>
                 </button>
               )}
-
-              <button onClick={action(onFinanzas)} className={`${itemBase} ${itemNormal}`} data-testid="hm-finanzas">
-                <Wallet className="w-4 h-4 shrink-0 text-emerald-400" />
-                <span>Finanzas</span>
-              </button>
 
               <button onClick={action(onContactsExport)} className={`${itemBase} ${itemNormal}`} data-testid="hm-contacts">
                 <Download className="w-4 h-4 shrink-0 text-cyan-400" />

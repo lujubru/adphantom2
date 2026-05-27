@@ -28,7 +28,7 @@ const fmtMoney = (n, cur) => {
   }
 };
 
-export const FinanzasModal = ({ onClose, currentUser }) => {
+export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
   const [filter, setFilter] = useState('mensual');
   const [customStart, setCustomStart] = useState('');
   const [customEnd, setCustomEnd] = useState('');
@@ -42,6 +42,7 @@ export const FinanzasModal = ({ onClose, currentUser }) => {
 
   // Bono editor
   const [bonusInput, setBonusInput] = useState('');
+  const [bonusApplyRetro, setBonusApplyRetro] = useState(false);
   const [savingBonus, setSavingBonus] = useState(false);
   const [bonusHistory, setBonusHistory] = useState([]);
 
@@ -93,10 +94,21 @@ export const FinanzasModal = ({ onClose, currentUser }) => {
       toast.error('El bono debe estar entre 0 y 200%');
       return;
     }
+    if (bonusApplyRetro && !window.confirm(
+      `¿Aplicar ${pct}% a TODO el histórico? Esto recalcula el bono de TODAS las cargas válidas previas (no se puede deshacer fácilmente).`
+    )) return;
     setSavingBonus(true);
     try {
-      await api.put('/finanzas/bonus-rate', { percentage: pct });
-      toast.success(`Bono actualizado al ${pct}% desde hoy`);
+      const { data } = await api.put('/finanzas/bonus-rate', {
+        percentage: pct,
+        apply_retroactive: bonusApplyRetro,
+      });
+      if (data.retroactive) {
+        toast.success(`Bono ${pct}% aplicado al histórico completo`);
+      } else {
+        toast.success(`Bono actualizado al ${pct}% desde hoy`);
+      }
+      setBonusApplyRetro(false);
       loadAll();
     } catch (err) {
       toast.error(err?.response?.data?.detail || 'Error guardando bono');
@@ -156,17 +168,23 @@ export const FinanzasModal = ({ onClose, currentUser }) => {
   const fichasEntregadas = totals.fichas_entregadas ?? 0;
 
   return (
-    <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-[60] flex items-center justify-center sm:p-4">
-      <div className="bg-slate-900 w-full h-full sm:rounded-xl sm:max-w-4xl sm:h-auto sm:max-h-[92vh] flex flex-col border border-slate-700 overflow-hidden">
+    <div className={inline
+      ? "w-full"
+      : "fixed inset-0 bg-black/70 backdrop-blur-sm z-[60] flex items-center justify-center sm:p-4"}>
+      <div className={inline
+        ? "bg-slate-900 w-full max-w-5xl mx-auto rounded-xl flex flex-col border border-slate-700 overflow-hidden"
+        : "bg-slate-900 w-full h-full sm:rounded-xl sm:max-w-4xl sm:h-auto sm:max-h-[92vh] flex flex-col border border-slate-700 overflow-hidden"}>
         <div className="px-4 py-3 border-b border-slate-800 flex items-center justify-between shrink-0">
           <div className="flex items-center gap-2">
             <Wallet className="w-5 h-5 text-emerald-400" />
             <h2 className="text-white font-semibold">Finanzas</h2>
             <span className="text-xs text-slate-500 hidden sm:inline">· {currentUser?.email}</span>
           </div>
-          <button onClick={onClose} className="text-slate-400 hover:text-white" data-testid="finanzas-close-btn">
-            <X className="w-5 h-5" />
-          </button>
+          {!inline && (
+            <button onClick={onClose} className="text-slate-400 hover:text-white" data-testid="finanzas-close-btn">
+              <X className="w-5 h-5" />
+            </button>
+          )}
         </div>
 
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
@@ -292,6 +310,15 @@ export const FinanzasModal = ({ onClose, currentUser }) => {
             <p className="text-[10px] text-slate-500 mt-1.5 leading-snug">
               El nuevo % rige desde HOY. Los días anteriores conservan el % que estuvo vigente cada día (no se recalculan).
             </p>
+            <label className="flex items-start gap-2 mt-2 cursor-pointer bg-amber-950/20 border border-amber-700/30 rounded p-2 hover:bg-amber-950/30 transition-colors">
+              <input type="checkbox" checked={bonusApplyRetro}
+                onChange={e => setBonusApplyRetro(e.target.checked)}
+                className="mt-0.5 cursor-pointer"
+                data-testid="finanzas-bonus-retroactive-toggle" />
+              <span className="text-[11px] text-amber-200 leading-snug">
+                <strong>Aplicar también al histórico</strong> (recalcula el bono de TODAS las cargas previas con este %). Útil para tener un estimado retroactivo de lo que venías regalando antes de configurar el sistema.
+              </span>
+            </label>
             {bonusHistory.length > 1 && (
               <details className="mt-2">
                 <summary className="text-[11px] text-slate-400 cursor-pointer hover:text-white">
@@ -471,12 +498,14 @@ export const FinanzasModal = ({ onClose, currentUser }) => {
           </div>
         </div>
 
-        <div className="p-3 border-t border-slate-800 shrink-0">
-          <Button onClick={onClose} className="w-full bg-slate-700 hover:bg-slate-600"
-            data-testid="finanzas-close-btn-bottom">
-            Cerrar
-          </Button>
-        </div>
+        {!inline && (
+          <div className="p-3 border-t border-slate-800 shrink-0">
+            <Button onClick={onClose} className="w-full bg-slate-700 hover:bg-slate-600"
+              data-testid="finanzas-close-btn-bottom">
+              Cerrar
+            </Button>
+          </div>
+        )}
       </div>
     </div>
   );

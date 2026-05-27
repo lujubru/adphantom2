@@ -5,7 +5,7 @@ import {
   DollarSign, UserCheck, AlertTriangle,
   GripVertical, Eye, Settings, Smartphone,
   ArrowRight, BarChart3, Zap, Copy, User, Target,
-  Megaphone, Radio, Wallet,
+  Megaphone, Radio,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -18,7 +18,6 @@ import { formatTime } from './leads-crm/utils';
 import { StatusBadge } from './leads-crm/StatusSelector';
 import { ChatPanel } from './leads-crm/ChatPanel';
 import { BroadcastModal } from './leads-crm/BroadcastModal';
-import { FinanzasModal } from './leads-crm/FinanzasModal';
 import { ChatListItem } from './leads-crm/ChatListItem';
 import { HamburgerMenu } from './leads-crm/HamburgerMenu';
 
@@ -718,7 +717,6 @@ export default function LeadsCRM() {
   }, []);
 
   const [broadcastOpen, setBroadcastOpen] = useState(false);
-  const [finanzasOpen, setFinanzasOpen] = useState(false);
 
   useEffect(() => {
     if ('serviceWorker' in navigator) {
@@ -1234,7 +1232,6 @@ export default function LeadsCRM() {
             pwaInstalled={pwaInstalled}
             onInstall={installPWA}
             onBroadcast={() => setBroadcastOpen(true)}
-            onFinanzas={() => setFinanzasOpen(true)}
             onRefresh={loadLeads}
             onContactsExport={async () => {
               try {
@@ -1320,15 +1317,6 @@ export default function LeadsCRM() {
                   <span className="hidden sm:inline">Masivo</span>
                 </button>
               )}
-              <button
-                onClick={() => setFinanzasOpen(true)}
-                title="Finanzas"
-                data-testid="finanzas-open-btn"
-                className="flex items-center gap-1 px-2 h-8 rounded-lg text-xs font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/25"
-              >
-                <Wallet className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Finanzas</span>
-              </button>
               <button onClick={loadLeads} className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors" data-testid="refresh-leads-btn">
                 <RefreshCw className="w-4 h-4" />
               </button>
@@ -1511,9 +1499,6 @@ export default function LeadsCRM() {
         {broadcastOpen && (
           <BroadcastModal lines={lines} currentUser={currentUser} onClose={() => setBroadcastOpen(false)} />
         )}
-        {finanzasOpen && (
-          <FinanzasModal currentUser={currentUser} onClose={() => setFinanzasOpen(false)} />
-        )}
       </div>
     );
   }
@@ -1546,14 +1531,6 @@ export default function LeadsCRM() {
                 <Radio className="w-4 h-4 mr-2" /> Envío masivo
               </Button>
             )}
-            <Button
-              onClick={() => setFinanzasOpen(true)}
-              variant="outline"
-              className="border-emerald-500/40 text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20"
-              data-testid="admin-finanzas-btn"
-            >
-              <Wallet className="w-4 h-4 mr-2" /> Finanzas
-            </Button>
             <Button onClick={() => { loadLeads(); loadLines(); loadFunnel(); }} variant="outline" className={darkMode ? "border-slate-600" : "border-gray-300"}>
               <RefreshCw className="w-4 h-4 mr-2" /> Actualizar
             </Button>
@@ -1619,9 +1596,6 @@ export default function LeadsCRM() {
       )}
       {broadcastOpen && (
         <BroadcastModal lines={lines} currentUser={currentUser} onClose={() => setBroadcastOpen(false)} />
-      )}
-      {finanzasOpen && (
-        <FinanzasModal currentUser={currentUser} onClose={() => setFinanzasOpen(false)} />
       )}
     </div>
   );

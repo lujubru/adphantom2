@@ -16,12 +16,28 @@ export const BroadcastModal = ({ lines, onClose, currentUser }) => {
   const [lineId, setLineId] = useState('');
   const [message, setMessage] = useState('Hola {nombre}, te comparto info desde {linea}');
   const [imageFile, setImageFile] = useState(null);
+  const [audioFile, setAudioFile] = useState(null);
+  const [audioAsVoice, setAudioAsVoice] = useState(true);
   const [minDelay, setMinDelay] = useState(4);
   const [maxDelay, setMaxDelay] = useState(10);
   const [maxPerHour, setMaxPerHour] = useState(300);
   const [loading, setLoading] = useState(false);
   const [activeBC, setActiveBC] = useState(null);
   const [targetStatus, setTargetStatus] = useState(['valido']);
+
+  // Preview URL del audio para reproducir antes de enviar
+  const audioPreviewUrl = useMemo(() => {
+    if (!audioFile) return null;
+    try { return URL.createObjectURL(audioFile); } catch { return null; }
+  }, [audioFile]);
+  useEffect(() => () => { if (audioPreviewUrl) URL.revokeObjectURL(audioPreviewUrl); }, [audioPreviewUrl]);
+
+  // El audio se renderiza como "nota de voz" (PTT) en WA solo si es ogg/opus
+  const audioIsPTTCompatible = useMemo(() => {
+    if (!audioFile) return false;
+    const n = (audioFile.name || '').toLowerCase();
+    return n.endsWith('.ogg') || n.endsWith('.opus') || (audioFile.type || '').includes('ogg');
+  }, [audioFile]);
 
   const loadActive = useCallback(async (id) => {
     try {
@@ -39,10 +55,15 @@ export const BroadcastModal = ({ lines, onClose, currentUser }) => {
   }, [activeBC?.id, activeBC?.status, loadActive]);
 
   const start = async () => {
-    if (!lineId || !message.trim()) { toast.error('Elegí línea y mensaje'); return; }
+    if (!lineId) { toast.error('Elegí línea'); return; }
+    if (!message.trim() && !imageFile && !audioFile) {
+      toast.error('Tenés que poner mensaje, imagen o audio');
+      return;
+    }
     setLoading(true);
     try {
       let imagePath = null;
+      let audioPath = null;
       if (imageFile) {
         const form = new FormData();
         form.append('file', imageFile);
@@ -51,11 +72,21 @@ export const BroadcastModal = ({ lines, onClose, currentUser }) => {
         });
         imagePath = up.filename;
       }
+      if (audioFile) {
+        const form = new FormData();
+        form.append('file', audioFile);
+        const { data: upA } = await api.post('/crm/broadcast/upload-audio', form, {
+          headers: { 'Content-Type': 'multipart/form-data' }
+        });
+        audioPath = upA.filename;
+      }
       const { data: bc } = await api.post('/crm/broadcast', {
         line_id: lineId,
         target_status: targetStatus,
         message,
         image_path: imagePath,
+        audio_path: audioPath,
+        audio_as_voice: audioAsVoice,
         min_delay_sec: minDelay,
         max_delay_sec: maxDelay,
         max_per_hour: maxPerHour,
@@ -131,6 +162,42 @@ export const BroadcastModal = ({ lines, onClose, currentUser }) => {
                 <input type="file" accept="image/*" onChange={e => setImageFile(e.target.files?.[0] || null)}
                   className="w-full mt-1 text-xs text-slate-300" data-testid="broadcast-image-input" />
               </div>
+              <div>
+                <label className="text-xs text-slate-400 uppercase font-semibold flex items-center gap-2">
+                  Audio (opcional)
+                  {audioFile && (
+                    <button type="button" onClick={() => setAudioFile(null)}
+                      className="text-[10px] text-red-400 hover:text-red-300 normal-case font-normal"
+                      data-testid="broadcast-audio-clear-btn">
+                      quitar
+                    </button>
+                  )}
+                </label>
+                <input type="file" accept="audio/*,.ogg,.opus,.mp3,.m4a,.aac,.amr,.wav,.webm"
+                  onChange={e => setAudioFile(e.target.files?.[0] || null)}
+                  className="w-full mt-1 text-xs text-slate-300" data-testid="broadcast-audio-input" />
+                {audioFile && (
+                  <div className="mt-2 space-y-2">
+                    <audio src={audioPreviewUrl} controls className="w-full h-9" data-testid="broadcast-audio-preview" />
+                    <div className="flex items-start gap-2 bg-slate-800/60 border border-slate-700 rounded p-2">
+                      <input type="checkbox" id="audio-as-voice" checked={audioAsVoice}
+                        onChange={e => setAudioAsVoice(e.target.checked)}
+                        className="mt-0.5 cursor-pointer" data-testid="broadcast-audio-voice-toggle" />
+                      <label htmlFor="audio-as-voice" className="text-[11px] text-slate-300 cursor-pointer leading-snug">
+                        Enviar como <strong>nota de voz</strong> (PTT)
+                        {!audioIsPTTCompatible && (
+                          <span className="block text-amber-400 mt-1">
+                            ⚠ Tu archivo no es .ogg/.opus → se enviará como audio reproducible normal, no como nota de voz. Para PTT, convertí el archivo a .ogg/opus.
+                          </span>
+                        )}
+                      </label>
+                    </div>
+                    <p className="text-[10px] text-slate-500 leading-snug">
+                      Si además ponés un mensaje de texto, se enviará en un mensaje aparte después del audio (WhatsApp no permite leyenda en audios).
+                    </p>
+                  </div>
+                )}
+              </div>
               <div className="grid grid-cols-3 gap-2">
                 <div>
                   <label className="text-[10px] text-slate-400 uppercase font-semibold">Min delay (s)</label>
@@ -182,7 +249,7 @@ export const BroadcastModal = ({ lines, onClose, currentUser }) => {
 
         <div className="p-4 border-t border-slate-800 shrink-0">
           {!activeBC ? (
-            <Button onClick={start} disabled={loading || !lineId || !message.trim()} className="w-full bg-purple-600 hover:bg-purple-700" data-testid="broadcast-start-btn">
+            <Button onClick={start} disabled={loading || !lineId || (!message.trim() && !imageFile && !audioFile)} className="w-full bg-purple-600 hover:bg-purple-700" data-testid="broadcast-start-btn">
               {loading ? 'Iniciando...' : '🚀 Iniciar envío masivo'}
             </Button>
           ) : activeBC.status === 'running' ? (

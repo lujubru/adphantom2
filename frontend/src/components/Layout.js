@@ -1,6 +1,6 @@
 import React from 'react';
 import { Navigate, Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Target, LogOut, BarChart, Globe, Users, UserCog, Sun, Moon, Sparkles, Activity, TrendingUp, Megaphone } from 'lucide-react';
+import { LayoutDashboard, Target, LogOut, BarChart, Globe, Users, UserCog, Sun, Moon, Sparkles, Activity, TrendingUp, Megaphone, Wallet } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useTheme } from '@/contexts/ThemeContext';
 
@@ -8,6 +8,7 @@ const ALL_NAV_ITEMS = [
   { path: '/dashboard', label: 'Panel', icon: LayoutDashboard, roles: ['admin'] },
   { path: '/leads-crm', label: 'CRM', icon: Users, roles: ['admin', 'cajero'] },
   { path: '/broadcasts', label: 'Broadcasts', icon: Megaphone, roles: ['admin', 'cajero'] },
+  { path: '/finanzas', label: 'Finanzas', icon: Wallet, roles: ['admin', 'cajero'] },
   { path: '/campaigns', label: 'Campañas', icon: Target, roles: ['admin'] },
   { path: '/wa-landings', label: 'Landings', icon: Globe, roles: ['admin'] },
   { path: '/wa-landing-forensics', label: 'WAForensics', icon: Globe, roles: ['admin'] },
@@ -73,7 +74,7 @@ const Layout = () => {
             <div className="flex items-center space-x-8">
               <div className="flex items-center space-x-2">
                 <img src="/logo.png" alt="aplicacion" className="h-10 w-10 rounded-lg object-contain" />
-                <span className={`font-bold text-lg ${darkMode ? 'text-white' : 'text-gray-900'}`}>BlackGuardian</span>
+                <span className={`font-bold text-lg ${darkMode ? 'text-white' : 'text-gray-900'}`}>aplicacion</span>
               </div>
               <div className="hidden md:flex space-x-1">
                 {navItems.map((item) => {
