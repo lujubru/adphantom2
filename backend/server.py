@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Query, Response
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Query, Response, Body
 from fastapi.responses import RedirectResponse, HTMLResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -3773,6 +3773,10 @@ class CRMLineCreate(BaseModel):
     phone_number_id: Optional[str] = ""
     whatsapp_business_account_id: Optional[str] = ""  # WABA id — required for fetching templates
     verify_token: Optional[str] = ""
+    # Multi-line webhook sharing: if set, this line copies whatsapp_token,
+    # verify_token and whatsapp_business_account_id from the parent line, so
+    # several phone numbers under the same Meta App share one verified webhook.
+    webhook_parent_line_id: Optional[str] = None
     # Meta Pixel Config
     meta_access_token: Optional[str] = ""
     meta_pixel_id: Optional[str] = ""
@@ -3787,6 +3791,7 @@ class CRMLineUpdate(BaseModel):
     phone_number_id: Optional[str] = None
     whatsapp_business_account_id: Optional[str] = None
     verify_token: Optional[str] = None
+    webhook_parent_line_id: Optional[str] = None
     meta_access_token: Optional[str] = None
     meta_pixel_id: Optional[str] = None
     description: Optional[str] = None
@@ -4503,20 +4508,38 @@ async def crm_create_line(data: CRMLineCreate, current_user=Depends(get_current_
         raise HTTPException(status_code=400, detail=f"Tipo de línea inválido. Opciones: {CRM_LINE_TYPES}")
     
     now = datetime.now(timezone.utc).isoformat()
-    
-    # Generate unique verify token if not provided
-    verify_token = data.verify_token or f"verify_{uuid.uuid4().hex[:12]}"
-    
+
+    # Pull tokens from parent line if webhook is shared (multi-line Meta App)
+    parent_id = data.webhook_parent_line_id
+    parent_line = None
+    if parent_id:
+        parent_line = await db.crm_lines.find_one({"id": parent_id}, {"_id": 0})
+        if not parent_line:
+            raise HTTPException(status_code=400, detail="webhook_parent_line_id no existe")
+
+    if parent_line:
+        # Inherit verify_token + WhatsApp token from parent (App-level secrets).
+        # WABA ID is per-WABA: keep the explicit one from `data` if provided,
+        # only fall back to parent's WABA if the child didn't set one.
+        inherited_verify = parent_line.get("verify_token") or ""
+        inherited_wa_token = parent_line.get("whatsapp_token") or data.whatsapp_token or ""
+        inherited_waba_id = data.whatsapp_business_account_id or parent_line.get("whatsapp_business_account_id") or ""
+    else:
+        inherited_verify = data.verify_token or f"verify_{uuid.uuid4().hex[:12]}"
+        inherited_wa_token = data.whatsapp_token or ""
+        inherited_waba_id = data.whatsapp_business_account_id or ""
+
     line = {
         "id": str(uuid.uuid4()),
         "name": data.name,
         "line_type": data.line_type,
         "whatsapp_number": data.whatsapp_number,
         # WhatsApp Business API
-        "whatsapp_token": data.whatsapp_token or "",
+        "whatsapp_token": inherited_wa_token,
         "phone_number_id": data.phone_number_id or "",
-        "verify_token": verify_token,
-        "whatsapp_business_account_id": data.whatsapp_business_account_id or "",
+        "verify_token": inherited_verify,
+        "whatsapp_business_account_id": inherited_waba_id,
+        "webhook_parent_line_id": parent_id or None,
         # Meta Pixel
         "meta_access_token": data.meta_access_token or "",
         "meta_pixel_id": data.meta_pixel_id or "",
@@ -4566,7 +4589,28 @@ async def crm_update_line(line_id: str, data: CRMLineUpdate, current_user=Depend
     
     update_data = {k: v for k, v in data.model_dump(exclude_unset=True).items()}
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
-    
+
+    # If linking to a parent webhook line, re-inherit tokens from the parent
+    # (only when parent changes or hasn't been resolved yet). This way the
+    # admin can switch a line to "use webhook of X" later and the tokens
+    # auto-update.
+    new_parent_id = update_data.get("webhook_parent_line_id")
+    if "webhook_parent_line_id" in update_data and new_parent_id:
+        parent_line = await db.crm_lines.find_one({"id": new_parent_id}, {"_id": 0})
+        if not parent_line:
+            raise HTTPException(status_code=400, detail="webhook_parent_line_id no existe")
+        if new_parent_id == line_id:
+            raise HTTPException(status_code=400, detail="Una línea no puede ser padre de sí misma")
+        update_data["verify_token"] = parent_line.get("verify_token") or ""
+        update_data["whatsapp_token"] = parent_line.get("whatsapp_token") or ""
+        # WABA ID is per-WABA, not per-App: only inherit if the operator didn't
+        # provide an explicit one in this update payload, AND the existing line
+        # also has no WABA configured.
+        if "whatsapp_business_account_id" not in update_data or not update_data.get("whatsapp_business_account_id"):
+            existing = await db.crm_lines.find_one({"id": line_id}, {"_id": 0, "whatsapp_business_account_id": 1})
+            if not (existing or {}).get("whatsapp_business_account_id"):
+                update_data["whatsapp_business_account_id"] = parent_line.get("whatsapp_business_account_id") or ""
+
     await db.crm_lines.update_one({"id": line_id}, {"$set": update_data})
     updated = await db.crm_lines.find_one({"id": line_id}, {"_id": 0})
     return updated
@@ -4583,9 +4627,274 @@ async def crm_delete_line(line_id: str, current_user=Depends(get_current_user)):
     
     return {"message": "Línea eliminada"}
 
+
+# ─── WhatsApp Cloud API number registration ──────────────────────────
+# Two-step process required by Meta to move a number from "Pending" to
+# "Connected" in Business Manager:
+#   1) request_code → Meta sends OTP via SMS/voice to the physical SIM.
+#   2) register → using that OTP + a new PIN (set by the operator),
+#      the number is bound to the API and becomes usable.
+# Both calls inherit the WhatsApp token from the parent line when this
+# line is a child (shared webhook).
+
+def _wa_line_credentials(line: dict) -> tuple:
+    """Return (phone_number_id, token) — token from parent if it's a child."""
+    return (line.get("phone_number_id") or "", line.get("whatsapp_token") or "")
+
+
+class WaRequestCodePayload(BaseModel):
+    code_method: str = "SMS"  # SMS or VOICE
+    language: str = "es"
+
+
+@api_router.post("/crm/lines/{line_id}/wa-request-code")
+async def crm_wa_request_code(
+    line_id: str,
+    payload: WaRequestCodePayload,
+    current_user=Depends(get_current_user),
+):
+    """Step 1/2: ask Meta to send the 6-digit OTP to the physical SIM."""
+    line = await db.crm_lines.find_one({"id": line_id}, {"_id": 0})
+    if not line:
+        raise HTTPException(status_code=404, detail="Línea no encontrada")
+    phone_id, token = _wa_line_credentials(line)
+    if not phone_id or not token:
+        raise HTTPException(status_code=400, detail="La línea no tiene Phone Number ID o Token configurados")
+    if payload.code_method not in ("SMS", "VOICE"):
+        raise HTTPException(status_code=400, detail="code_method debe ser SMS o VOICE")
+
+    url = f"{WA_GRAPH_URL}/{phone_id}/request_code"
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post(
+                url,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"code_method": payload.code_method, "language": payload.language},
+            )
+            data = r.json() if r.content else {}
+            if r.status_code >= 400 or (isinstance(data, dict) and data.get("error")):
+                err = (data.get("error") or {}) if isinstance(data, dict) else {}
+                msg = err.get("message") or str(data)
+                code = err.get("code")
+                subcode = err.get("error_subcode")
+                # Log full Meta body for debugging
+                logger.warning(f"wa request_code Meta error: status={r.status_code} code={code} subcode={subcode} body={data}")
+                hint = ""
+                if code == 136025 or subcode == 2388045:
+                    hint = " (El número ya está verificado — saltá directo a 'Registrar número' con un PIN nuevo, sin OTP.)"
+                elif code == 133006:
+                    hint = " (Acabás de pedir un código hace poco — esperá unos minutos o usá el que ya te llegó.)"
+                elif code == 133010:
+                    hint = " (El número no está dado de alta en la WABA. Agregalo primero en Business Manager.)"
+                raise HTTPException(status_code=400, detail=f"Meta: {msg} [code={code} subcode={subcode}]{hint}")
+            return {"ok": True, "method": payload.code_method, "response": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"wa request_code error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class WaRegisterPayload(BaseModel):
+    pin: str  # 6-digit numeric PIN the operator wants to use (will be set on Meta)
+    code: Optional[str] = None  # OTP received via SMS/VOICE (omit if number was already verified)
+
+
+@api_router.post("/crm/lines/{line_id}/wa-register")
+async def crm_wa_register(
+    line_id: str,
+    payload: WaRegisterPayload,
+    current_user=Depends(get_current_user),
+):
+    """Step 2/2: register the number on WhatsApp Cloud API.
+
+    Moves the number from "Pendiente" to "Conectado". From this moment the
+    number can send/receive messages through the API.
+    """
+    line = await db.crm_lines.find_one({"id": line_id}, {"_id": 0})
+    if not line:
+        raise HTTPException(status_code=404, detail="Línea no encontrada")
+    phone_id, token = _wa_line_credentials(line)
+    if not phone_id or not token:
+        raise HTTPException(status_code=400, detail="La línea no tiene Phone Number ID o Token configurados")
+
+    pin = (payload.pin or "").strip()
+    if not pin.isdigit() or len(pin) != 6:
+        raise HTTPException(status_code=400, detail="El PIN debe ser de 6 dígitos numéricos")
+
+    body = {"messaging_product": "whatsapp", "pin": pin}
+    if payload.code:
+        body["code"] = payload.code.strip()
+
+    url = f"{WA_GRAPH_URL}/{phone_id}/register"
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(
+                url,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=body,
+            )
+            data = r.json() if r.content else {}
+            if r.status_code >= 400 or (isinstance(data, dict) and data.get("error")):
+                err = (data.get("error") or {}) if isinstance(data, dict) else {}
+                msg = err.get("message") or str(data)
+                code = err.get("code")
+                subcode = err.get("error_subcode")
+                logger.warning(f"wa register Meta error: status={r.status_code} code={code} subcode={subcode} body={data}")
+                hint = ""
+                if code == 133005:
+                    hint = " (El PIN no coincide con el que ya tenía registrado el número en Meta. Si es un número que ya estuvo en API, usá el PIN original; sino, pedí un nuevo OTP y reseteá.)"
+                elif code == 133010:
+                    hint = " (Número aún no verificado — primero pedí el código OTP arriba.)"
+                elif code == 136025:
+                    hint = " (Ya está registrado — el número debería estar funcionando. Si sigue 'Pendiente', esperá 1-2 minutos y refrescá Meta Business Manager.)"
+                raise HTTPException(status_code=400, detail=f"Meta: {msg} [code={code} subcode={subcode}]{hint}")
+            # Persist the PIN reference for audit (NOT the value itself)
+            await db.crm_lines.update_one(
+                {"id": line_id},
+                {"$set": {
+                    "wa_registered_at": datetime.now(timezone.utc).isoformat(),
+                    "wa_registered_by": current_user.get("email"),
+                }}
+            )
+            return {"ok": True, "response": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"wa register error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class WaListNumbersPayload(BaseModel):
+    waba_id: Optional[str] = None  # explicit override
+    parent_line_id: Optional[str] = None  # take waba+token from this line
+
+
+@api_router.post("/crm/wa-list-numbers")
+async def crm_wa_list_numbers(
+    payload: WaListNumbersPayload,
+    current_user=Depends(get_current_user),
+):
+    """List all phone numbers registered under a WABA along with their
+    phone_number_id, status and quality. Used by the line form so the
+    operator can pick the new number from a dropdown instead of copying
+    phone_number_id from Devs by hand.
+
+    Source of credentials: pass `parent_line_id` to inherit waba_id+token
+    from an existing line, or pass `waba_id` directly (token will come
+    from any line that has that WABA).
+    """
+    waba_id = (payload.waba_id or "").strip()
+    token = ""
+
+    if payload.parent_line_id:
+        parent = await db.crm_lines.find_one({"id": payload.parent_line_id}, {"_id": 0})
+        if not parent:
+            raise HTTPException(status_code=404, detail="parent_line_id no existe")
+        waba_id = waba_id or parent.get("whatsapp_business_account_id") or ""
+        token = parent.get("whatsapp_token") or ""
+
+    if not waba_id:
+        raise HTTPException(status_code=400, detail="Falta WABA ID (o parent_line_id con WABA configurado)")
+    if not token:
+        # Fallback: cualquier línea con esa WABA
+        any_line = await db.crm_lines.find_one(
+            {"whatsapp_business_account_id": waba_id, "whatsapp_token": {"$nin": [None, ""]}},
+            {"_id": 0, "whatsapp_token": 1},
+        )
+        token = (any_line or {}).get("whatsapp_token") or ""
+    if not token:
+        raise HTTPException(status_code=400, detail="No hay token disponible para consultar esta WABA")
+
+    url = f"{WA_GRAPH_URL}/{waba_id}/phone_numbers"
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                params={"fields": "id,display_phone_number,verified_name,code_verification_status,quality_rating,name_status,messaging_limit_tier"},
+            )
+            data = r.json() if r.content else {}
+            if r.status_code >= 400 or (isinstance(data, dict) and data.get("error")):
+                err = (data.get("error") or {}) if isinstance(data, dict) else {}
+                msg = err.get("message") or str(data)
+                code = err.get("code")
+                logger.warning(f"wa list_numbers Meta error: status={r.status_code} code={code} body={data}")
+                raise HTTPException(status_code=400, detail=f"Meta: {msg} [code={code}]")
+            return {"ok": True, "waba_id": waba_id, "numbers": data.get("data", [])}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"wa list_numbers error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/crm/lines/{line_id}/wa-subscribe-app")
+async def crm_wa_subscribe_app(
+    line_id: str,
+    payload: Optional[Dict] = Body(default=None),
+    current_user=Depends(get_current_user),
+):
+    """Subscribe this line's WABA to the Meta App via Graph API.
+
+    Required (and almost always silently missing) for Meta to actually
+    deliver webhooks when a new number is added to an existing WABA.
+    Calls `POST /{WABA_ID}/subscribed_apps` with the line's token.
+
+    Accepts an optional body with `waba_id` and/or `token` to override the
+    values stored in the line — useful when the operator wants to subscribe
+    BEFORE saving the form.
+    """
+    line = await db.crm_lines.find_one({"id": line_id}, {"_id": 0})
+    if not line:
+        raise HTTPException(status_code=404, detail="Línea no encontrada")
+    override = payload or {}
+    waba_id = (override.get("waba_id") or "").strip() or line.get("whatsapp_business_account_id") or ""
+    token = (override.get("token") or "").strip() or line.get("whatsapp_token") or ""
+    if not waba_id:
+        raise HTTPException(status_code=400, detail="La línea no tiene WhatsApp Business Account ID configurado. Pegalo en el campo WABA ID y guardá la línea antes (o pasalo en el form).")
+    if not token:
+        raise HTTPException(status_code=400, detail="La línea no tiene WhatsApp Token configurado")
+
+    url = f"{WA_GRAPH_URL}/{waba_id}/subscribed_apps"
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post(
+                url,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            )
+            data = r.json() if r.content else {}
+            if r.status_code >= 400 or (isinstance(data, dict) and data.get("error")):
+                err = (data.get("error") or {}) if isinstance(data, dict) else {}
+                msg = err.get("message") or str(data)
+                code = err.get("code")
+                subcode = err.get("error_subcode")
+                logger.warning(f"wa subscribe_app Meta error: status={r.status_code} code={code} subcode={subcode} body={data}")
+                hint = ""
+                if code == 200:
+                    hint = " (El token no tiene permiso 'whatsapp_business_management'. Usá un token de System User con ese permiso.)"
+                raise HTTPException(status_code=400, detail=f"Meta: {msg} [code={code} subcode={subcode}]{hint}")
+            # Confirm current subscriptions
+            check = await c.get(
+                f"{WA_GRAPH_URL}/{waba_id}/subscribed_apps",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            apps_list = []
+            try:
+                apps_list = (check.json() or {}).get("data", []) if check.status_code < 400 else []
+            except Exception:
+                apps_list = []
+            return {"ok": True, "response": data, "subscribed_apps": apps_list}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"wa subscribe_app error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @api_router.post("/crm/lines/{line_id}/assign-lead/{lead_id}")
 async def crm_assign_lead_to_line(
-    line_id: str, 
+    line_id: str,
     lead_id: str,
     current_user=Depends(get_current_user)
 ):
@@ -4632,7 +4941,16 @@ async def crm_line_webhook_verify(line_id: str, request: Request):
 
 @api_router.post("/crm/webhook/{line_id}")
 async def crm_line_webhook_receive(line_id: str, request: Request):
-    """Receive WhatsApp messages for a specific line"""
+    """Receive WhatsApp messages for a specific line.
+
+    Multi-line webhook support: when several CRM lines share the same Meta
+    App (and therefore the same webhook URL), Meta keeps calling the URL of
+    the "parent" line — but inside the payload the `phone_number_id` in
+    metadata tells us which actual number received the message. Here we
+    transparently re-route to the line that owns that phone_number_id, so
+    every line (parent or child) gets its own messages without exposing a
+    different URL.
+    """
     line = await db.crm_lines.find_one({"id": line_id}, {"_id": 0})
     if not line:
         logger.error(f"CRM webhook: Line {line_id} not found")
@@ -4652,6 +4970,33 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                 metadata = value.get("metadata", {})
                 display_phone = metadata.get("display_phone_number", "")
                 phone_number_id = metadata.get("phone_number_id", "")
+
+                # ── Multi-line routing ─────────────────────────────────
+                # If the incoming phone_number_id belongs to a different
+                # line (i.e. this URL is shared by several lines), swap to
+                # the actual owner so we store messages under the correct
+                # line and respond with its WhatsApp token.
+                if phone_number_id and phone_number_id != line.get("phone_number_id"):
+                    real_line = await db.crm_lines.find_one(
+                        {"phone_number_id": phone_number_id}, {"_id": 0}
+                    )
+                    if real_line:
+                        if real_line.get("id") != line.get("id"):
+                            logger.info(
+                                f"Shared webhook: routed to line "
+                                f"'{real_line.get('name')}' ({real_line.get('id')}) "
+                                f"via phone_number_id={phone_number_id}"
+                            )
+                        line = real_line
+                        # CRITICAL: also refresh `line_id` since downstream
+                        # logic reads it (lead lookup, ad attribution, etc).
+                        line_id = real_line.get("id")
+                    else:
+                        logger.warning(
+                            f"Shared webhook hit URL of line {line_id} but "
+                            f"phone_number_id={phone_number_id} doesn't match "
+                            f"any registered line — falling back to URL line."
+                        )
 
                 # ── Broadcast message status updates (sent/delivered/read/failed) ──
                 # Meta sends `statuses` events with the wa_message_id we stored when
@@ -7477,11 +7822,483 @@ class BroadcastCreate(BaseModel):
     target_status: List[str] = ["valido"]
     message: str
     image_path: Optional[str] = None  # local filename from prior upload (optional)
+    audio_path: Optional[str] = None  # local filename from prior upload (optional)
+    audio_as_voice: bool = True  # send as PTT/voice note (Meta only PTTs ogg/opus)
     min_delay_sec: int = 4
     max_delay_sec: int = 10
     max_per_hour: int = 300
 
 _broadcast_workers: Dict[str, "asyncio.Task"] = {}
+
+
+# ════════════════════════════════════════════════════════════════════
+# FINANZAS (Cajero) — Bono, Ingresos, Egresos, Balance
+# ════════════════════════════════════════════════════════════════════
+# Cada cajero gestiona su propia caja: ve cuánto ingresó (sacado del
+# embudo: leads "valido"), cuánto egresó (carga manual), cuánto bono
+# entregó (% configurable, versionado por fecha para que cambios no
+# alteren históricos) y su balance.
+
+class FinanzasBonusRateUpdate(BaseModel):
+    percentage: float  # 0..100
+
+
+class FinanzasExpenseCreate(BaseModel):
+    amount: float
+    observation: str
+
+
+class FinanzasExpenseUpdate(BaseModel):
+    amount: float
+    observation: str
+
+
+def _today_utc_iso_date() -> str:
+    """YYYY-MM-DD del día actual UTC."""
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+async def _finanzas_get_bonus_rate_for_date(user_id: str, date_iso: str) -> float:
+    """Busca el % de bono vigente para `user_id` en `date_iso` (YYYY-MM-DD).
+    Si no hay nada configurado, retorna 0."""
+    doc = await db.cajero_bonus_rates.find_one(
+        {
+            "user_id": user_id,
+            "effective_from": {"$lte": date_iso},
+            "$or": [{"effective_to": None}, {"effective_to": {"$gt": date_iso}}],
+        },
+        {"_id": 0, "percentage": 1},
+    )
+    return float(doc["percentage"]) if doc else 0.0
+
+
+async def _finanzas_get_current_bonus_rate(user_id: str) -> float:
+    today = _today_utc_iso_date()
+    return await _finanzas_get_bonus_rate_for_date(user_id, today)
+
+
+def _finanzas_resolve_date_range(
+    filter_type: Optional[str],
+    start_date: Optional[str],
+    end_date: Optional[str],
+) -> tuple:
+    """Resuelve un rango de fechas YYYY-MM-DD (inclusive) según el filtro."""
+    today = datetime.now(timezone.utc).date()
+    if filter_type == "custom" and start_date and end_date:
+        return start_date, end_date
+    if filter_type == "diario":
+        return today.isoformat(), today.isoformat()
+    if filter_type == "ayer":
+        y = today - timedelta(days=1)
+        return y.isoformat(), y.isoformat()
+    if filter_type == "ultimos_10":
+        return (today - timedelta(days=9)).isoformat(), today.isoformat()
+    if filter_type == "semanal":
+        return (today - timedelta(days=6)).isoformat(), today.isoformat()
+    if filter_type == "mensual":
+        return today.replace(day=1).isoformat(), today.isoformat()
+    if filter_type == "mes_anterior":
+        first_this = today.replace(day=1)
+        last_prev = first_this - timedelta(days=1)
+        first_prev = last_prev.replace(day=1)
+        return first_prev.isoformat(), last_prev.isoformat()
+    # default: mes actual
+    return today.replace(day=1).isoformat(), today.isoformat()
+
+
+async def _finanzas_ingresos_by_day(user_id: str, start_iso: str, end_iso: str) -> Dict[str, float]:
+    """Suma de conversion_value por día (YYYY-MM-DD) de leads marcados como `valido`
+    asignados a este cajero. Si el cajero tiene `line_ids`, filtra por esas líneas."""
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "line_ids": 1, "role": 1})
+    line_filter: Dict = {}
+    if user and user.get("role") not in ("admin", "superadmin"):
+        line_ids = user.get("line_ids") or []
+        if line_ids:
+            line_filter = {"line_id": {"$in": line_ids}}
+        else:
+            return {}  # cajero sin líneas asignadas → sin ingresos
+    start_dt = f"{start_iso}T00:00:00"
+    end_dt = f"{end_iso}T23:59:59.999"
+    query = {
+        **line_filter,
+        "status": "valido",
+        "classified_at": {"$gte": start_dt, "$lte": end_dt},
+        "conversion_value": {"$ne": None, "$gt": 0},
+    }
+    by_day: Dict[str, float] = {}
+    cursor = db.crm_leads.find(query, {"_id": 0, "classified_at": 1, "conversion_value": 1})
+    async for lead in cursor:
+        d = (lead.get("classified_at") or "")[:10]
+        if not d:
+            continue
+        try:
+            by_day[d] = by_day.get(d, 0.0) + float(lead.get("conversion_value") or 0)
+        except Exception:
+            pass
+    return by_day
+
+
+async def _finanzas_egresos_by_day(user_id: str, start_iso: str, end_iso: str) -> Dict[str, float]:
+    start_dt = f"{start_iso}T00:00:00"
+    end_dt = f"{end_iso}T23:59:59.999"
+    by_day: Dict[str, float] = {}
+    cursor = db.cajero_expenses.find(
+        {"user_id": user_id, "created_at": {"$gte": start_dt, "$lte": end_dt}},
+        {"_id": 0, "created_at": 1, "amount": 1},
+    )
+    async for ex in cursor:
+        d = (ex.get("created_at") or "")[:10]
+        if not d:
+            continue
+        try:
+            by_day[d] = by_day.get(d, 0.0) + float(ex.get("amount") or 0)
+        except Exception:
+            pass
+    return by_day
+
+
+async def _finanzas_get_cargas_list(user_id: str, start_iso: str, end_iso: str) -> list:
+    """Devuelve la lista de cargas válidas individuales con su bono calculado
+    según el % vigente EL DÍA que se clasificó. Ordenadas por fecha desc."""
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "line_ids": 1, "role": 1})
+    line_filter: Dict = {}
+    if user and user.get("role") not in ("admin", "superadmin"):
+        line_ids = user.get("line_ids") or []
+        if line_ids:
+            line_filter = {"line_id": {"$in": line_ids}}
+        else:
+            return []
+    start_dt = f"{start_iso}T00:00:00"
+    end_dt = f"{end_iso}T23:59:59.999"
+    query = {
+        **line_filter,
+        "status": "valido",
+        "classified_at": {"$gte": start_dt, "$lte": end_dt},
+        "conversion_value": {"$ne": None, "$gt": 0},
+    }
+    # Cache de rates por día para no consultar 1 vez por carga (puede haber muchas)
+    rate_cache: Dict[str, float] = {}
+
+    async def _rate_for(day: str) -> float:
+        if day not in rate_cache:
+            rate_cache[day] = await _finanzas_get_bonus_rate_for_date(user_id, day)
+        return rate_cache[day]
+
+    cargas = []
+    cursor = db.crm_leads.find(
+        query,
+        {"_id": 0, "id": 1, "name": 1, "phone": 1, "line_id": 1, "line_name": 1,
+         "classified_at": 1, "conversion_value": 1},
+    ).sort("classified_at", -1)
+    async for lead in cursor:
+        try:
+            value = float(lead.get("conversion_value") or 0)
+        except Exception:
+            value = 0
+        day = (lead.get("classified_at") or "")[:10]
+        rate = await _rate_for(day) if day else 0
+        bono = round(value * rate / 100.0, 2) if rate > 0 else 0.0
+        cargas.append({
+            "lead_id": lead.get("id"),
+            "name": lead.get("name") or "(sin nombre)",
+            "phone": lead.get("phone"),
+            "line_id": lead.get("line_id"),
+            "line_name": lead.get("line_name"),
+            "classified_at": lead.get("classified_at"),
+            "monto": round(value, 2),
+            "bono_pct": rate,
+            "bono": bono,
+            "fichas_entregadas": round(value + bono, 2),
+        })
+    return cargas
+
+
+async def _finanzas_compute_bono_by_day(user_id: str, ingresos_by_day: Dict[str, float]) -> Dict[str, float]:
+    """Para cada día con ingresos, mira el % vigente ESE DÍA y calcula el bono.
+    Esto preserva el histórico cuando el cajero cambia el %."""
+    bono_by_day: Dict[str, float] = {}
+    for day, monto in ingresos_by_day.items():
+        rate = await _finanzas_get_bonus_rate_for_date(user_id, day)
+        bono_by_day[day] = round(monto * rate / 100.0, 2) if rate > 0 else 0.0
+    return bono_by_day
+
+
+def _finanzas_get_target_user_id(current_user: dict, requested_user_id: Optional[str]) -> str:
+    """Resuelve qué user_id consultar: cajero siempre el suyo; admin puede pasar otro."""
+    if requested_user_id and current_user.get("role") in ("admin", "superadmin"):
+        return requested_user_id
+    return current_user["id"]
+
+
+@api_router.get("/finanzas/currency")
+async def finanzas_get_currency(current_user=Depends(get_current_user)):
+    cur = (os.environ.get("PURCHASE_CURRENCY") or "USD").upper().strip()
+    return {"currency": cur}
+
+
+@api_router.get("/finanzas/bonus-rate")
+async def finanzas_get_bonus_rate(
+    user_id: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    """% de bono vigente HOY para el usuario."""
+    target_uid = _finanzas_get_target_user_id(current_user, user_id)
+    rate = await _finanzas_get_current_bonus_rate(target_uid)
+    history = []
+    cursor = db.cajero_bonus_rates.find(
+        {"user_id": target_uid}, {"_id": 0}
+    ).sort("effective_from", -1).limit(20)
+    async for h in cursor:
+        history.append(h)
+    return {"percentage": rate, "history": history}
+
+
+@api_router.put("/finanzas/bonus-rate")
+async def finanzas_update_bonus_rate(
+    payload: FinanzasBonusRateUpdate,
+    current_user=Depends(get_current_user),
+):
+    """Actualizar % de bono. El nuevo valor rige desde HOY (UTC).
+    Si ya hubo un cambio HOY, lo reemplaza en lugar de acumular."""
+    pct = float(payload.percentage)
+    if pct < 0 or pct > 200:
+        raise HTTPException(status_code=400, detail="El bono debe estar entre 0 y 200%")
+    user_id = current_user["id"]
+    today = _today_utc_iso_date()
+
+    existing_today = await db.cajero_bonus_rates.find_one(
+        {"user_id": user_id, "effective_from": today, "effective_to": None}
+    )
+    if existing_today:
+        await db.cajero_bonus_rates.update_one(
+            {"_id": existing_today["_id"]},
+            {"$set": {"percentage": pct, "updated_at": datetime.now(timezone.utc).isoformat()}},
+        )
+        return {"percentage": pct, "effective_from": today}
+
+    await db.cajero_bonus_rates.update_many(
+        {"user_id": user_id, "effective_to": None},
+        {"$set": {"effective_to": today}},
+    )
+    await db.cajero_bonus_rates.insert_one({
+        "id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "percentage": pct,
+        "effective_from": today,
+        "effective_to": None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"percentage": pct, "effective_from": today}
+
+
+@api_router.get("/finanzas/summary")
+async def finanzas_summary(
+    filter_type: Optional[str] = "mensual",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user_id: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    """Resumen agregado del rango: ingresos, egresos, bono, fichas entregadas, balance."""
+    target_uid = _finanzas_get_target_user_id(current_user, user_id)
+    start_iso, end_iso = _finanzas_resolve_date_range(filter_type, start_date, end_date)
+    ingresos = await _finanzas_ingresos_by_day(target_uid, start_iso, end_iso)
+    egresos = await _finanzas_egresos_by_day(target_uid, start_iso, end_iso)
+    bono = await _finanzas_compute_bono_by_day(target_uid, ingresos)
+
+    total_ingresos = round(sum(ingresos.values()), 2)
+    total_egresos = round(sum(egresos.values()), 2)
+    total_bono = round(sum(bono.values()), 2)
+    # Fichas entregadas = plata ingresada (en fichas) + bono regalado al cliente.
+    # Es lo que el CLIENTE recibió en fichas.
+    fichas_entregadas = round(total_ingresos + total_bono, 2)
+    # Balance de PLATA neta del cajero = lo que cobró - lo que gastó.
+    # El bono NO se resta porque son fichas (no plata real que sale del bolsillo).
+    balance = round(total_ingresos - total_egresos, 2)
+
+    # Conteo de cargas válidas (= cuántos "valido" generaron ingreso en el período)
+    user = await db.users.find_one({"id": target_uid}, {"_id": 0, "line_ids": 1, "role": 1})
+    line_filter: Dict = {}
+    total_cargas = 0
+    if not (user and user.get("role") not in ("admin", "superadmin") and not (user.get("line_ids") or [])):
+        if user and user.get("role") not in ("admin", "superadmin"):
+            line_filter = {"line_id": {"$in": user.get("line_ids") or []}}
+        total_cargas = await db.crm_leads.count_documents({
+            **line_filter,
+            "status": "valido",
+            "classified_at": {"$gte": f"{start_iso}T00:00:00", "$lte": f"{end_iso}T23:59:59.999"},
+            "conversion_value": {"$ne": None, "$gt": 0},
+        })
+    avg_por_carga = round(total_ingresos / total_cargas, 2) if total_cargas > 0 else 0.0
+
+    current_rate = await _finanzas_get_current_bonus_rate(target_uid)
+    cur = (os.environ.get("PURCHASE_CURRENCY") or "USD").upper().strip()
+
+    return {
+        "range": {"start": start_iso, "end": end_iso, "filter_type": filter_type},
+        "totals": {
+            "ingresos": total_ingresos,
+            "egresos": total_egresos,
+            "bono": total_bono,
+            "fichas_entregadas": fichas_entregadas,
+            "balance": balance,
+            "total_cargas": total_cargas,
+            "avg_por_carga": avg_por_carga,
+        },
+        "current_bonus_percentage": current_rate,
+        "currency": cur,
+    }
+
+
+@api_router.get("/finanzas/cargas")
+async def finanzas_list_cargas(
+    filter_type: Optional[str] = "mensual",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user_id: Optional[str] = None,
+    limit: int = 500,
+    current_user=Depends(get_current_user),
+):
+    """Lista de cargas válidas individuales en el período, con bono individual
+    calculado al % vigente el día que se clasificó cada una."""
+    target_uid = _finanzas_get_target_user_id(current_user, user_id)
+    start_iso, end_iso = _finanzas_resolve_date_range(filter_type, start_date, end_date)
+    cargas = await _finanzas_get_cargas_list(target_uid, start_iso, end_iso)
+    if limit and limit > 0:
+        cargas = cargas[:limit]
+    return {"cargas": cargas, "range": {"start": start_iso, "end": end_iso}, "count": len(cargas)}
+
+
+@api_router.get("/finanzas/chart")
+async def finanzas_chart(
+    filter_type: Optional[str] = "mensual",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user_id: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    """Breakdown diario para gráfico: [{date, ingresos, egresos, bono}]."""
+    target_uid = _finanzas_get_target_user_id(current_user, user_id)
+    start_iso, end_iso = _finanzas_resolve_date_range(filter_type, start_date, end_date)
+    ingresos = await _finanzas_ingresos_by_day(target_uid, start_iso, end_iso)
+    egresos = await _finanzas_egresos_by_day(target_uid, start_iso, end_iso)
+    bono = await _finanzas_compute_bono_by_day(target_uid, ingresos)
+
+    start = datetime.fromisoformat(start_iso).date()
+    end = datetime.fromisoformat(end_iso).date()
+    series = []
+    cur = start
+    while cur <= end:
+        d = cur.isoformat()
+        series.append({
+            "date": d,
+            "ingresos": round(ingresos.get(d, 0.0), 2),
+            "egresos": round(egresos.get(d, 0.0), 2),
+            "bono": round(bono.get(d, 0.0), 2),
+        })
+        cur = cur + timedelta(days=1)
+    return {"series": series, "range": {"start": start_iso, "end": end_iso}}
+
+
+@api_router.post("/finanzas/expenses")
+async def finanzas_create_expense(
+    payload: FinanzasExpenseCreate,
+    current_user=Depends(get_current_user),
+):
+    if payload.amount <= 0:
+        raise HTTPException(status_code=400, detail="El monto debe ser mayor a 0")
+    obs = (payload.observation or "").strip()
+    if not obs:
+        raise HTTPException(status_code=400, detail="La observación es obligatoria")
+    if len(obs) > 300:
+        raise HTTPException(status_code=400, detail="Observación muy larga (máx 300)")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": current_user["id"],
+        "user_email": current_user.get("email"),
+        "amount": round(float(payload.amount), 2),
+        "observation": obs,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.cajero_expenses.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api_router.get("/finanzas/expenses")
+async def finanzas_list_expenses(
+    filter_type: Optional[str] = "mensual",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user_id: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    target_uid = _finanzas_get_target_user_id(current_user, user_id)
+    start_iso, end_iso = _finanzas_resolve_date_range(filter_type, start_date, end_date)
+    start_dt = f"{start_iso}T00:00:00"
+    end_dt = f"{end_iso}T23:59:59.999"
+    items = []
+    cursor = db.cajero_expenses.find(
+        {"user_id": target_uid, "created_at": {"$gte": start_dt, "$lte": end_dt}},
+        {"_id": 0},
+    ).sort("created_at", -1)
+    today_iso = _today_utc_iso_date()
+    async for ex in cursor:
+        ex_date = (ex.get("created_at") or "")[:10]
+        ex["editable"] = (ex_date == today_iso)
+        items.append(ex)
+    return {"expenses": items, "range": {"start": start_iso, "end": end_iso}}
+
+
+@api_router.put("/finanzas/expenses/{expense_id}")
+async def finanzas_update_expense(
+    expense_id: str,
+    payload: FinanzasExpenseUpdate,
+    current_user=Depends(get_current_user),
+):
+    ex = await db.cajero_expenses.find_one({"id": expense_id}, {"_id": 0})
+    if not ex:
+        raise HTTPException(status_code=404, detail="Egreso no encontrado")
+    is_admin = current_user.get("role") in ("admin", "superadmin")
+    if ex["user_id"] != current_user["id"] and not is_admin:
+        raise HTTPException(status_code=403, detail="No es tu egreso")
+    ex_date = (ex.get("created_at") or "")[:10]
+    if ex_date != _today_utc_iso_date() and not is_admin:
+        raise HTTPException(status_code=403, detail="Solo se puede editar el día que se creó")
+    if payload.amount <= 0:
+        raise HTTPException(status_code=400, detail="El monto debe ser mayor a 0")
+    obs = (payload.observation or "").strip()
+    if not obs:
+        raise HTTPException(status_code=400, detail="La observación es obligatoria")
+    await db.cajero_expenses.update_one(
+        {"id": expense_id},
+        {"$set": {
+            "amount": round(float(payload.amount), 2),
+            "observation": obs[:300],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }},
+    )
+    return {"ok": True}
+
+
+@api_router.delete("/finanzas/expenses/{expense_id}")
+async def finanzas_delete_expense(
+    expense_id: str,
+    current_user=Depends(get_current_user),
+):
+    ex = await db.cajero_expenses.find_one({"id": expense_id}, {"_id": 0})
+    if not ex:
+        raise HTTPException(status_code=404, detail="Egreso no encontrado")
+    is_admin = current_user.get("role") in ("admin", "superadmin")
+    if ex["user_id"] != current_user["id"] and not is_admin:
+        raise HTTPException(status_code=403, detail="No es tu egreso")
+    ex_date = (ex.get("created_at") or "")[:10]
+    if ex_date != _today_utc_iso_date() and not is_admin:
+        raise HTTPException(status_code=403, detail="Solo se puede borrar el día que se creó")
+    await db.cajero_expenses.delete_one({"id": expense_id})
+    return {"ok": True}
+
+
 
 # ════════════════════════════════════════════════════════════════════
 # CSV BROADCASTS — import audiences, fetch templates, manage opt-outs
@@ -8889,6 +9706,71 @@ async def crm_broadcast_get_image(filename: str, current_user=Depends(get_curren
     return FileResponse(path)
 
 
+@api_router.post("/crm/broadcast/upload-audio")
+async def crm_broadcast_upload_audio(
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user)
+):
+    """Upload an audio for broadcast use (returns filename to pass to create).
+    Accepted: ogg/opus (best — shows as PTT voice note), mp3, m4a, aac, amr, wav.
+    Note: only ogg/opus is rendered as a voice-note (PTT) by WhatsApp.
+    Otros formatos se envían como mensaje de audio reproducible (no PTT).
+    """
+    allowed_mimes = {
+        "audio/ogg", "audio/opus",
+        "audio/mpeg", "audio/mp3",
+        "audio/mp4", "audio/m4a", "audio/x-m4a",
+        "audio/aac",
+        "audio/amr",
+        "audio/wav", "audio/x-wav",
+        "audio/webm",
+    }
+    if file.content_type not in allowed_mimes:
+        raise HTTPException(status_code=400, detail=f"Formato no soportado ({file.content_type}). Usá ogg/opus, mp3, m4a, aac, amr, wav o webm.")
+    data = await file.read()
+    # WhatsApp limit: audio max 16MB. Damos 15MB de margen.
+    if len(data) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Audio muy grande (máx 15MB)")
+    os.makedirs("/app/backend/uploads/broadcast", exist_ok=True)
+    # Map mime → extension
+    ext_map = {
+        "audio/ogg": "ogg", "audio/opus": "ogg",
+        "audio/mpeg": "mp3", "audio/mp3": "mp3",
+        "audio/mp4": "m4a", "audio/m4a": "m4a", "audio/x-m4a": "m4a",
+        "audio/aac": "aac",
+        "audio/amr": "amr",
+        "audio/wav": "wav", "audio/x-wav": "wav",
+        "audio/webm": "webm",
+    }
+    # Prefer extension from filename if present and valid, else from mime
+    fname_ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else ""
+    ext = fname_ext if fname_ext in {"ogg", "opus", "mp3", "m4a", "aac", "amr", "wav", "webm"} else ext_map.get(file.content_type, "mp3")
+    if ext == "opus":
+        ext = "ogg"  # WhatsApp espera .ogg para opus
+    name = f"{uuid.uuid4()}.{ext}"
+    path = f"/app/backend/uploads/broadcast/{name}"
+    with open(path, "wb") as f:
+        f.write(data)
+    is_ptt_compatible = ext == "ogg"
+    return {
+        "filename": name,
+        "url": f"/api/crm/broadcast-audio/{name}",
+        "is_voice_note_compatible": is_ptt_compatible,
+        "size_kb": round(len(data) / 1024),
+    }
+
+
+@api_router.get("/crm/broadcast-audio/{filename}")
+async def crm_broadcast_get_audio(filename: str, current_user=Depends(get_current_user)):
+    from fastapi.responses import FileResponse
+    if "/" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Inválido")
+    path = f"/app/backend/uploads/broadcast/{filename}"
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="No encontrada")
+    return FileResponse(path)
+
+
 @api_router.post("/crm/broadcast")
 async def crm_create_broadcast(data: BroadcastCreate, current_user=Depends(get_current_user)):
     """Create a broadcast job. Sends to all leads of selected line with target_status.
@@ -8907,8 +9789,8 @@ async def crm_create_broadcast(data: BroadcastCreate, current_user=Depends(get_c
         raise HTTPException(status_code=404, detail="Línea no encontrada")
     if not line.get("whatsapp_token") or not line.get("phone_number_id"):
         raise HTTPException(status_code=400, detail="Línea sin credenciales de WhatsApp")
-    if not data.message.strip():
-        raise HTTPException(status_code=400, detail="Mensaje vacío")
+    if not data.message.strip() and not data.image_path and not data.audio_path:
+        raise HTTPException(status_code=400, detail="El masivo debe tener mensaje, imagen o audio")
 
     # Find target leads
     target_leads = []
@@ -8932,6 +9814,8 @@ async def crm_create_broadcast(data: BroadcastCreate, current_user=Depends(get_c
         "created_at": now,
         "message": data.message,
         "image_path": data.image_path or None,
+        "audio_path": data.audio_path or None,
+        "audio_as_voice": bool(data.audio_as_voice),
         "target_status": data.target_status,
         "min_delay_sec": max(2, int(data.min_delay_sec)),
         "max_delay_sec": max(int(data.min_delay_sec) + 1, int(data.max_delay_sec)),
@@ -8961,6 +9845,8 @@ async def _broadcast_worker(broadcast_id: str, line: dict):
     try:
         # Preload image media_id once (if image attached)
         image_media_id = None
+        audio_media_id = None
+        audio_as_voice = True
         bc = await db.crm_broadcasts.find_one({"id": broadcast_id})
         if not bc:
             return
@@ -8976,6 +9862,27 @@ async def _broadcast_worker(broadcast_id: str, line: dict):
                     token=line["whatsapp_token"], phone_id=line["phone_number_id"]
                 )
                 image_media_id = up.get("id") if isinstance(up, dict) else None
+
+        if bc.get("audio_path"):
+            audio_path = f"/app/backend/uploads/broadcast/{bc['audio_path']}"
+            if os.path.exists(audio_path):
+                with open(audio_path, "rb") as f:
+                    audio_bytes = f.read()
+                aext = bc["audio_path"].rsplit(".", 1)[-1].lower() if "." in bc["audio_path"] else "mp3"
+                audio_mime = {
+                    "ogg": "audio/ogg", "opus": "audio/ogg",
+                    "mp3": "audio/mpeg", "mpeg": "audio/mpeg",
+                    "m4a": "audio/mp4", "aac": "audio/aac",
+                    "amr": "audio/amr", "wav": "audio/wav",
+                    "webm": "audio/webm",
+                }.get(aext, "audio/mpeg")
+                up_audio = await wa_upload_media(
+                    file_bytes=audio_bytes, filename=bc["audio_path"], mime_type=audio_mime,
+                    token=line["whatsapp_token"], phone_id=line["phone_number_id"]
+                )
+                audio_media_id = up_audio.get("id") if isinstance(up_audio, dict) else None
+                # Solo ogg/opus se renderiza como PTT; si no es ogg, forzamos voice=False
+                audio_as_voice = bool(bc.get("audio_as_voice", True)) and (aext in ("ogg", "opus"))
 
         # Rate limiting: spread over time
         max_per_hour = bc["max_per_hour"]
@@ -8999,18 +9906,37 @@ async def _broadcast_worker(broadcast_id: str, line: dict):
             personalized = bc["message"].replace("{nombre}", first_name).replace("{linea}", line.get("name", ""))
 
             try:
+                # Send logic:
+                #   - Si hay imagen → imagen con caption (texto)
+                #   - Si hay audio (sin imagen) → audio + texto separado (audio no soporta caption)
+                #   - Si solo texto → texto plano
+                res = None
+                status_code = None
                 if image_media_id:
                     res = await wa_send_image(
                         phone=t["phone"], media_id=image_media_id, caption=personalized,
                         token=line["whatsapp_token"], phone_id=line["phone_number_id"]
                     )
+                elif audio_media_id:
+                    res = await wa_send_audio(
+                        phone=t["phone"], media_id=audio_media_id,
+                        token=line["whatsapp_token"], phone_id=line["phone_number_id"],
+                        as_voice=audio_as_voice,
+                    )
+                    # Si hay texto además del audio, lo mandamos como mensaje separado.
+                    # WhatsApp audio NO soporta caption — por eso se envía aparte.
+                    if personalized.strip():
+                        await asyncio.sleep(random.uniform(0.8, 1.6))
+                        await wa_send_text(
+                            phone=t["phone"], message=personalized,
+                            token=line["whatsapp_token"], phone_id=line["phone_number_id"]
+                        )
                 else:
                     res = await wa_send_text(
                         phone=t["phone"], message=personalized,
                         token=line["whatsapp_token"], phone_id=line["phone_number_id"]
                     )
                 ok = isinstance(res, dict) and "error" not in res and res.get("messages")
-                status_code = None
                 if isinstance(res, dict) and res.get("error"):
                     err = res.get("error")
                     if isinstance(err, dict):
@@ -9381,21 +10307,21 @@ async def startup():
         logger.error(f"MongoDB connection FAILED: {e}")
         return
     # Create admin user if not exists
-#    existing = await db.users.find_one({"email": "admin@maxi.com"})
-#    if not existing:
-#        hashed = pwd_context.hash("admin123")
-#        await db.users.insert_one({
-#            "id": str(uuid.uuid4()),
-#            "email": "admin@maxi.com",
-#            "hashed_password": hashed,
-#            "role": "admin",
-#            "is_active": True,
-#            "welcome_message": "",
-#            "user_message": "",
-#            "line_ids": [],
-#            "created_at": datetime.now(timezone.utc).isoformat(),
-#        })
-#        logger.info("Admin user created: admin@maxi.com")
+    existing = await db.users.find_one({"email": "admin@maxi.com"})
+    if not existing:
+        hashed = pwd_context.hash("admin123")
+        await db.users.insert_one({
+            "id": str(uuid.uuid4()),
+            "email": "admin@maxi.com",
+            "hashed_password": hashed,
+            "role": "admin",
+            "is_active": True,
+            "welcome_message": "",
+            "user_message": "",
+            "line_ids": [],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.info("Admin user created: admin@maxi.com")
     # Create cajero user if not exists 
 #    existing_cajero = await db.users.find_one({"email": "cajero@blackguardian.com"})
 #    if not existing_cajero:
