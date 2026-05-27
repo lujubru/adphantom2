@@ -1234,6 +1234,7 @@ export default function LeadsCRM() {
             pwaInstalled={pwaInstalled}
             onInstall={installPWA}
             onBroadcast={() => setBroadcastOpen(true)}
+            onFinanzas={() => setFinanzasOpen(true)}
             onRefresh={loadLeads}
             onContactsExport={async () => {
               try {
