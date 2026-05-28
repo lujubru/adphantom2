@@ -7846,12 +7846,30 @@ class FinanzasBonusRateUpdate(BaseModel):
 
 class FinanzasExpenseCreate(BaseModel):
     amount: float
-    observation: str
+    category_id: Optional[str] = None  # nuevo: categoría seleccionada
+    observation: Optional[str] = ""    # legacy / texto libre opcional
 
 
 class FinanzasExpenseUpdate(BaseModel):
     amount: float
-    observation: str
+    category_id: Optional[str] = None
+    observation: Optional[str] = ""
+
+
+class FinanzasCategoryCreate(BaseModel):
+    type: str  # "plataforma" | "ingreso_manual" | "egreso"
+    name: str
+
+
+class FinanzasManualIncomeCreate(BaseModel):
+    amount: float
+    category_id: str  # plataforma o tipo de ingreso manual
+    observation: Optional[str] = ""
+
+
+class FinanzasCargaPlatformAssign(BaseModel):
+    lead_id: str
+    category_id: Optional[str] = None  # None = quitar asignación
 
 
 def _today_utc_iso_date() -> str:
@@ -7943,6 +7961,27 @@ async def _finanzas_ingresos_by_day(user_id: str, start_iso: str, end_iso: str) 
     return by_day
 
 
+async def _finanzas_manual_ingresos_by_day(user_id: str, start_iso: str, end_iso: str) -> Dict[str, float]:
+    """Suma de ingresos manuales por día (cargas que el cajero ingresa a mano,
+    independientes del embudo del CRM)."""
+    start_dt = f"{start_iso}T00:00:00"
+    end_dt = f"{end_iso}T23:59:59.999"
+    by_day: Dict[str, float] = {}
+    cursor = db.cajero_manual_ingresos.find(
+        {"user_id": user_id, "created_at": {"$gte": start_dt, "$lte": end_dt}},
+        {"_id": 0, "created_at": 1, "amount": 1},
+    )
+    async for ing in cursor:
+        d = (ing.get("created_at") or "")[:10]
+        if not d:
+            continue
+        try:
+            by_day[d] = by_day.get(d, 0.0) + float(ing.get("amount") or 0)
+        except Exception:
+            pass
+    return by_day
+
+
 async def _finanzas_egresos_by_day(user_id: str, start_iso: str, end_iso: str) -> Dict[str, float]:
     start_dt = f"{start_iso}T00:00:00"
     end_dt = f"{end_iso}T23:59:59.999"
@@ -7993,7 +8032,8 @@ async def _finanzas_get_cargas_list(user_id: str, start_iso: str, end_iso: str) 
     cursor = db.crm_leads.find(
         query,
         {"_id": 0, "id": 1, "name": 1, "phone": 1, "line_id": 1, "line_name": 1,
-         "created_at": 1, "charge_amount": 1},
+         "created_at": 1, "charge_amount": 1,
+         "finanzas_plataforma_id": 1, "finanzas_plataforma_name": 1},
     ).sort("created_at", -1)
     async for lead in cursor:
         try:
@@ -8014,6 +8054,8 @@ async def _finanzas_get_cargas_list(user_id: str, start_iso: str, end_iso: str) 
             "bono_pct": rate,
             "bono": bono,
             "fichas_entregadas": round(value + bono, 2),
+            "plataforma_id": lead.get("finanzas_plataforma_id"),
+            "plataforma_name": lead.get("finanzas_plataforma_name"),
         })
     return cargas
 
@@ -8138,24 +8180,28 @@ async def finanzas_summary(
     user_id: Optional[str] = None,
     current_user=Depends(get_current_user),
 ):
-    """Resumen agregado del rango: ingresos, egresos, bono, fichas entregadas, balance."""
+    """Resumen agregado del rango: ingresos, egresos, bono, balances panel/general."""
     target_uid = _finanzas_get_target_user_id(current_user, user_id)
     start_iso, end_iso = _finanzas_resolve_date_range(filter_type, start_date, end_date)
-    ingresos = await _finanzas_ingresos_by_day(target_uid, start_iso, end_iso)
+    ingresos_embudo = await _finanzas_ingresos_by_day(target_uid, start_iso, end_iso)
+    ingresos_manual = await _finanzas_manual_ingresos_by_day(target_uid, start_iso, end_iso)
     egresos = await _finanzas_egresos_by_day(target_uid, start_iso, end_iso)
-    bono = await _finanzas_compute_bono_by_day(target_uid, ingresos)
+    # El bono se calcula SOLO sobre los ingresos del embudo (cargas del CRM).
+    # Los ingresos manuales NO generan bono (ya son cargas externas/conciliación).
+    bono = await _finanzas_compute_bono_by_day(target_uid, ingresos_embudo)
 
-    total_ingresos = round(sum(ingresos.values()), 2)
+    total_ingresos_embudo = round(sum(ingresos_embudo.values()), 2)
+    total_ingresos_manual = round(sum(ingresos_manual.values()), 2)
+    total_ingresos = round(total_ingresos_embudo + total_ingresos_manual, 2)
     total_egresos = round(sum(egresos.values()), 2)
     total_bono = round(sum(bono.values()), 2)
-    # Fichas entregadas = plata ingresada (en fichas) + bono regalado al cliente.
-    # Es lo que el CLIENTE recibió en fichas.
-    fichas_entregadas = round(total_ingresos + total_bono, 2)
-    # Balance de PLATA neta del cajero = lo que cobró - lo que gastó.
-    # El bono NO se resta porque son fichas (no plata real que sale del bolsillo).
-    balance = round(total_ingresos - total_egresos, 2)
 
-    # Conteo de cargas válidas (= cuántos "valido" generaron ingreso en el período)
+    # BALANCE PANEL = ingresos − bono (lo que vale tu caja en fichas)
+    balance_panel = round(total_ingresos - total_bono, 2)
+    # BALANCE GENERAL = ingresos − bono − egresos (caja real después de todo)
+    balance_general = round(total_ingresos - total_bono - total_egresos, 2)
+
+    # Conteo de cargas válidas (del embudo, no de las manuales)
     user = await db.users.find_one({"id": target_uid}, {"_id": 0, "line_ids": 1, "role": 1})
     line_filter: Dict = {}
     total_cargas = 0
@@ -8168,7 +8214,7 @@ async def finanzas_summary(
             "created_at": {"$gte": f"{start_iso}T00:00:00", "$lte": f"{end_iso}T23:59:59.999"},
             "charge_amount": {"$gt": 0},
         })
-    avg_por_carga = round(total_ingresos / total_cargas, 2) if total_cargas > 0 else 0.0
+    avg_por_carga = round(total_ingresos_embudo / total_cargas, 2) if total_cargas > 0 else 0.0
 
     current_rate = await _finanzas_get_current_bonus_rate(target_uid)
     cur = (os.environ.get("PURCHASE_CURRENCY") or "USD").upper().strip()
@@ -8177,10 +8223,12 @@ async def finanzas_summary(
         "range": {"start": start_iso, "end": end_iso, "filter_type": filter_type},
         "totals": {
             "ingresos": total_ingresos,
+            "ingresos_embudo": total_ingresos_embudo,
+            "ingresos_manual": total_ingresos_manual,
             "egresos": total_egresos,
             "bono": total_bono,
-            "fichas_entregadas": fichas_entregadas,
-            "balance": balance,
+            "balance_panel": balance_panel,
+            "balance_general": balance_general,
             "total_cargas": total_cargas,
             "avg_por_carga": avg_por_carga,
         },
@@ -8246,17 +8294,25 @@ async def finanzas_create_expense(
 ):
     if payload.amount <= 0:
         raise HTTPException(status_code=400, detail="El monto debe ser mayor a 0")
+    cat_name = None
+    if payload.category_id:
+        cat = await db.finanzas_categories.find_one(
+            {"id": payload.category_id, "user_id": current_user["id"]}
+        )
+        if not cat:
+            raise HTTPException(status_code=400, detail="Categoría inválida")
+        cat_name = cat.get("name")
     obs = (payload.observation or "").strip()
-    if not obs:
-        raise HTTPException(status_code=400, detail="La observación es obligatoria")
-    if len(obs) > 300:
-        raise HTTPException(status_code=400, detail="Observación muy larga (máx 300)")
+    if not payload.category_id and not obs:
+        raise HTTPException(status_code=400, detail="Elegí una categoría o ingresá una observación")
     doc = {
         "id": str(uuid.uuid4()),
         "user_id": current_user["id"],
         "user_email": current_user.get("email"),
         "amount": round(float(payload.amount), 2),
-        "observation": obs,
+        "category_id": payload.category_id,
+        "category_name": cat_name,
+        "observation": obs[:300],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.cajero_expenses.insert_one(doc)
@@ -8306,13 +8362,23 @@ async def finanzas_update_expense(
         raise HTTPException(status_code=403, detail="Solo se puede editar el día que se creó")
     if payload.amount <= 0:
         raise HTTPException(status_code=400, detail="El monto debe ser mayor a 0")
+    cat_name = None
+    if payload.category_id:
+        cat = await db.finanzas_categories.find_one(
+            {"id": payload.category_id, "user_id": current_user["id"]}
+        )
+        if not cat:
+            raise HTTPException(status_code=400, detail="Categoría inválida")
+        cat_name = cat.get("name")
     obs = (payload.observation or "").strip()
-    if not obs:
-        raise HTTPException(status_code=400, detail="La observación es obligatoria")
+    if not payload.category_id and not obs:
+        raise HTTPException(status_code=400, detail="Elegí una categoría o ingresá una observación")
     await db.cajero_expenses.update_one(
         {"id": expense_id},
         {"$set": {
             "amount": round(float(payload.amount), 2),
+            "category_id": payload.category_id,
+            "category_name": cat_name,
             "observation": obs[:300],
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }},
@@ -8336,6 +8402,195 @@ async def finanzas_delete_expense(
         raise HTTPException(status_code=403, detail="Solo se puede borrar el día que se creó")
     await db.cajero_expenses.delete_one({"id": expense_id})
     return {"ok": True}
+
+
+
+# ════════════════════════════════════════════════════════════════════
+# CATEGORÍAS configurables: plataformas, tipos de ingreso, tipos de egreso
+# ════════════════════════════════════════════════════════════════════
+
+_VALID_CATEGORY_TYPES = {"plataforma", "ingreso_manual", "egreso"}
+
+
+@api_router.get("/finanzas/categories")
+async def finanzas_list_categories(
+    type: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    query: Dict = {"user_id": current_user["id"]}
+    if type:
+        if type not in _VALID_CATEGORY_TYPES:
+            raise HTTPException(status_code=400, detail=f"type debe ser uno de {sorted(_VALID_CATEGORY_TYPES)}")
+        query["type"] = type
+    items = []
+    cursor = db.finanzas_categories.find(query, {"_id": 0}).sort("name", 1)
+    async for c in cursor:
+        items.append(c)
+    return {"categories": items}
+
+
+@api_router.post("/finanzas/categories")
+async def finanzas_create_category(
+    payload: FinanzasCategoryCreate,
+    current_user=Depends(get_current_user),
+):
+    if payload.type not in _VALID_CATEGORY_TYPES:
+        raise HTTPException(status_code=400, detail="Tipo inválido")
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Nombre requerido")
+    if len(name) > 60:
+        raise HTTPException(status_code=400, detail="Nombre muy largo (máx 60)")
+    # Evitar duplicados por (user, type, name) case-insensitive
+    existing = await db.finanzas_categories.find_one({
+        "user_id": current_user["id"],
+        "type": payload.type,
+        "name_lower": name.lower(),
+    })
+    if existing:
+        raise HTTPException(status_code=409, detail="Ya existe una categoría con ese nombre")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": current_user["id"],
+        "type": payload.type,
+        "name": name,
+        "name_lower": name.lower(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.finanzas_categories.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api_router.delete("/finanzas/categories/{category_id}")
+async def finanzas_delete_category(
+    category_id: str,
+    current_user=Depends(get_current_user),
+):
+    cat = await db.finanzas_categories.find_one({"id": category_id, "user_id": current_user["id"]})
+    if not cat:
+        raise HTTPException(status_code=404, detail="Categoría no encontrada")
+    await db.finanzas_categories.delete_one({"id": category_id})
+    # Las cargas/ingresos/egresos ya creados conservan el category_id histórico
+    # (en frontend se mostrará "Sin categoría" si no se encuentra).
+    return {"ok": True}
+
+
+# ════════════════════════════════════════════════════════════════════
+# INGRESOS MANUALES
+# ════════════════════════════════════════════════════════════════════
+
+@api_router.post("/finanzas/manual-incomes")
+async def finanzas_create_manual_income(
+    payload: FinanzasManualIncomeCreate,
+    current_user=Depends(get_current_user),
+):
+    if payload.amount <= 0:
+        raise HTTPException(status_code=400, detail="El monto debe ser mayor a 0")
+    cat = await db.finanzas_categories.find_one(
+        {"id": payload.category_id, "user_id": current_user["id"]}
+    )
+    if not cat:
+        raise HTTPException(status_code=400, detail="Categoría inválida")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": current_user["id"],
+        "amount": round(float(payload.amount), 2),
+        "category_id": payload.category_id,
+        "category_name": cat.get("name"),
+        "observation": (payload.observation or "").strip()[:300],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.cajero_manual_ingresos.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api_router.get("/finanzas/manual-incomes")
+async def finanzas_list_manual_incomes(
+    filter_type: Optional[str] = "mensual",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user_id: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    target_uid = _finanzas_get_target_user_id(current_user, user_id)
+    start_iso, end_iso = _finanzas_resolve_date_range(filter_type, start_date, end_date)
+    start_dt = f"{start_iso}T00:00:00"
+    end_dt = f"{end_iso}T23:59:59.999"
+    items = []
+    cursor = db.cajero_manual_ingresos.find(
+        {"user_id": target_uid, "created_at": {"$gte": start_dt, "$lte": end_dt}},
+        {"_id": 0},
+    ).sort("created_at", -1)
+    today_iso = _today_utc_iso_date()
+    async for it in cursor:
+        it_date = (it.get("created_at") or "")[:10]
+        it["editable"] = (it_date == today_iso)
+        items.append(it)
+    return {"items": items, "range": {"start": start_iso, "end": end_iso}}
+
+
+@api_router.delete("/finanzas/manual-incomes/{income_id}")
+async def finanzas_delete_manual_income(
+    income_id: str,
+    current_user=Depends(get_current_user),
+):
+    ing = await db.cajero_manual_ingresos.find_one({"id": income_id}, {"_id": 0})
+    if not ing:
+        raise HTTPException(status_code=404, detail="Ingreso no encontrado")
+    is_admin = current_user.get("role") in ("admin", "superadmin")
+    if ing["user_id"] != current_user["id"] and not is_admin:
+        raise HTTPException(status_code=403, detail="No es tu ingreso")
+    ing_date = (ing.get("created_at") or "")[:10]
+    if ing_date != _today_utc_iso_date() and not is_admin:
+        raise HTTPException(status_code=403, detail="Solo se puede borrar el día que se creó")
+    await db.cajero_manual_ingresos.delete_one({"id": income_id})
+    return {"ok": True}
+
+
+# ════════════════════════════════════════════════════════════════════
+# Asignación de plataforma a cargas del CRM (lead.finanzas_plataforma_id)
+# ════════════════════════════════════════════════════════════════════
+
+@api_router.post("/finanzas/cargas/assign-platform")
+async def finanzas_assign_platform_to_carga(
+    payload: FinanzasCargaPlatformAssign,
+    current_user=Depends(get_current_user),
+):
+    """Asigna (o desasigna) una plataforma a un lead 'valido' para tracking."""
+    lead = await db.crm_leads.find_one({"id": payload.lead_id}, {"_id": 0, "line_id": 1})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead no encontrado")
+    # Validación de categoría si viene
+    if payload.category_id:
+        cat = await db.finanzas_categories.find_one(
+            {"id": payload.category_id, "user_id": current_user["id"], "type": "plataforma"}
+        )
+        if not cat:
+            raise HTTPException(status_code=400, detail="Plataforma inválida")
+        await db.crm_leads.update_one(
+            {"id": payload.lead_id},
+            {"$set": {
+                "finanzas_plataforma_id": payload.category_id,
+                "finanzas_plataforma_name": cat.get("name"),
+                "finanzas_plataforma_assigned_at": datetime.now(timezone.utc).isoformat(),
+                "finanzas_plataforma_assigned_by": current_user["id"],
+            }},
+        )
+    else:
+        await db.crm_leads.update_one(
+            {"id": payload.lead_id},
+            {"$unset": {
+                "finanzas_plataforma_id": "",
+                "finanzas_plataforma_name": "",
+                "finanzas_plataforma_assigned_at": "",
+                "finanzas_plataforma_assigned_by": "",
+            }},
+        )
+    return {"ok": True}
+
+
 
 
 
