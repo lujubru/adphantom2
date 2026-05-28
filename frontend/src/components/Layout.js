@@ -74,7 +74,7 @@ const Layout = () => {
             <div className="flex items-center space-x-8">
               <div className="flex items-center space-x-2">
                 <img src="/logo.png" alt="aplicacion" className="h-10 w-10 rounded-lg object-contain" />
-                <span className={`font-bold text-lg ${darkMode ? 'text-white' : 'text-gray-900'}`}>aplicacion</span>
+                <span className={`font-bold text-lg ${darkMode ? 'text-white' : 'text-gray-900'}`}>Black Guardian</span>
               </div>
               <div className="hidden md:flex space-x-1">
                 {navItems.map((item) => {
