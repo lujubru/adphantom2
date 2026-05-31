@@ -7865,7 +7865,12 @@ class FinanzasManualIncomeCreate(BaseModel):
     amount: float
     category_id: str  # plataforma o tipo de ingreso manual
     observation: Optional[str] = ""
-    bonus_percentage: Optional[float] = 0.0  # % de bono que el cajero regaló en ESTA carga manual
+
+
+class FinanzasBonoPanelCreate(BaseModel):
+    amount: float
+    observation: Optional[str] = ""
+    category_id: Optional[str] = None  # opcional: plataforma asociada
 
 
 class FinanzasCargaPlatformAssign(BaseModel):
@@ -7983,22 +7988,22 @@ async def _finanzas_manual_ingresos_by_day(user_id: str, start_iso: str, end_iso
     return by_day
 
 
-async def _finanzas_manual_bonos_by_day(user_id: str, start_iso: str, end_iso: str) -> Dict[str, float]:
-    """Suma de bonos asociados a ingresos manuales (cada ingreso manual puede
-    venir con su propio % de bono que el cajero regaló al cargar desde fuera)."""
+async def _finanzas_bonos_panel_by_day(user_id: str, start_iso: str, end_iso: str) -> Dict[str, float]:
+    """Suma de bonos panel cargados manualmente por el cajero al final del día.
+    Es independiente del bono del CRM (que viene del % × cargas válidas embudo)."""
     start_dt = f"{start_iso}T00:00:00"
     end_dt = f"{end_iso}T23:59:59.999"
     by_day: Dict[str, float] = {}
-    cursor = db.cajero_manual_ingresos.find(
+    cursor = db.cajero_bonos_panel.find(
         {"user_id": user_id, "created_at": {"$gte": start_dt, "$lte": end_dt}},
-        {"_id": 0, "created_at": 1, "bonus_amount": 1},
+        {"_id": 0, "created_at": 1, "amount": 1},
     )
-    async for ing in cursor:
-        d = (ing.get("created_at") or "")[:10]
+    async for b in cursor:
+        d = (b.get("created_at") or "")[:10]
         if not d:
             continue
         try:
-            by_day[d] = by_day.get(d, 0.0) + float(ing.get("bonus_amount") or 0)
+            by_day[d] = by_day.get(d, 0.0) + float(b.get("amount") or 0)
         except Exception:
             pass
     return by_day
@@ -8208,18 +8213,18 @@ async def finanzas_summary(
     ingresos_embudo = await _finanzas_ingresos_by_day(target_uid, start_iso, end_iso)
     ingresos_manual = await _finanzas_manual_ingresos_by_day(target_uid, start_iso, end_iso)
     egresos = await _finanzas_egresos_by_day(target_uid, start_iso, end_iso)
-    # Bono del embudo: % vigente día por día × cargas válidas del CRM
-    bono_embudo = await _finanzas_compute_bono_by_day(target_uid, ingresos_embudo)
-    # Bono manual: bonus_amount guardado en cada ingreso manual (% individual elegido al cargar)
-    bono_manual = await _finanzas_manual_bonos_by_day(target_uid, start_iso, end_iso)
+    # Bono del CRM: % vigente día por día × cargas válidas del embudo
+    bono_by_day = await _finanzas_compute_bono_by_day(target_uid, ingresos_embudo)
+    # Bonos Panel: cargados manualmente por el cajero al final del día
+    # (independientes del bono del CRM, informativos)
+    bonos_panel_by_day = await _finanzas_bonos_panel_by_day(target_uid, start_iso, end_iso)
 
     total_ingresos_embudo = round(sum(ingresos_embudo.values()), 2)
     total_ingresos_manual = round(sum(ingresos_manual.values()), 2)
     total_ingresos = round(total_ingresos_embudo + total_ingresos_manual, 2)
     total_egresos = round(sum(egresos.values()), 2)
-    total_bono_embudo = round(sum(bono_embudo.values()), 2)
-    total_bono_manual = round(sum(bono_manual.values()), 2)
-    total_bono = round(total_bono_embudo + total_bono_manual, 2)
+    total_bono = round(sum(bono_by_day.values()), 2)
+    total_bono_panel = round(sum(bonos_panel_by_day.values()), 2)
 
     # BALANCE PANEL = ingresos − bono (lo que vale tu caja en fichas)
     balance_panel = round(total_ingresos - total_bono, 2)
@@ -8252,8 +8257,7 @@ async def finanzas_summary(
             "ingresos_manual": total_ingresos_manual,
             "egresos": total_egresos,
             "bono": total_bono,
-            "bono_embudo": total_bono_embudo,
-            "bono_manual": total_bono_manual,
+            "bono_panel": total_bono_panel,
             "balance_panel": balance_panel,
             "balance_general": balance_general,
             "total_cargas": total_cargas,
@@ -8291,15 +8295,14 @@ async def finanzas_chart(
     user_id: Optional[str] = None,
     current_user=Depends(get_current_user),
 ):
-    """Breakdown diario para gráfico: [{date, ingresos, egresos, bono}].
-    Ingresos = embudo + manual. Bono = bono embudo + bono manual."""
+    """Breakdown diario para gráfico: [{date, ingresos, egresos, bono, bono_panel}]."""
     target_uid = _finanzas_get_target_user_id(current_user, user_id)
     start_iso, end_iso = _finanzas_resolve_date_range(filter_type, start_date, end_date)
     ingresos_embudo = await _finanzas_ingresos_by_day(target_uid, start_iso, end_iso)
     ingresos_manual = await _finanzas_manual_ingresos_by_day(target_uid, start_iso, end_iso)
     egresos = await _finanzas_egresos_by_day(target_uid, start_iso, end_iso)
-    bono_embudo = await _finanzas_compute_bono_by_day(target_uid, ingresos_embudo)
-    bono_manual = await _finanzas_manual_bonos_by_day(target_uid, start_iso, end_iso)
+    bono = await _finanzas_compute_bono_by_day(target_uid, ingresos_embudo)
+    bono_panel = await _finanzas_bonos_panel_by_day(target_uid, start_iso, end_iso)
 
     start = datetime.fromisoformat(start_iso).date()
     end = datetime.fromisoformat(end_iso).date()
@@ -8311,7 +8314,8 @@ async def finanzas_chart(
             "date": d,
             "ingresos": round(ingresos_embudo.get(d, 0.0) + ingresos_manual.get(d, 0.0), 2),
             "egresos": round(egresos.get(d, 0.0), 2),
-            "bono": round(bono_embudo.get(d, 0.0) + bono_manual.get(d, 0.0), 2),
+            "bono": round(bono.get(d, 0.0), 2),
+            "bono_panel": round(bono_panel.get(d, 0.0), 2),
         })
         cur = cur + timedelta(days=1)
     return {"series": series, "range": {"start": start_iso, "end": end_iso}}
@@ -8522,10 +8526,6 @@ async def finanzas_create_manual_income(
     )
     if not cat:
         raise HTTPException(status_code=400, detail="Categoría inválida")
-    pct = float(payload.bonus_percentage or 0)
-    if pct < 0 or pct > 200:
-        raise HTTPException(status_code=400, detail="El % de bono debe estar entre 0 y 200")
-    bonus_amount = round(payload.amount * pct / 100.0, 2)
     doc = {
         "id": str(uuid.uuid4()),
         "user_id": current_user["id"],
@@ -8533,8 +8533,6 @@ async def finanzas_create_manual_income(
         "category_id": payload.category_id,
         "category_name": cat.get("name"),
         "observation": (payload.observation or "").strip()[:300],
-        "bonus_percentage": pct,
-        "bonus_amount": bonus_amount,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.cajero_manual_ingresos.insert_one(doc)
@@ -8583,6 +8581,88 @@ async def finanzas_delete_manual_income(
         raise HTTPException(status_code=403, detail="Solo se puede borrar el día que se creó")
     await db.cajero_manual_ingresos.delete_one({"id": income_id})
     return {"ok": True}
+
+
+# ════════════════════════════════════════════════════════════════════
+# BONOS PANEL — bono cargado manualmente al final del día
+# ════════════════════════════════════════════════════════════════════
+# El cajero, cuando recibe +500 cargas diarias, no llega a procesar todas
+# por el CRM. Para no perder la métrica, al final del día carga aquí el
+# monto total de bono que repartió desde el panel. Es INFORMATIVO y NO
+# afecta el balance (el balance ya descuenta el bono propio del CRM).
+
+@api_router.post("/finanzas/bonos-panel")
+async def finanzas_create_bono_panel(
+    payload: FinanzasBonoPanelCreate,
+    current_user=Depends(get_current_user),
+):
+    if payload.amount <= 0:
+        raise HTTPException(status_code=400, detail="El monto debe ser mayor a 0")
+    cat_name = None
+    if payload.category_id:
+        cat = await db.finanzas_categories.find_one(
+            {"id": payload.category_id, "user_id": current_user["id"]}
+        )
+        if not cat:
+            raise HTTPException(status_code=400, detail="Categoría inválida")
+        cat_name = cat.get("name")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": current_user["id"],
+        "amount": round(float(payload.amount), 2),
+        "category_id": payload.category_id,
+        "category_name": cat_name,
+        "observation": (payload.observation or "").strip()[:300],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.cajero_bonos_panel.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api_router.get("/finanzas/bonos-panel")
+async def finanzas_list_bonos_panel(
+    filter_type: Optional[str] = "mensual",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user_id: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    target_uid = _finanzas_get_target_user_id(current_user, user_id)
+    start_iso, end_iso = _finanzas_resolve_date_range(filter_type, start_date, end_date)
+    start_dt = f"{start_iso}T00:00:00"
+    end_dt = f"{end_iso}T23:59:59.999"
+    items = []
+    cursor = db.cajero_bonos_panel.find(
+        {"user_id": target_uid, "created_at": {"$gte": start_dt, "$lte": end_dt}},
+        {"_id": 0},
+    ).sort("created_at", -1)
+    today_iso = _today_utc_iso_date()
+    async for it in cursor:
+        it_date = (it.get("created_at") or "")[:10]
+        it["editable"] = (it_date == today_iso)
+        items.append(it)
+    return {"items": items, "range": {"start": start_iso, "end": end_iso}}
+
+
+@api_router.delete("/finanzas/bonos-panel/{bono_id}")
+async def finanzas_delete_bono_panel(
+    bono_id: str,
+    current_user=Depends(get_current_user),
+):
+    bn = await db.cajero_bonos_panel.find_one({"id": bono_id}, {"_id": 0})
+    if not bn:
+        raise HTTPException(status_code=404, detail="No encontrado")
+    is_admin = current_user.get("role") in ("admin", "superadmin")
+    if bn["user_id"] != current_user["id"] and not is_admin:
+        raise HTTPException(status_code=403, detail="No es tu bono")
+    bn_date = (bn.get("created_at") or "")[:10]
+    if bn_date != _today_utc_iso_date() and not is_admin:
+        raise HTTPException(status_code=403, detail="Solo se puede borrar el día que se creó")
+    await db.cajero_bonos_panel.delete_one({"id": bono_id})
+    return {"ok": True}
+
+
 
 
 # ════════════════════════════════════════════════════════════════════
