@@ -7865,6 +7865,7 @@ class FinanzasManualIncomeCreate(BaseModel):
     amount: float
     category_id: str  # plataforma o tipo de ingreso manual
     observation: Optional[str] = ""
+    bonus_percentage: Optional[float] = 0.0  # % de bono que el cajero regaló en ESTA carga manual
 
 
 class FinanzasCargaPlatformAssign(BaseModel):
@@ -7977,6 +7978,27 @@ async def _finanzas_manual_ingresos_by_day(user_id: str, start_iso: str, end_iso
             continue
         try:
             by_day[d] = by_day.get(d, 0.0) + float(ing.get("amount") or 0)
+        except Exception:
+            pass
+    return by_day
+
+
+async def _finanzas_manual_bonos_by_day(user_id: str, start_iso: str, end_iso: str) -> Dict[str, float]:
+    """Suma de bonos asociados a ingresos manuales (cada ingreso manual puede
+    venir con su propio % de bono que el cajero regaló al cargar desde fuera)."""
+    start_dt = f"{start_iso}T00:00:00"
+    end_dt = f"{end_iso}T23:59:59.999"
+    by_day: Dict[str, float] = {}
+    cursor = db.cajero_manual_ingresos.find(
+        {"user_id": user_id, "created_at": {"$gte": start_dt, "$lte": end_dt}},
+        {"_id": 0, "created_at": 1, "bonus_amount": 1},
+    )
+    async for ing in cursor:
+        d = (ing.get("created_at") or "")[:10]
+        if not d:
+            continue
+        try:
+            by_day[d] = by_day.get(d, 0.0) + float(ing.get("bonus_amount") or 0)
         except Exception:
             pass
     return by_day
@@ -8186,15 +8208,18 @@ async def finanzas_summary(
     ingresos_embudo = await _finanzas_ingresos_by_day(target_uid, start_iso, end_iso)
     ingresos_manual = await _finanzas_manual_ingresos_by_day(target_uid, start_iso, end_iso)
     egresos = await _finanzas_egresos_by_day(target_uid, start_iso, end_iso)
-    # El bono se calcula SOLO sobre los ingresos del embudo (cargas del CRM).
-    # Los ingresos manuales NO generan bono (ya son cargas externas/conciliación).
-    bono = await _finanzas_compute_bono_by_day(target_uid, ingresos_embudo)
+    # Bono del embudo: % vigente día por día × cargas válidas del CRM
+    bono_embudo = await _finanzas_compute_bono_by_day(target_uid, ingresos_embudo)
+    # Bono manual: bonus_amount guardado en cada ingreso manual (% individual elegido al cargar)
+    bono_manual = await _finanzas_manual_bonos_by_day(target_uid, start_iso, end_iso)
 
     total_ingresos_embudo = round(sum(ingresos_embudo.values()), 2)
     total_ingresos_manual = round(sum(ingresos_manual.values()), 2)
     total_ingresos = round(total_ingresos_embudo + total_ingresos_manual, 2)
     total_egresos = round(sum(egresos.values()), 2)
-    total_bono = round(sum(bono.values()), 2)
+    total_bono_embudo = round(sum(bono_embudo.values()), 2)
+    total_bono_manual = round(sum(bono_manual.values()), 2)
+    total_bono = round(total_bono_embudo + total_bono_manual, 2)
 
     # BALANCE PANEL = ingresos − bono (lo que vale tu caja en fichas)
     balance_panel = round(total_ingresos - total_bono, 2)
@@ -8227,6 +8252,8 @@ async def finanzas_summary(
             "ingresos_manual": total_ingresos_manual,
             "egresos": total_egresos,
             "bono": total_bono,
+            "bono_embudo": total_bono_embudo,
+            "bono_manual": total_bono_manual,
             "balance_panel": balance_panel,
             "balance_general": balance_general,
             "total_cargas": total_cargas,
@@ -8264,12 +8291,15 @@ async def finanzas_chart(
     user_id: Optional[str] = None,
     current_user=Depends(get_current_user),
 ):
-    """Breakdown diario para gráfico: [{date, ingresos, egresos, bono}]."""
+    """Breakdown diario para gráfico: [{date, ingresos, egresos, bono}].
+    Ingresos = embudo + manual. Bono = bono embudo + bono manual."""
     target_uid = _finanzas_get_target_user_id(current_user, user_id)
     start_iso, end_iso = _finanzas_resolve_date_range(filter_type, start_date, end_date)
-    ingresos = await _finanzas_ingresos_by_day(target_uid, start_iso, end_iso)
+    ingresos_embudo = await _finanzas_ingresos_by_day(target_uid, start_iso, end_iso)
+    ingresos_manual = await _finanzas_manual_ingresos_by_day(target_uid, start_iso, end_iso)
     egresos = await _finanzas_egresos_by_day(target_uid, start_iso, end_iso)
-    bono = await _finanzas_compute_bono_by_day(target_uid, ingresos)
+    bono_embudo = await _finanzas_compute_bono_by_day(target_uid, ingresos_embudo)
+    bono_manual = await _finanzas_manual_bonos_by_day(target_uid, start_iso, end_iso)
 
     start = datetime.fromisoformat(start_iso).date()
     end = datetime.fromisoformat(end_iso).date()
@@ -8279,9 +8309,9 @@ async def finanzas_chart(
         d = cur.isoformat()
         series.append({
             "date": d,
-            "ingresos": round(ingresos.get(d, 0.0), 2),
+            "ingresos": round(ingresos_embudo.get(d, 0.0) + ingresos_manual.get(d, 0.0), 2),
             "egresos": round(egresos.get(d, 0.0), 2),
-            "bono": round(bono.get(d, 0.0), 2),
+            "bono": round(bono_embudo.get(d, 0.0) + bono_manual.get(d, 0.0), 2),
         })
         cur = cur + timedelta(days=1)
     return {"series": series, "range": {"start": start_iso, "end": end_iso}}
@@ -8492,6 +8522,10 @@ async def finanzas_create_manual_income(
     )
     if not cat:
         raise HTTPException(status_code=400, detail="Categoría inválida")
+    pct = float(payload.bonus_percentage or 0)
+    if pct < 0 or pct > 200:
+        raise HTTPException(status_code=400, detail="El % de bono debe estar entre 0 y 200")
+    bonus_amount = round(payload.amount * pct / 100.0, 2)
     doc = {
         "id": str(uuid.uuid4()),
         "user_id": current_user["id"],
@@ -8499,6 +8533,8 @@ async def finanzas_create_manual_income(
         "category_id": payload.category_id,
         "category_name": cat.get("name"),
         "observation": (payload.observation or "").strip()[:300],
+        "bonus_percentage": pct,
+        "bonus_amount": bonus_amount,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.cajero_manual_ingresos.insert_one(doc)
