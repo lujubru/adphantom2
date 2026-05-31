@@ -106,16 +106,14 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
   const [miAmount, setMiAmount] = useState('');
   const [miCategoryId, setMiCategoryId] = useState('');
   const [miObs, setMiObs] = useState('');
-  const [miBonusPct, setMiBonusPct] = useState('');
   const [creatingMI, setCreatingMI] = useState(false);
 
-  // Cálculo en vivo del bono para el form de ingreso manual
-  const miBonusPreview = useMemo(() => {
-    const a = parseFloat(miAmount);
-    const p = parseFloat(miBonusPct);
-    if (Number.isNaN(a) || Number.isNaN(p) || a <= 0 || p <= 0) return 0;
-    return Math.round(a * p) / 100;
-  }, [miAmount, miBonusPct]);
+  // Bonos Panel — bono manual cargado al final del día (informativo, no afecta balance)
+  const [bonosPanel, setBonosPanel] = useState([]);
+  const [bpAmount, setBpAmount] = useState('');
+  const [bpCategoryId, setBpCategoryId] = useState('');
+  const [bpObs, setBpObs] = useState('');
+  const [creatingBP, setCreatingBP] = useState(false);
 
   // Egreso form
   const [exAmount, setExAmount] = useState('');
@@ -147,7 +145,7 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
 
   const loadAll = useCallback(async () => {
     try {
-      const [s, c, e, mi, b, cur, cg] = await Promise.all([
+      const [s, c, e, mi, b, cur, cg, bp] = await Promise.all([
         api.get('/finanzas/summary', { params }),
         api.get('/finanzas/chart', { params }),
         api.get('/finanzas/expenses', { params }),
@@ -155,6 +153,7 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
         api.get('/finanzas/bonus-rate'),
         api.get('/finanzas/currency'),
         api.get('/finanzas/cargas', { params: { ...params, limit: 500 } }),
+        api.get('/finanzas/bonos-panel', { params }),
       ]);
       setSummary(s.data);
       setChart(c.data.series || []);
@@ -164,6 +163,7 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
       setBonusHistory(b.data.history || []);
       setCurrency(cur.data.currency || 'USD');
       setCargas(cg.data.cargas || []);
+      setBonosPanel(bp.data.items || []);
     } catch (err) {
       toast.error(err?.response?.data?.detail || 'Error cargando finanzas');
     }
@@ -222,18 +222,13 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
     const amt = parseFloat(miAmount);
     if (Number.isNaN(amt) || amt <= 0) { toast.error('Monto inválido'); return; }
     if (!miCategoryId) { toast.error('Elegí una plataforma/tipo'); return; }
-    const pct = parseFloat(miBonusPct) || 0;
-    if (pct < 0 || pct > 200) { toast.error('% de bono fuera de rango'); return; }
     setCreatingMI(true);
     try {
       await api.post('/finanzas/manual-incomes', {
         amount: amt, category_id: miCategoryId, observation: miObs.trim(),
-        bonus_percentage: pct,
       });
-      toast.success(pct > 0
-        ? `Ingreso $${amt} + bono $${(amt*pct/100).toFixed(2)} (${pct}%) cargados`
-        : 'Ingreso cargado');
-      setMiAmount(''); setMiObs(''); setMiBonusPct('');
+      toast.success('Ingreso cargado');
+      setMiAmount(''); setMiObs('');
       loadAll();
     } catch (err) {
       toast.error(err?.response?.data?.detail || 'Error');
@@ -245,6 +240,38 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
     if (!window.confirm('¿Borrar este ingreso?')) return;
     try {
       await api.delete(`/finanzas/manual-incomes/${id}`);
+      toast.success('Borrado');
+      loadAll();
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || 'Error');
+    }
+  };
+
+  // ─── Bonos Panel ─────────────────────────────────────────────────
+  const submitBonoPanel = async () => {
+    const amt = parseFloat(bpAmount);
+    if (Number.isNaN(amt) || amt <= 0) { toast.error('Monto inválido'); return; }
+    setCreatingBP(true);
+    try {
+      await api.post('/finanzas/bonos-panel', {
+        amount: amt,
+        category_id: bpCategoryId || null,
+        observation: bpObs.trim(),
+      });
+      toast.success(`Bono panel ${fmtMoney(amt, currency)} cargado`);
+      setBpAmount(''); setBpObs(''); setBpCategoryId('');
+      loadAll();
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || 'Error');
+    } finally {
+      setCreatingBP(false);
+    }
+  };
+
+  const deleteBonoPanel = async (id) => {
+    if (!window.confirm('¿Borrar este bono?')) return;
+    try {
+      await api.delete(`/finanzas/bonos-panel/${id}`);
       toast.success('Borrado');
       loadAll();
     } catch (err) {
@@ -373,8 +400,8 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
             </div>
           </div>
 
-          {/* 4 cards: Ingresos, Egresos, Bono, Promedio */}
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          {/* 5 cards: Ingresos, Egresos, Bono CRM, Bonos Panel, Promedio */}
+          <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
             <div className="bg-slate-800/60 border border-slate-700 rounded-lg p-3">
               <div className="flex items-center gap-1.5 text-[11px] text-emerald-400 uppercase font-semibold">
                 <TrendingUp className="w-3.5 h-3.5" /> Ingresos
@@ -404,10 +431,17 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
                 {fmtMoney(totals.bono, currency)}
               </div>
               <div className="text-[10px] text-slate-500 mt-1">
-                {totals.bono_manual > 0
-                  ? `Embudo: ${fmtMoney(totals.bono_embudo, currency)} · Manual: ${fmtMoney(totals.bono_manual, currency)}`
-                  : `${totals.total_cargas || 0} carga${totals.total_cargas === 1 ? '' : 's'} · ${summary?.current_bonus_percentage ?? 0}% hoy`}
+                {totals.total_cargas || 0} carga{totals.total_cargas === 1 ? '' : 's'} · {summary?.current_bonus_percentage ?? 0}% hoy
               </div>
+            </div>
+            <div className="bg-slate-800/60 border border-amber-700/30 rounded-lg p-3">
+              <div className="flex items-center gap-1.5 text-[11px] text-amber-300 uppercase font-semibold">
+                <Gift className="w-3.5 h-3.5" /> Bonos Panel
+              </div>
+              <div className="text-xl font-bold text-amber-200 mt-1" data-testid="finanzas-bono-panel">
+                {fmtMoney(totals.bono_panel, currency)}
+              </div>
+              <div className="text-[10px] text-slate-500 mt-1">Cargado a mano (informativo)</div>
             </div>
             <div className="bg-slate-800/60 border border-slate-700 rounded-lg p-3">
               <div className="flex items-center gap-1.5 text-[11px] text-violet-400 uppercase font-semibold">
@@ -554,7 +588,7 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
             <div className="text-xs uppercase font-semibold text-slate-300 mb-2 flex items-center gap-2">
               <PiggyBank className="w-3.5 h-3.5 text-emerald-400" /> Ingresos manuales
             </div>
-            <div className="grid grid-cols-12 gap-2 mb-1">
+            <div className="grid grid-cols-12 gap-2 mb-2">
               <input type="number" min="0" step="0.01" placeholder="Monto"
                 value={miAmount} onChange={e => setMiAmount(e.target.value)}
                 data-testid="finanzas-mi-amount"
@@ -570,29 +604,16 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
                   {categories.ingreso_manual.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
                 </optgroup>
               </select>
-              <div className="col-span-2 relative">
-                <input type="number" min="0" max="200" step="0.5" placeholder="% bono"
-                  value={miBonusPct} onChange={e => setMiBonusPct(e.target.value)}
-                  data-testid="finanzas-mi-bonus-pct"
-                  className="w-full bg-slate-900 border border-amber-700/40 text-amber-200 rounded px-2 py-1.5 text-sm pr-6" />
-                <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-amber-500 pointer-events-none">%</span>
-              </div>
-              <input type="text" placeholder="Observación"
+              <input type="text" placeholder="Observación (opcional)"
                 value={miObs} onChange={e => setMiObs(e.target.value)} maxLength={300}
                 data-testid="finanzas-mi-obs"
-                className="col-span-2 bg-slate-900 border border-slate-600 text-white rounded px-2 py-1.5 text-sm" />
+                className="col-span-4 bg-slate-900 border border-slate-600 text-white rounded px-2 py-1.5 text-sm" />
               <Button onClick={submitManualIncome} disabled={creatingMI}
                 data-testid="finanzas-mi-submit-btn"
                 className="col-span-2 bg-emerald-600 hover:bg-emerald-700 h-9 flex items-center justify-center">
                 <Plus className="w-4 h-4" />
               </Button>
             </div>
-            {miBonusPreview > 0 && (
-              <div className="text-[11px] text-amber-300 mb-2 pl-1" data-testid="finanzas-mi-bonus-preview">
-                💡 Bono que regalás en esta carga: <strong>{fmtMoney(miBonusPreview, currency)}</strong>
-                {' '}· Fichas totales que recibe el cliente: <strong>{fmtMoney((parseFloat(miAmount) || 0) + miBonusPreview, currency)}</strong>
-              </div>
-            )}
             {manualIncomes.length === 0 ? (
               <div className="text-center text-slate-500 text-xs py-3">Sin ingresos manuales en este período</div>
             ) : (
@@ -602,11 +623,6 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-emerald-300 font-semibold">{fmtMoney(it.amount, currency)}</span>
-                        {Number(it.bonus_amount || 0) > 0 && (
-                          <span className="text-[11px] text-amber-300 bg-amber-950/30 px-1.5 py-0.5 rounded">
-                            + bono {fmtMoney(it.bonus_amount, currency)} ({it.bonus_percentage}%)
-                          </span>
-                        )}
                         <span className="text-[10px] text-cyan-400 bg-cyan-950/30 px-1.5 py-0.5 rounded">
                           {it.category_name || 'sin cat.'}
                         </span>
@@ -616,6 +632,68 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
                     </div>
                     {it.editable && (
                       <button onClick={() => deleteManualIncome(it.id)} title="Borrar"
+                        className="text-slate-400 hover:text-red-400 p-1">
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          {/* Bonos Panel — bonos cargados manualmente al final del día (informativo) */}
+          <div className="bg-slate-800/40 border border-amber-700/30 rounded-lg p-3">
+            <div className="text-xs uppercase font-semibold text-slate-300 mb-1 flex items-center gap-2">
+              <Gift className="w-3.5 h-3.5 text-amber-400" /> Bonos Panel
+              <span className="ml-auto text-[10px] normal-case font-normal text-slate-500">
+                Solo informativo, no afecta el balance
+              </span>
+            </div>
+            <p className="text-[11px] text-slate-500 mb-2">
+              Cargá acá el total de bonos que entregaste desde el panel (cuando no llegás a procesar las 500+ cargas por el CRM).
+            </p>
+            <div className="grid grid-cols-12 gap-2 mb-2">
+              <input type="number" min="0" step="0.01" placeholder="Monto"
+                value={bpAmount} onChange={e => setBpAmount(e.target.value)}
+                data-testid="finanzas-bp-amount"
+                className="col-span-3 bg-slate-900 border border-amber-700/40 text-amber-200 rounded px-2 py-1.5 text-sm" />
+              <select value={bpCategoryId} onChange={e => setBpCategoryId(e.target.value)}
+                data-testid="finanzas-bp-category"
+                className="col-span-3 bg-slate-900 border border-slate-600 text-white rounded px-2 py-1.5 text-sm">
+                <option value="">— plataforma (opc) —</option>
+                {categories.plataforma.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+              <input type="text" placeholder="Observación (opcional)"
+                value={bpObs} onChange={e => setBpObs(e.target.value)} maxLength={300}
+                data-testid="finanzas-bp-obs"
+                className="col-span-4 bg-slate-900 border border-slate-600 text-white rounded px-2 py-1.5 text-sm" />
+              <Button onClick={submitBonoPanel} disabled={creatingBP}
+                data-testid="finanzas-bp-submit-btn"
+                className="col-span-2 bg-amber-600 hover:bg-amber-700 h-9 flex items-center justify-center">
+                <Plus className="w-4 h-4" />
+              </Button>
+            </div>
+            {bonosPanel.length === 0 ? (
+              <div className="text-center text-slate-500 text-xs py-3">Sin bonos panel en este período</div>
+            ) : (
+              <ul className="space-y-1 max-h-44 overflow-y-auto">
+                {bonosPanel.map(it => (
+                  <li key={it.id} className="flex items-center gap-2 px-2 py-1.5 bg-slate-900/60 rounded text-sm">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-amber-300 font-semibold">{fmtMoney(it.amount, currency)}</span>
+                        {it.category_name && (
+                          <span className="text-[10px] text-cyan-400 bg-cyan-950/30 px-1.5 py-0.5 rounded">
+                            {it.category_name}
+                          </span>
+                        )}
+                      </div>
+                      {it.observation && <div className="text-[11px] text-slate-400 truncate">{it.observation}</div>}
+                      <div className="text-[10px] text-slate-500">{it.created_at?.slice(0, 16).replace('T', ' ')}</div>
+                    </div>
+                    {it.editable && (
+                      <button onClick={() => deleteBonoPanel(it.id)} title="Borrar"
                         className="text-slate-400 hover:text-red-400 p-1">
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
