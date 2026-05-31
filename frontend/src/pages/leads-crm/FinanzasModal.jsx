@@ -106,7 +106,16 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
   const [miAmount, setMiAmount] = useState('');
   const [miCategoryId, setMiCategoryId] = useState('');
   const [miObs, setMiObs] = useState('');
+  const [miBonusPct, setMiBonusPct] = useState('');
   const [creatingMI, setCreatingMI] = useState(false);
+
+  // Cálculo en vivo del bono para el form de ingreso manual
+  const miBonusPreview = useMemo(() => {
+    const a = parseFloat(miAmount);
+    const p = parseFloat(miBonusPct);
+    if (Number.isNaN(a) || Number.isNaN(p) || a <= 0 || p <= 0) return 0;
+    return Math.round(a * p) / 100;
+  }, [miAmount, miBonusPct]);
 
   // Egreso form
   const [exAmount, setExAmount] = useState('');
@@ -213,13 +222,18 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
     const amt = parseFloat(miAmount);
     if (Number.isNaN(amt) || amt <= 0) { toast.error('Monto inválido'); return; }
     if (!miCategoryId) { toast.error('Elegí una plataforma/tipo'); return; }
+    const pct = parseFloat(miBonusPct) || 0;
+    if (pct < 0 || pct > 200) { toast.error('% de bono fuera de rango'); return; }
     setCreatingMI(true);
     try {
       await api.post('/finanzas/manual-incomes', {
         amount: amt, category_id: miCategoryId, observation: miObs.trim(),
+        bonus_percentage: pct,
       });
-      toast.success('Ingreso cargado');
-      setMiAmount(''); setMiObs('');
+      toast.success(pct > 0
+        ? `Ingreso $${amt} + bono $${(amt*pct/100).toFixed(2)} (${pct}%) cargados`
+        : 'Ingreso cargado');
+      setMiAmount(''); setMiObs(''); setMiBonusPct('');
       loadAll();
     } catch (err) {
       toast.error(err?.response?.data?.detail || 'Error');
@@ -390,7 +404,9 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
                 {fmtMoney(totals.bono, currency)}
               </div>
               <div className="text-[10px] text-slate-500 mt-1">
-                {totals.total_cargas || 0} carga{totals.total_cargas === 1 ? '' : 's'} · {summary?.current_bonus_percentage ?? 0}% hoy
+                {totals.bono_manual > 0
+                  ? `Embudo: ${fmtMoney(totals.bono_embudo, currency)} · Manual: ${fmtMoney(totals.bono_manual, currency)}`
+                  : `${totals.total_cargas || 0} carga${totals.total_cargas === 1 ? '' : 's'} · ${summary?.current_bonus_percentage ?? 0}% hoy`}
               </div>
             </div>
             <div className="bg-slate-800/60 border border-slate-700 rounded-lg p-3">
@@ -538,7 +554,7 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
             <div className="text-xs uppercase font-semibold text-slate-300 mb-2 flex items-center gap-2">
               <PiggyBank className="w-3.5 h-3.5 text-emerald-400" /> Ingresos manuales
             </div>
-            <div className="grid grid-cols-12 gap-2 mb-2">
+            <div className="grid grid-cols-12 gap-2 mb-1">
               <input type="number" min="0" step="0.01" placeholder="Monto"
                 value={miAmount} onChange={e => setMiAmount(e.target.value)}
                 data-testid="finanzas-mi-amount"
@@ -546,7 +562,7 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
               <select value={miCategoryId} onChange={e => setMiCategoryId(e.target.value)}
                 data-testid="finanzas-mi-category"
                 className="col-span-3 bg-slate-900 border border-slate-600 text-white rounded px-2 py-1.5 text-sm">
-                <option value="">— elegir —</option>
+                <option value="">— plataforma/tipo —</option>
                 <optgroup label="Plataformas">
                   {categories.plataforma.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
                 </optgroup>
@@ -554,16 +570,29 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
                   {categories.ingreso_manual.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
                 </optgroup>
               </select>
-              <input type="text" placeholder="Observación (opcional)"
+              <div className="col-span-2 relative">
+                <input type="number" min="0" max="200" step="0.5" placeholder="% bono"
+                  value={miBonusPct} onChange={e => setMiBonusPct(e.target.value)}
+                  data-testid="finanzas-mi-bonus-pct"
+                  className="w-full bg-slate-900 border border-amber-700/40 text-amber-200 rounded px-2 py-1.5 text-sm pr-6" />
+                <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-amber-500 pointer-events-none">%</span>
+              </div>
+              <input type="text" placeholder="Observación"
                 value={miObs} onChange={e => setMiObs(e.target.value)} maxLength={300}
                 data-testid="finanzas-mi-obs"
-                className="col-span-4 bg-slate-900 border border-slate-600 text-white rounded px-2 py-1.5 text-sm" />
+                className="col-span-2 bg-slate-900 border border-slate-600 text-white rounded px-2 py-1.5 text-sm" />
               <Button onClick={submitManualIncome} disabled={creatingMI}
                 data-testid="finanzas-mi-submit-btn"
                 className="col-span-2 bg-emerald-600 hover:bg-emerald-700 h-9 flex items-center justify-center">
                 <Plus className="w-4 h-4" />
               </Button>
             </div>
+            {miBonusPreview > 0 && (
+              <div className="text-[11px] text-amber-300 mb-2 pl-1" data-testid="finanzas-mi-bonus-preview">
+                💡 Bono que regalás en esta carga: <strong>{fmtMoney(miBonusPreview, currency)}</strong>
+                {' '}· Fichas totales que recibe el cliente: <strong>{fmtMoney((parseFloat(miAmount) || 0) + miBonusPreview, currency)}</strong>
+              </div>
+            )}
             {manualIncomes.length === 0 ? (
               <div className="text-center text-slate-500 text-xs py-3">Sin ingresos manuales en este período</div>
             ) : (
@@ -571,8 +600,13 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
                 {manualIncomes.map(it => (
                   <li key={it.id} className="flex items-center gap-2 px-2 py-1.5 bg-slate-900/60 rounded text-sm">
                     <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-emerald-300 font-semibold">{fmtMoney(it.amount, currency)}</span>
+                        {Number(it.bonus_amount || 0) > 0 && (
+                          <span className="text-[11px] text-amber-300 bg-amber-950/30 px-1.5 py-0.5 rounded">
+                            + bono {fmtMoney(it.bonus_amount, currency)} ({it.bonus_percentage}%)
+                          </span>
+                        )}
                         <span className="text-[10px] text-cyan-400 bg-cyan-950/30 px-1.5 py-0.5 rounded">
                           {it.category_name || 'sin cat.'}
                         </span>
