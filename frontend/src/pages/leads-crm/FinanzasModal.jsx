@@ -381,7 +381,7 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
             <div className={`rounded-xl p-4 border ${panelPositive
               ? 'bg-gradient-to-br from-emerald-950/40 to-slate-900 border-emerald-500/30'
               : 'bg-gradient-to-br from-red-950/40 to-slate-900 border-red-500/30'}`}>
-              <div className="text-[11px] uppercase tracking-wider text-slate-400 mb-1">Balance panel</div>
+              <div className="text-[11px] uppercase tracking-wider text-slate-400 mb-1">Balance publi</div>
               <div className={`text-2xl sm:text-3xl font-bold ${panelPositive ? 'text-emerald-300' : 'text-red-300'}`}
                 data-testid="finanzas-balance-panel">
                 {fmtMoney(balancePanel, currency)}
