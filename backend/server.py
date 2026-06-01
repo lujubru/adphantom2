@@ -8242,9 +8242,11 @@ async def finanzas_summary(
     total_bono_publi = round(sum(bono_publi_by_day.values()), 2)
     total_bono_panel = round(sum(bonos_panel_by_day.values()), 2)
 
-    # BALANCE PUBLI = solo lo del CRM/embudo (ingresos del embudo − bono publi del embudo)
-    # Es lo que el CRM "ve" sin contar lo que se cargó manualmente.
-    balance_publi = round(total_ingresos_embudo - total_bono_publi, 2)
+    # BALANCE PUBLI = ingreso bruto del embudo (las cargas válidas del CRM).
+    # El bono publi se muestra APARTE en su propia card — no se resta acá para
+    # que el cajero vea claramente "$X cargado en publi" y "$Y dado de bono publi"
+    # como métricas independientes.
+    balance_publi = round(total_ingresos_embudo, 2)
     # BALANCE GENERAL = caja real al cierre, basado en lo que carga el cajero manualmente.
     # NO suma el embudo porque las cargas del CRM YA están dentro de los ingresos manuales
     # (el cajero al final del día carga TODO lo del panel, que incluye lo que pasó por el CRM).
