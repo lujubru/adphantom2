@@ -8233,7 +8233,11 @@ async def finanzas_summary(
 
     total_ingresos_embudo = round(sum(ingresos_embudo.values()), 2)
     total_ingresos_manual = round(sum(ingresos_manual.values()), 2)
-    total_ingresos = round(total_ingresos_embudo + total_ingresos_manual, 2)
+    # IMPORTANTE: el total de ingresos = SOLO los manuales porque al cierre del día
+    # el cajero carga TODO lo del panel (que incluye lo que pasó por el CRM).
+    # Si sumáramos embudo + manual, estaríamos contando el CRM dos veces.
+    # `ingresos_embudo` queda como referencia (para Balance Publi y la tabla de cargas).
+    total_ingresos = total_ingresos_manual
     total_egresos = round(sum(egresos.values()), 2)
     total_bono_publi = round(sum(bono_publi_by_day.values()), 2)
     total_bono_panel = round(sum(bonos_panel_by_day.values()), 2)
