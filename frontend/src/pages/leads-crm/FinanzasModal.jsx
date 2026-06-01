@@ -410,8 +410,12 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
                 {fmtMoney(totals.ingresos, currency)}
               </div>
               <div className="text-[10px] text-slate-500 mt-1">
-                Embudo: {fmtMoney(totals.ingresos_embudo, currency)}
-                {totals.ingresos_manual > 0 && ` + Manual: ${fmtMoney(totals.ingresos_manual, currency)}`}
+                Cierre del día
+                {totals.ingresos_embudo > 0 && (
+                  <span title="Estas cargas del CRM YA están incluidas en el cierre del día — no se suman dos veces">
+                    {' '}· Embudo CRM: {fmtMoney(totals.ingresos_embudo, currency)} (incluido)
+                  </span>
+                )}
               </div>
             </div>
             <div className="bg-slate-800/60 border border-slate-700 rounded-lg p-3">
