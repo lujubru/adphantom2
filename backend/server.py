@@ -7902,6 +7902,24 @@ async def _finanzas_get_current_bonus_rate(user_id: str) -> float:
     return await _finanzas_get_bonus_rate_for_date(user_id, today)
 
 
+def _finanzas_range_utc_bounds(start_iso: str, end_iso: str) -> tuple:
+    """Convierte un rango lógico AR (YYYY-MM-DD) a límites UTC ISO para
+    filtrar por `created_at` que se guarda en UTC.
+
+    Ejemplo: rango AR 2026-05-01 → 2026-05-31 se convierte a:
+        start_utc = 2026-05-01T03:00:00 UTC (= 00:00 AR del 1 de mayo)
+        end_utc   = 2026-06-01T02:59:59.999 UTC (= 23:59:59 AR del 31 de mayo)
+    """
+    start_d = datetime.fromisoformat(start_iso).date()
+    end_d = datetime.fromisoformat(end_iso).date()
+    # AR midnight = UTC + 3h
+    start_utc = datetime(start_d.year, start_d.month, start_d.day, 3, 0, 0, tzinfo=timezone.utc)
+    # End: el día siguiente a las 02:59:59.999 UTC = 23:59:59.999 AR del end_d
+    end_next = end_d + timedelta(days=1)
+    end_utc = datetime(end_next.year, end_next.month, end_next.day, 2, 59, 59, 999000, tzinfo=timezone.utc)
+    return start_utc.isoformat(), end_utc.isoformat()
+
+
 def _finanzas_resolve_date_range(
     filter_type: Optional[str],
     start_date: Optional[str],
@@ -7946,8 +7964,7 @@ async def _finanzas_ingresos_by_day(user_id: str, start_iso: str, end_iso: str) 
             line_filter = {"line_id": {"$in": line_ids}}
         else:
             return {}  # cajero sin líneas asignadas → sin ingresos
-    start_dt = f"{start_iso}T00:00:00"
-    end_dt = f"{end_iso}T23:59:59.999"
+    start_dt, end_dt = _finanzas_range_utc_bounds(start_iso, end_iso)
     query = {
         **line_filter,
         "status": "valido",
@@ -7970,8 +7987,7 @@ async def _finanzas_ingresos_by_day(user_id: str, start_iso: str, end_iso: str) 
 async def _finanzas_manual_ingresos_by_day(user_id: str, start_iso: str, end_iso: str) -> Dict[str, float]:
     """Suma de ingresos manuales por día (cargas que el cajero ingresa a mano,
     independientes del embudo del CRM)."""
-    start_dt = f"{start_iso}T00:00:00"
-    end_dt = f"{end_iso}T23:59:59.999"
+    start_dt, end_dt = _finanzas_range_utc_bounds(start_iso, end_iso)
     by_day: Dict[str, float] = {}
     cursor = db.cajero_manual_ingresos.find(
         {"user_id": user_id, "created_at": {"$gte": start_dt, "$lte": end_dt}},
@@ -7991,8 +8007,7 @@ async def _finanzas_manual_ingresos_by_day(user_id: str, start_iso: str, end_iso
 async def _finanzas_bonos_panel_by_day(user_id: str, start_iso: str, end_iso: str) -> Dict[str, float]:
     """Suma de bonos panel cargados manualmente por el cajero al final del día.
     Es independiente del bono del CRM (que viene del % × cargas válidas embudo)."""
-    start_dt = f"{start_iso}T00:00:00"
-    end_dt = f"{end_iso}T23:59:59.999"
+    start_dt, end_dt = _finanzas_range_utc_bounds(start_iso, end_iso)
     by_day: Dict[str, float] = {}
     cursor = db.cajero_bonos_panel.find(
         {"user_id": user_id, "created_at": {"$gte": start_dt, "$lte": end_dt}},
@@ -8010,8 +8025,7 @@ async def _finanzas_bonos_panel_by_day(user_id: str, start_iso: str, end_iso: st
 
 
 async def _finanzas_egresos_by_day(user_id: str, start_iso: str, end_iso: str) -> Dict[str, float]:
-    start_dt = f"{start_iso}T00:00:00"
-    end_dt = f"{end_iso}T23:59:59.999"
+    start_dt, end_dt = _finanzas_range_utc_bounds(start_iso, end_iso)
     by_day: Dict[str, float] = {}
     cursor = db.cajero_expenses.find(
         {"user_id": user_id, "created_at": {"$gte": start_dt, "$lte": end_dt}},
@@ -8039,8 +8053,7 @@ async def _finanzas_get_cargas_list(user_id: str, start_iso: str, end_iso: str) 
             line_filter = {"line_id": {"$in": line_ids}}
         else:
             return []
-    start_dt = f"{start_iso}T00:00:00"
-    end_dt = f"{end_iso}T23:59:59.999"
+    start_dt, end_dt = _finanzas_range_utc_bounds(start_iso, end_iso)
     query = {
         **line_filter,
         "status": "valido",
@@ -8213,23 +8226,25 @@ async def finanzas_summary(
     ingresos_embudo = await _finanzas_ingresos_by_day(target_uid, start_iso, end_iso)
     ingresos_manual = await _finanzas_manual_ingresos_by_day(target_uid, start_iso, end_iso)
     egresos = await _finanzas_egresos_by_day(target_uid, start_iso, end_iso)
-    # Bono del CRM: % vigente día por día × cargas válidas del embudo
-    bono_by_day = await _finanzas_compute_bono_by_day(target_uid, ingresos_embudo)
-    # Bonos Panel: cargados manualmente por el cajero al final del día
-    # (independientes del bono del CRM, informativos)
+    # Bono PUBLI: % vigente día por día × cargas válidas del embudo (CRM)
+    bono_publi_by_day = await _finanzas_compute_bono_by_day(target_uid, ingresos_embudo)
+    # Bonos PANEL: cargados manualmente al cierre (informativo)
     bonos_panel_by_day = await _finanzas_bonos_panel_by_day(target_uid, start_iso, end_iso)
 
     total_ingresos_embudo = round(sum(ingresos_embudo.values()), 2)
     total_ingresos_manual = round(sum(ingresos_manual.values()), 2)
     total_ingresos = round(total_ingresos_embudo + total_ingresos_manual, 2)
     total_egresos = round(sum(egresos.values()), 2)
-    total_bono = round(sum(bono_by_day.values()), 2)
+    total_bono_publi = round(sum(bono_publi_by_day.values()), 2)
     total_bono_panel = round(sum(bonos_panel_by_day.values()), 2)
 
-    # BALANCE PANEL = ingresos − bono (lo que vale tu caja en fichas)
-    balance_panel = round(total_ingresos - total_bono, 2)
-    # BALANCE GENERAL = ingresos − bono − egresos (caja real después de todo)
-    balance_general = round(total_ingresos - total_bono - total_egresos, 2)
+    # BALANCE PUBLI = solo lo del CRM/embudo (ingresos del embudo − bono publi del embudo)
+    # Es lo que el CRM "ve" sin contar lo que se cargó manualmente.
+    balance_publi = round(total_ingresos_embudo - total_bono_publi, 2)
+    # BALANCE GENERAL = caja real al cierre, basado en lo que carga el cajero manualmente.
+    # NO suma el embudo porque las cargas del CRM YA están dentro de los ingresos manuales
+    # (el cajero al final del día carga TODO lo del panel, que incluye lo que pasó por el CRM).
+    balance_general = round(total_ingresos_manual - total_bono_publi - total_bono_panel - total_egresos, 2)
 
     # Conteo de cargas válidas (del embudo, no de las manuales)
     user = await db.users.find_one({"id": target_uid}, {"_id": 0, "line_ids": 1, "role": 1})
@@ -8238,10 +8253,11 @@ async def finanzas_summary(
     if not (user and user.get("role") not in ("admin", "superadmin") and not (user.get("line_ids") or [])):
         if user and user.get("role") not in ("admin", "superadmin"):
             line_filter = {"line_id": {"$in": user.get("line_ids") or []}}
+        _scs, _ecs = _finanzas_range_utc_bounds(start_iso, end_iso)
         total_cargas = await db.crm_leads.count_documents({
             **line_filter,
             "status": "valido",
-            "created_at": {"$gte": f"{start_iso}T00:00:00", "$lte": f"{end_iso}T23:59:59.999"},
+            "created_at": {"$gte": _scs, "$lte": _ecs},
             "charge_amount": {"$gt": 0},
         })
     avg_por_carga = round(total_ingresos_embudo / total_cargas, 2) if total_cargas > 0 else 0.0
@@ -8256,9 +8272,9 @@ async def finanzas_summary(
             "ingresos_embudo": total_ingresos_embudo,
             "ingresos_manual": total_ingresos_manual,
             "egresos": total_egresos,
-            "bono": total_bono,
+            "bono_publi": total_bono_publi,
             "bono_panel": total_bono_panel,
-            "balance_panel": balance_panel,
+            "balance_publi": balance_publi,
             "balance_general": balance_general,
             "total_cargas": total_cargas,
             "avg_por_carga": avg_por_carga,
@@ -8301,7 +8317,7 @@ async def finanzas_chart(
     ingresos_embudo = await _finanzas_ingresos_by_day(target_uid, start_iso, end_iso)
     ingresos_manual = await _finanzas_manual_ingresos_by_day(target_uid, start_iso, end_iso)
     egresos = await _finanzas_egresos_by_day(target_uid, start_iso, end_iso)
-    bono = await _finanzas_compute_bono_by_day(target_uid, ingresos_embudo)
+    bono_publi = await _finanzas_compute_bono_by_day(target_uid, ingresos_embudo)
     bono_panel = await _finanzas_bonos_panel_by_day(target_uid, start_iso, end_iso)
 
     start = datetime.fromisoformat(start_iso).date()
@@ -8314,7 +8330,7 @@ async def finanzas_chart(
             "date": d,
             "ingresos": round(ingresos_embudo.get(d, 0.0) + ingresos_manual.get(d, 0.0), 2),
             "egresos": round(egresos.get(d, 0.0), 2),
-            "bono": round(bono.get(d, 0.0), 2),
+            "bono_publi": round(bono_publi.get(d, 0.0), 2),
             "bono_panel": round(bono_panel.get(d, 0.0), 2),
         })
         cur = cur + timedelta(days=1)
@@ -8364,8 +8380,7 @@ async def finanzas_list_expenses(
 ):
     target_uid = _finanzas_get_target_user_id(current_user, user_id)
     start_iso, end_iso = _finanzas_resolve_date_range(filter_type, start_date, end_date)
-    start_dt = f"{start_iso}T00:00:00"
-    end_dt = f"{end_iso}T23:59:59.999"
+    start_dt, end_dt = _finanzas_range_utc_bounds(start_iso, end_iso)
     items = []
     cursor = db.cajero_expenses.find(
         {"user_id": target_uid, "created_at": {"$gte": start_dt, "$lte": end_dt}},
@@ -8550,8 +8565,7 @@ async def finanzas_list_manual_incomes(
 ):
     target_uid = _finanzas_get_target_user_id(current_user, user_id)
     start_iso, end_iso = _finanzas_resolve_date_range(filter_type, start_date, end_date)
-    start_dt = f"{start_iso}T00:00:00"
-    end_dt = f"{end_iso}T23:59:59.999"
+    start_dt, end_dt = _finanzas_range_utc_bounds(start_iso, end_iso)
     items = []
     cursor = db.cajero_manual_ingresos.find(
         {"user_id": target_uid, "created_at": {"$gte": start_dt, "$lte": end_dt}},
@@ -8630,8 +8644,7 @@ async def finanzas_list_bonos_panel(
 ):
     target_uid = _finanzas_get_target_user_id(current_user, user_id)
     start_iso, end_iso = _finanzas_resolve_date_range(filter_type, start_date, end_date)
-    start_dt = f"{start_iso}T00:00:00"
-    end_dt = f"{end_iso}T23:59:59.999"
+    start_dt, end_dt = _finanzas_range_utc_bounds(start_iso, end_iso)
     items = []
     cursor = db.cajero_bonos_panel.find(
         {"user_id": target_uid, "created_at": {"$gte": start_dt, "$lte": end_dt}},
