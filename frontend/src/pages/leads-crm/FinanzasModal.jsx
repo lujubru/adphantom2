@@ -324,9 +324,9 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
   };
 
   const totals = summary?.totals || {};
-  const balancePanel = totals.balance_panel ?? 0;
+  const balancePubli = totals.balance_publi ?? 0;
   const balanceGeneral = totals.balance_general ?? 0;
-  const panelPositive = balancePanel >= 0;
+  const publiPositive = balancePubli >= 0;
   const generalPositive = balanceGeneral >= 0;
 
   return (
@@ -376,17 +376,17 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
             </div>
           )}
 
-          {/* 2 hero cards: Balance Panel y Balance General */}
+          {/* 2 hero cards: Balance Publi (CRM) y Balance General (cierre real del día) */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div className={`rounded-xl p-4 border ${panelPositive
+            <div className={`rounded-xl p-4 border ${publiPositive
               ? 'bg-gradient-to-br from-emerald-950/40 to-slate-900 border-emerald-500/30'
               : 'bg-gradient-to-br from-red-950/40 to-slate-900 border-red-500/30'}`}>
               <div className="text-[11px] uppercase tracking-wider text-slate-400 mb-1">Balance publi</div>
-              <div className={`text-2xl sm:text-3xl font-bold ${panelPositive ? 'text-emerald-300' : 'text-red-300'}`}
-                data-testid="finanzas-balance-panel">
-                {fmtMoney(balancePanel, currency)}
+              <div className={`text-2xl sm:text-3xl font-bold ${publiPositive ? 'text-emerald-300' : 'text-red-300'}`}
+                data-testid="finanzas-balance-publi">
+                {fmtMoney(balancePubli, currency)}
               </div>
-              <div className="text-[11px] text-slate-500 mt-1">Ingresos − bonos</div>
+              <div className="text-[11px] text-slate-500 mt-1">Ingresos del embudo − bono publi</div>
             </div>
             <div className={`rounded-xl p-4 border ${generalPositive
               ? 'bg-gradient-to-br from-blue-950/40 to-slate-900 border-blue-500/30'
@@ -396,7 +396,7 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
                 data-testid="finanzas-balance-general">
                 {fmtMoney(balanceGeneral, currency)}
               </div>
-              <div className="text-[11px] text-slate-500 mt-1">Ingresos − bonos − egresos</div>
+              <div className="text-[11px] text-slate-500 mt-1">Ingresos manuales − bono publi − bono panel − egresos</div>
             </div>
           </div>
 
@@ -425,10 +425,10 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
             </div>
             <div className="bg-slate-800/60 border border-slate-700 rounded-lg p-3">
               <div className="flex items-center gap-1.5 text-[11px] text-amber-400 uppercase font-semibold">
-                <Gift className="w-3.5 h-3.5" /> Bono entregado
+                <Gift className="w-3.5 h-3.5" /> Bono publi
               </div>
               <div className="text-xl font-bold text-white mt-1" data-testid="finanzas-bono">
-                {fmtMoney(totals.bono, currency)}
+                {fmtMoney(totals.bono_publi, currency)}
               </div>
               <div className="text-[10px] text-slate-500 mt-1">
                 {totals.total_cargas || 0} carga{totals.total_cargas === 1 ? '' : 's'} · {summary?.current_bonus_percentage ?? 0}% hoy
@@ -777,7 +777,8 @@ export const FinanzasModal = ({ onClose, currentUser, inline = false }) => {
                     <Legend wrapperStyle={{ fontSize: 11 }} />
                     <Bar dataKey="ingresos" fill="#10b981" name="Ingresos (embudo)" />
                     <Bar dataKey="egresos" fill="#ef4444" name="Egresos" />
-                    <Bar dataKey="bono" fill="#f59e0b" name="Bono" />
+                    <Bar dataKey="bono_publi" fill="#f59e0b" name="Bono publi" />
+                    <Bar dataKey="bono_panel" fill="#fbbf24" name="Bono panel" />
                   </BarChart>
                 </ResponsiveContainer>
               </div>
