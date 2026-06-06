@@ -81,7 +81,7 @@ const Dashboard = () => {
   const [refreshing, setRefreshing] = useState(false);
 
   const params = useCallback(() => {
-    const p = { date_from: activeRange.date_from, date_to: activeRange.date_to };
+    const p = { start_date: activeRange.date_from, end_date: activeRange.date_to };
     if (selectedLineId) p.line_id = selectedLineId;
     return p;
   }, [activeRange, selectedLineId]);
