@@ -10831,8 +10831,19 @@ def _dashboard_role_guard(user):
 
 
 def _dashboard_date_range(days: int, start_date: Optional[str], end_date: Optional[str]):
-    """Return (start_iso, end_iso) strings for Mongo range queries."""
+    """Return (start_iso, end_iso) strings for Mongo range queries.
+
+    Acepta start_date/end_date como 'YYYY-MM-DD' o ISO completo.
+    Cuando vienen solo como fecha (10 chars), convierte:
+      - start_date → inicio del día 00:00:00 UTC
+      - end_date   → fin del día 23:59:59 UTC (para incluir todo el día)
+    """
     if start_date and end_date:
+        # Si vienen solo como YYYY-MM-DD, expandir a ISO completo
+        if len(start_date) == 10:
+            start_date = f"{start_date}T00:00:00+00:00"
+        if len(end_date) == 10:
+            end_date = f"{end_date}T23:59:59+00:00"
         return start_date, end_date
     now = datetime.now(timezone.utc)
     return (now - timedelta(days=days)).isoformat(), now.isoformat()
