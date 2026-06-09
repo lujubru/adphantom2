@@ -7730,13 +7730,22 @@ async def send_web_push(user_id: str, title: str, body: str, data: dict = None):
             "data": data or {},
         }
         payload_json = json.dumps(payload)
-        vapid_claims = {"sub": keys["subject"]}
         sent, failed, gone = 0, 0, 0
+        from urllib.parse import urlparse as _urlparse
         async for sub in db.push_subscriptions.find({"user_id": user_id}):
             try:
+                # VAPID spec: `aud` claim MUST contain the origin of the push
+                # service endpoint (e.g. https://fcm.googleapis.com for Chrome,
+                # https://updates.push.services.mozilla.com for Firefox).
+                # pywebpush 2.x no longer auto-fills `aud` when a Vapid object
+                # is passed, so we set it explicitly per-subscription.
+                _ep = sub["endpoint"]
+                _p = _urlparse(_ep)
+                _aud = f"{_p.scheme}://{_p.netloc}" if _p.scheme and _p.netloc else _ep
+                vapid_claims = {"sub": keys["subject"], "aud": _aud}
                 webpush(
                     subscription_info={
-                        "endpoint": sub["endpoint"],
+                        "endpoint": _ep,
                         "keys": sub["keys"],
                     },
                     data=payload_json,
@@ -10831,19 +10840,8 @@ def _dashboard_role_guard(user):
 
 
 def _dashboard_date_range(days: int, start_date: Optional[str], end_date: Optional[str]):
-    """Return (start_iso, end_iso) strings for Mongo range queries.
-
-    Acepta start_date/end_date como 'YYYY-MM-DD' o ISO completo.
-    Cuando vienen solo como fecha (10 chars), convierte:
-      - start_date → inicio del día 00:00:00 UTC
-      - end_date   → fin del día 23:59:59 UTC (para incluir todo el día)
-    """
+    """Return (start_iso, end_iso) strings for Mongo range queries."""
     if start_date and end_date:
-        # Si vienen solo como YYYY-MM-DD, expandir a ISO completo
-        if len(start_date) == 10:
-            start_date = f"{start_date}T00:00:00+00:00"
-        if len(end_date) == 10:
-            end_date = f"{end_date}T23:59:59+00:00"
         return start_date, end_date
     now = datetime.now(timezone.utc)
     return (now - timedelta(days=days)).isoformat(), now.isoformat()
