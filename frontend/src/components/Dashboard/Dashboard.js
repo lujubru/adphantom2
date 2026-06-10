@@ -13,12 +13,12 @@ import {
 } from '@/pages/dashboard/Charts';
 
 const DATE_PRESETS = [
-  { key: 'today',        label: 'Hoy' },
-  { key: 'yesterday',    label: 'Ayer' },
-  { key: 'last10',       label: 'Últimos 10 días' },
-  { key: 'this_month',   label: 'Este mes' },
-  { key: 'last_month',   label: 'Mes anterior' },
-  { key: 'custom',       label: 'Personalizado' },
+  { key: 'today',      label: 'Hoy' },
+  { key: 'yesterday',  label: 'Ayer' },
+  { key: 'last10',     label: 'Últimos 10 días' },
+  { key: 'this_month', label: 'Este mes' },
+  { key: 'last_month', label: 'Mes anterior' },
+  { key: 'custom',     label: 'Personalizado' },
 ];
 
 // Devuelve { date_from, date_to } en formato YYYY-MM-DD según el preset
@@ -62,10 +62,10 @@ const Dashboard = () => {
   const [selectedLineId, setSelectedLineId] = useState('');
   const [periodKey, setPeriodKey] = useState('this_month');
 
-  // Rango activo (se recalcula al cambiar preset o al confirmar personalizado)
+  // Rango activo — se recalcula al cambiar preset o al confirmar personalizado
   const [activeRange, setActiveRange] = useState(() => getPresetRange('this_month'));
 
-  // Estado temporal para el picker de fechas personalizado
+  // Estado temporal para el picker personalizado
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo] = useState('');
 
@@ -80,6 +80,7 @@ const Dashboard = () => {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
+  // Envía start_date / end_date que es lo que espera el backend
   const params = useCallback(() => {
     const p = { start_date: activeRange.date_from, end_date: activeRange.date_to };
     if (selectedLineId) p.line_id = selectedLineId;
@@ -92,13 +93,13 @@ const Dashboard = () => {
     try {
       const p = params();
       const [ov, ad, dm, ge, tl, hm, dv] = await Promise.all([
-        api.get('/dashboard/overview', { params: p }),
-        api.get('/dashboard/ad-performance', { params: p }),
-        api.get('/dashboard/demographics', { params: p }),
-        api.get('/dashboard/geography', { params: p }),
-        api.get('/dashboard/timeline', { params: p }),
-        api.get('/dashboard/hourly-heatmap', { params: p }),
-        api.get('/dashboard/device-stats', { params: p }),
+        api.get('/dashboard/overview',      { params: p }),
+        api.get('/dashboard/ad-performance',{ params: p }),
+        api.get('/dashboard/demographics',  { params: p }),
+        api.get('/dashboard/geography',     { params: p }),
+        api.get('/dashboard/timeline',      { params: p }),
+        api.get('/dashboard/hourly-heatmap',{ params: p }),
+        api.get('/dashboard/device-stats',  { params: p }),
       ]);
       setOverview(ov.data);
       setAds(ad.data || []);
@@ -135,7 +136,6 @@ const Dashboard = () => {
     if (key !== 'custom') {
       setActiveRange(getPresetRange(key));
     }
-    // Si es custom, esperamos que el usuario confirme el rango
   };
 
   const applyCustomRange = () => {
@@ -189,7 +189,7 @@ const Dashboard = () => {
               ))}
             </div>
 
-            {/* Custom date pickers — solo visibles cuando periodKey === 'custom' */}
+            {/* Date pickers — solo visibles con "Personalizado" */}
             {periodKey === 'custom' && (
               <div className="flex items-center gap-1.5">
                 <Calendar className="w-3.5 h-3.5 text-slate-400 shrink-0" />
