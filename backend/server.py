@@ -10877,12 +10877,61 @@ def _dashboard_role_guard(user):
         raise HTTPException(status_code=403, detail="Solo administradores")
 
 
-def _dashboard_date_range(days: int, start_date: Optional[str], end_date: Optional[str]):
-    """Return (start_iso, end_iso) strings for Mongo range queries."""
+def _dashboard_date_range(
+    days: int,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    preset: Optional[str] = None,
+):
+    """Return (start_iso, end_iso) ISO strings using Argentina timezone (UTC-3, no DST).
+
+    - `preset` toma precedencia sobre `days` y permite valores:
+        hoy | ayer | ultimos_10 | semanal | mensual | mes_anterior | ultimos_N
+    - `start_date`/`end_date` (formato YYYY-MM-DD) interpretan rango AR completo.
+    - Si nada coincide, vuelve a `days` rolling desde ahora.
+    """
+    AR = timezone(timedelta(hours=-3))
+    now_ar = datetime.now(AR)
+
+    def _ar_day_start(d: datetime) -> datetime:
+        return d.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def _ar_day_end(d: datetime) -> datetime:
+        return d.replace(hour=23, minute=59, second=59, microsecond=999999)
+
     if start_date and end_date:
-        return start_date, end_date
-    now = datetime.now(timezone.utc)
-    return (now - timedelta(days=days)).isoformat(), now.isoformat()
+        try:
+            sd = datetime.fromisoformat(start_date).replace(tzinfo=AR)
+            ed = datetime.fromisoformat(end_date).replace(tzinfo=AR)
+            return _ar_day_start(sd).astimezone(timezone.utc).isoformat(), _ar_day_end(ed).astimezone(timezone.utc).isoformat()
+        except Exception:
+            pass
+
+    today_start = _ar_day_start(now_ar)
+    if preset == "hoy":
+        s_ar, e_ar = today_start, now_ar
+    elif preset == "ayer":
+        s_ar = today_start - timedelta(days=1)
+        e_ar = _ar_day_end(today_start - timedelta(days=1))
+    elif preset == "ultimos_10":
+        s_ar, e_ar = today_start - timedelta(days=9), now_ar
+    elif preset == "semanal":
+        s_ar = today_start - timedelta(days=today_start.weekday())
+        e_ar = now_ar
+    elif preset == "mensual":
+        s_ar = today_start.replace(day=1)
+        e_ar = now_ar
+    elif preset == "mes_anterior":
+        first_this = today_start.replace(day=1)
+        last_prev = first_this - timedelta(microseconds=1)
+        first_prev = last_prev.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        s_ar, e_ar = first_prev, last_prev
+    else:
+        # rolling window últimos N días, alineado a inicio de día AR
+        s_ar = today_start - timedelta(days=max(0, days - 1))
+        e_ar = now_ar
+
+    return s_ar.astimezone(timezone.utc).isoformat(), e_ar.astimezone(timezone.utc).isoformat()
 
 
 @api_router.get("/crm/contacts/history")
@@ -10965,11 +11014,12 @@ async def dashboard_overview(
     days: int = Query(30, ge=1, le=365),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    preset: Optional[str] = None,
     current_user=Depends(get_current_user),
 ):
     """KPIs + period-over-period comparison + quick insights."""
     _dashboard_role_guard(current_user)
-    s, e = _dashboard_date_range(days, start_date, end_date)
+    s, e = _dashboard_date_range(days, start_date, end_date, preset)
     line_q = {"line_id": line_id} if line_id else {}
 
     cur_match = {**line_q, "created_at": {"$gte": s, "$lte": e}}
@@ -11084,11 +11134,12 @@ async def dashboard_ad_performance(
     days: int = Query(30, ge=1, le=365),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    preset: Optional[str] = None,
     current_user=Depends(get_current_user),
 ):
     """Ad performance table with preview thumbnails and ROAS."""
     _dashboard_role_guard(current_user)
-    s, e = _dashboard_date_range(days, start_date, end_date)
+    s, e = _dashboard_date_range(days, start_date, end_date, preset)
     line_q = {"line_id": line_id} if line_id else {}
     match = {**line_q, "created_at": {"$gte": s, "$lte": e}, "ad_source": {"$nin": [None, ""]}}
 
@@ -11140,11 +11191,12 @@ async def dashboard_demographics(
     days: int = Query(30, ge=1, le=365),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    preset: Optional[str] = None,
     current_user=Depends(get_current_user),
 ):
     """Gender and age-range breakdown."""
     _dashboard_role_guard(current_user)
-    s, e = _dashboard_date_range(days, start_date, end_date)
+    s, e = _dashboard_date_range(days, start_date, end_date, preset)
     line_q = {"line_id": line_id} if line_id else {}
     match = {**line_q, "created_at": {"$gte": s, "$lte": e}}
 
@@ -11207,11 +11259,12 @@ async def dashboard_geography(
     days: int = Query(30, ge=1, le=365),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    preset: Optional[str] = None,
     current_user=Depends(get_current_user),
 ):
     """Top provinces/cities with conversion rates."""
     _dashboard_role_guard(current_user)
-    s, e = _dashboard_date_range(days, start_date, end_date)
+    s, e = _dashboard_date_range(days, start_date, end_date, preset)
     line_q = {"line_id": line_id} if line_id else {}
     match = {**line_q, "created_at": {"$gte": s, "$lte": e}}
 
@@ -11274,11 +11327,12 @@ async def dashboard_timeline(
     days: int = Query(30, ge=1, le=365),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    preset: Optional[str] = None,
     current_user=Depends(get_current_user),
 ):
     """Per-day leads + conversions for area chart."""
     _dashboard_role_guard(current_user)
-    s, e = _dashboard_date_range(days, start_date, end_date)
+    s, e = _dashboard_date_range(days, start_date, end_date, preset)
     line_q = {"line_id": line_id} if line_id else {}
     match = {**line_q, "created_at": {"$gte": s, "$lte": e}}
 
@@ -11310,11 +11364,12 @@ async def dashboard_hourly_heatmap(
     days: int = Query(30, ge=1, le=365),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    preset: Optional[str] = None,
     current_user=Depends(get_current_user),
 ):
     """Day-of-week x hour-of-day heatmap (UTC-3 / Argentina)."""
     _dashboard_role_guard(current_user)
-    s, e = _dashboard_date_range(days, start_date, end_date)
+    s, e = _dashboard_date_range(days, start_date, end_date, preset)
     line_q = {"line_id": line_id} if line_id else {}
     match = {**line_q, "created_at": {"$gte": s, "$lte": e}}
 
@@ -11355,11 +11410,12 @@ async def dashboard_device_stats(
     days: int = Query(30, ge=1, le=365),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    preset: Optional[str] = None,
     current_user=Depends(get_current_user),
 ):
     """Device / OS breakdown from wa_clicks."""
     _dashboard_role_guard(current_user)
-    s, e = _dashboard_date_range(days, start_date, end_date)
+    s, e = _dashboard_date_range(days, start_date, end_date, preset)
     match: dict = {"created_at": {"$gte": s, "$lte": e}}
     if line_id:
         match["line_id"] = line_id
