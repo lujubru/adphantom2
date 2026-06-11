@@ -5218,6 +5218,21 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                     # Find or create CRM lead for this SPECIFIC line
                     # Each line has its own independent lead/conversation per phone number
                     crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": line_id})
+
+                    # Auto-resurrect soft-deleted lead: if a cajero hid the
+                    # chat and the contact writes again, the conversation
+                    # comes back with full history intact.
+                    if crm_lead and crm_lead.get("deleted_at"):
+                        await db.crm_leads.update_one(
+                            {"id": crm_lead["id"]},
+                            {"$set": {
+                                "deleted_at": None,
+                                "deleted_by": None,
+                                "updated_at": now,
+                            }}
+                        )
+                        crm_lead["deleted_at"] = None
+                        logger.info(f"CRM: Resurrected soft-deleted lead {crm_lead['id']} ({from_phone}) on line {line['name']}")
                     
                     if not crm_lead:
                         # Check if there's an unassigned lead (no line_id) we can claim
@@ -5770,7 +5785,8 @@ async def crm_get_all_leads(
     current_user=Depends(get_current_user)
 ):
     """Get all CRM leads with optional filters"""
-    query = {}
+    # Excluye leads soft-deleteados (deleted_at seteado)
+    query: dict = {"deleted_at": {"$in": [None, ""]}}
     if status:
         query["status"] = status
     if min_score > 0:
@@ -5876,6 +5892,7 @@ async def crm_get_leads_changed(
     since_iso = since_dt.isoformat()
 
     query: Dict = {
+        "deleted_at": {"$in": [None, ""]},
         "$or": [
             {"last_interaction": {"$gt": since_iso}},
             {"updated_at": {"$gt": since_iso}},
@@ -6171,16 +6188,39 @@ async def crm_edit_lead_name(
 
 @api_router.delete("/crm/leads/{lead_id}")
 async def crm_delete_lead(lead_id: str, current_user=Depends(get_current_user)):
-    """Delete a lead and all associated data"""
-    result = await db.crm_leads.delete_one({"id": lead_id})
-    if result.deleted_count == 0:
+    """Soft-delete a lead (ocultarlo del CRM).
+
+    El historial (mensajes/recibos) NO se borra. Si el contacto vuelve a
+    escribir, el webhook detecta `deleted_at` y resucita el lead conservando
+    todo el chat anterior. Borrado es global por línea (todos los cajeros del
+    equipo lo dejan de ver).
+
+    Permisos:
+    - admin/superadmin: puede borrar cualquier lead.
+    - cajero: solo leads de las líneas que tiene asignadas.
+    """
+    lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0, "line_id": 1})
+    if not lead:
         raise HTTPException(status_code=404, detail="Lead no encontrado")
-    
-    # Also delete associated messages and receipts
-    await db.crm_messages.delete_many({"lead_id": lead_id})
-    await db.crm_receipts.delete_many({"lead_id": lead_id})
-    
-    return {"message": "Lead eliminado"}
+
+    role = current_user.get("role")
+    if role == "cajero":
+        user_line_ids = current_user.get("line_ids") or []
+        if not lead.get("line_id") or lead["line_id"] not in user_line_ids:
+            raise HTTPException(status_code=403, detail="No tenés permiso para borrar este chat")
+    elif role not in ("admin", "superadmin"):
+        raise HTTPException(status_code=403, detail="Sin permisos")
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.crm_leads.update_one(
+        {"id": lead_id},
+        {"$set": {
+            "deleted_at": now,
+            "deleted_by": current_user.get("id"),
+            "updated_at": now,
+        }}
+    )
+    return {"message": "Chat eliminado", "lead_id": lead_id, "soft": True}
 
 @api_router.post("/crm/leads/{lead_id}/classify")
 async def crm_classify_lead(
