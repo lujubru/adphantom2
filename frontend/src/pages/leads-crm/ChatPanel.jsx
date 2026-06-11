@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   MessageCircle, RefreshCw, Send, X, Image as ImageIcon, Mic, DollarSign,
   User, Users, ArrowLeft, ArrowDown, Share2, Phone, Landmark, Pencil, Check as CheckIcon,
+  Trash2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -22,6 +23,7 @@ export const ChatPanel = ({
   showBackButton = false,
   userMessages = {},
   onLeadUpdated,
+  onLeadDeleted,
 }) => {
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState('');
@@ -444,6 +446,21 @@ Le envio nuestros datos de cuenta 👇`;
     }
   };
 
+  const deleteChat = async () => {
+    const label = lead.name || lead.phone;
+    if (!window.confirm(
+      `¿Eliminar el chat con ${label}?\n\n` +
+      `Se va a ocultar del CRM. Si el contacto vuelve a escribir, el chat reaparece con el historial completo.`
+    )) return;
+    try {
+      await api.delete(`/crm/leads/${lead.id}`);
+      toast.success('Chat eliminado');
+      if (onLeadDeleted) onLeadDeleted(lead.id);
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || 'Error eliminando el chat');
+    }
+  };
+
   // Close derivar/cbu dropdowns on outside click
   useEffect(() => {
     if (!showDerivarMenu && !showCbuMenu) return;
@@ -540,6 +557,16 @@ Le envio nuestros datos de cuenta 👇`;
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
           <StatusSelector currentStatus={lead.status} onSelect={handleStatusChange} />
+          <button
+            type="button"
+            onClick={deleteChat}
+            data-testid="chat-delete-btn"
+            className="p-1.5 text-slate-400 hover:text-red-400 rounded-lg hover:bg-red-500/10 transition-colors"
+            title="Eliminar chat del CRM (reaparece si el contacto vuelve a escribir)"
+            aria-label="Eliminar chat"
+          >
+            <Trash2 className="w-4 h-4" />
+          </button>
           {showCloseButton && (
             <button onClick={onClose} className="p-1 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800">
               <X className="w-4 h-4" />
