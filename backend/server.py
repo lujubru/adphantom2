@@ -2357,6 +2357,41 @@ async def wa_webhook_verify(request: Request):
     logger.warning(f"WA webhook verify failed: mode={mode}, token={token}")
     raise HTTPException(status_code=403, detail="Verification failed")
 
+async def _send_contact_capi_async(
+    lead_id: str,
+    lead_data: dict,
+    line_name: str,
+    pixel_id: str,
+    access_token: str,
+    ts: str,
+):
+    """Envía el evento Contact a Meta CAPI en background y persiste el resultado
+    en `meta_events_sent`. Se invoca con `asyncio.create_task(...)` desde el
+    webhook para NO bloquear la respuesta a Meta (que solo da ~3s antes de
+    reintentar, generando una cascada de webhooks duplicados)."""
+    try:
+        contact_result = await send_meta_conversion_event(
+            event_name="Contact",
+            lead_data=lead_data,
+            custom_data={"content_name": "WhatsApp Contact", "line": line_name},
+            access_token=access_token,
+            pixel_id=pixel_id,
+        )
+        await db.crm_leads.update_one(
+            {"id": lead_id},
+            {"$push": {"meta_events_sent": {
+                "event": "Contact",
+                "timestamp": ts,
+                "event_id": contact_result.get("event_id"),
+                "pixel_id": (pixel_id[:8] + "...") if pixel_id else None,
+                "line": line_name,
+                "success": contact_result.get("success", False),
+            }}}
+        )
+    except Exception as e:
+        logger.warning(f"_send_contact_capi_async failed for lead {lead_id}: {e}")
+
+
 async def resend_enriched_landing_events(crm_lead: dict, line: dict):
     """
     Re-fire the Contact / Lead / InitiateCheckout events that were dispatched
@@ -5263,25 +5298,19 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                         logger.info(f"CRM: Created new lead for {from_phone} on line {line['name']}{' from ad: ' + str(ad_source) if ad_source else ''}")
                         
                         # Send Contact event to Meta if line has credentials
+                        # Fire-and-forget para no bloquear la respuesta al webhook:
+                        # cada CAPI call tarda 200-1500ms y Meta da solo 3s para
+                        # responder el webhook antes de empezar a reintentar.
                         if line.get("meta_access_token") and line.get("meta_pixel_id"):
-                            contact_result = await send_meta_conversion_event(
-                                event_name="Contact",
-                                lead_data=crm_lead,
-                                custom_data={"content_name": "WhatsApp Contact", "line": line["name"]},
+                            import asyncio as _asyncio
+                            _asyncio.create_task(_send_contact_capi_async(
+                                lead_id=lead_id,
+                                lead_data=dict(crm_lead),
+                                line_name=line["name"],
+                                pixel_id=line["meta_pixel_id"],
                                 access_token=line["meta_access_token"],
-                                pixel_id=line["meta_pixel_id"]
-                            )
-                            await db.crm_leads.update_one(
-                                {"id": lead_id},
-                                {"$push": {"meta_events_sent": {
-                                    "event": "Contact",
-                                    "timestamp": now,
-                                    "event_id": contact_result.get("event_id"),
-                                    "pixel_id": line.get("meta_pixel_id", "")[:8] + "..." if line.get("meta_pixel_id") else None,
-                                    "line": line["name"],
-                                    "success": contact_result.get("success", False)
-                                }}}
-                            )
+                                ts=now,
+                            ))
 
                         # Auto-send welcome message from cajero config (fire-and-forget)
                         import asyncio as _asyncio
@@ -7772,15 +7801,24 @@ async def send_web_push(user_id: str, title: str, body: str, data: dict = None):
                             status = int(m.group(1))
                         except ValueError:
                             status = None
-                if status in (404, 410):
+                if status in (400, 401, 403, 404, 410):
+                    # 400/401/403 = clave inválida o credenciales obsoletas (sub muerta del lado servidor)
+                    # 404/410 = subscription expired
                     await db.push_subscriptions.delete_one({"endpoint": sub["endpoint"]})
                     gone += 1
                 else:
                     failed += 1
                     logger.warning(f"Web push failed ({status}): {e}")
             except Exception as e:
-                failed += 1
-                logger.warning(f"Web push error: {e}")
+                # `Invalid EC key` etc. = la subscription guardada quedó corrupta,
+                # no tiene sentido seguir reintentándola.
+                msg = str(e).lower()
+                if "invalid ec key" in msg or "invalid key" in msg or "padding" in msg:
+                    await db.push_subscriptions.delete_one({"endpoint": sub["endpoint"]})
+                    gone += 1
+                else:
+                    failed += 1
+                    logger.warning(f"Web push error: {e}")
         if sent or failed or gone:
             logger.info(f"Web push sent to {user_id}: sent={sent}, failed={failed}, gone={gone}")
         return {"sent": sent, "failed": failed, "gone": gone}
@@ -10840,18 +10878,8 @@ def _dashboard_role_guard(user):
 
 
 def _dashboard_date_range(days: int, start_date: Optional[str], end_date: Optional[str]):
-    """Return (start_iso, end_iso) strings for Mongo range queries.
-
-    Acepta start_date/end_date como 'YYYY-MM-DD' o ISO completo.
-    Cuando vienen solo como fecha (10 chars), convierte:
-      - start_date -> inicio del dia 00:00:00 UTC
-      - end_date   -> fin del dia 23:59:59 UTC (para incluir todo el dia)
-    """
+    """Return (start_iso, end_iso) strings for Mongo range queries."""
     if start_date and end_date:
-        if len(start_date) == 10:
-            start_date = f"{start_date}T00:00:00+00:00"
-        if len(end_date) == 10:
-            end_date = f"{end_date}T23:59:59+00:00"
         return start_date, end_date
     now = datetime.now(timezone.utc)
     return (now - timedelta(days=days)).isoformat(), now.isoformat()
