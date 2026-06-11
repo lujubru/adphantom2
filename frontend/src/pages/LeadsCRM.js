@@ -680,6 +680,7 @@ const AdminLeadModal = ({ lead, onClose, onUpdate }) => {
           }}
           onClose={onClose}
           showCloseButton={true}
+          onLeadDeleted={() => { onUpdate(); onClose(); }}
         />
       </div>
     </div>
@@ -1483,6 +1484,10 @@ export default function LeadsCRM() {
                 onLeadUpdated={(updated) => {
                   setSelectedLead(prev => prev && prev.id === updated.id ? { ...prev, ...updated } : prev);
                   setLeads(prev => prev.map(l => l.id === updated.id ? { ...l, ...updated } : l));
+                }}
+                onLeadDeleted={(deletedId) => {
+                  setLeads(prev => prev.filter(l => l.id !== deletedId));
+                  setSelectedLead(null);
                 }}
                 userMessages={{
                   welcome_message: currentUser?.welcome_message,
