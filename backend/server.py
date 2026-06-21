@@ -379,6 +379,54 @@ async def get_welcome_variant(current_user=Depends(get_current_user)):
     if not raw:
         return {"message": ""}
     return {"message": _pick_welcome_variation(raw)}
+
+
+class MyMessagesUpdate(BaseModel):
+    """Auto-gestión de los textos/botones del CRM por parte del cajero.
+
+    El admin sigue pudiendo editarlos vía `/auth/users/{id}` (UserUpdate),
+    pero ahora el cajero también puede actualizar SUS PROPIOS textos sin
+    depender del admin. Esto reduce fricción operativa.
+    """
+    welcome_message: Optional[str] = None
+    user_message: Optional[str] = None
+    auto_welcome_enabled: Optional[bool] = None
+    derivation_message: Optional[str] = None
+    derivation_numbers: Optional[List[str]] = None
+    cbu_list: Optional[List[Dict]] = None
+
+
+@api_router.put("/auth/me/messages")
+async def update_my_messages(payload: MyMessagesUpdate, current_user=Depends(get_current_user)):
+    """Cajeros + admins se auto-gestionan sus textos (Bienvenida / Usuario /
+    CBU / Derivación). NO permite cambiar role, líneas, cupo de broadcast
+    ni nada que sea responsabilidad del admin.
+    """
+    update_data: dict = {}
+    for k, v in payload.model_dump(exclude_unset=True).items():
+        if k == "derivation_numbers" and v is not None:
+            update_data[k] = [n.strip() for n in v if n and n.strip()]
+        elif k == "cbu_list" and v is not None:
+            update_data[k] = _sanitize_cbu_list(v)
+        elif k == "auto_welcome_enabled":
+            update_data[k] = bool(v) if v is not None else True
+        elif v is not None:
+            update_data[k] = v
+    if update_data:
+        update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await db.users.update_one({"id": current_user["id"]}, {"$set": update_data})
+    refreshed = await db.users.find_one({"id": current_user["id"]}, {"_id": 0, "hashed_password": 0})
+    return {
+        "ok": True,
+        "welcome_message": refreshed.get("welcome_message", ""),
+        "user_message": refreshed.get("user_message", ""),
+        "auto_welcome_enabled": refreshed.get("auto_welcome_enabled", True),
+        "derivation_message": refreshed.get("derivation_message", ""),
+        "derivation_numbers": refreshed.get("derivation_numbers", []),
+        "cbu_list": refreshed.get("cbu_list", []),
+    }
+
+
 def _sanitize_cbu_list(raw) -> List[Dict]:
     """Keep only entries with a non-empty CBU; trim whitespace on cbu and name."""
     if not isinstance(raw, list):
@@ -1282,7 +1330,7 @@ async def generate_ai_page(data: AIPageCreate, current_user=Depends(get_current_
         import anthropic
         client_ai = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
         message = client_ai.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5-20250929",
             max_tokens=4096,
             messages=[{
                 "role": "user",
@@ -1652,7 +1700,7 @@ RESPONDE EN JSON EXACTO con esta estructura (sin markdown, solo JSON puro):
         import anthropic
         client_ai = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
         message = client_ai.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5-20250929",
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -8924,6 +8972,157 @@ async def broadcasts_quota_me(current_user=Depends(get_current_user)):
     return state
 
 
+async def _wa_fetch_phone_quality(phone_number_id: str, token: str) -> dict:
+    """Health check (b): consulta Meta Graph para obtener el estado completo
+    del número:
+      - `quality_rating` (GREEN/YELLOW/RED) — calidad del contenido
+      - `status` (CONNECTED/DISCONNECTED/FLAGGED/BANNED/RATE_LIMITED/...) —
+        estado operativo del número. Si está distinto de CONNECTED, no podés
+        mandar nada aunque el rating sea GREEN.
+      - `messaging_limit_tier` — cuántas conversaciones nuevas/día permite
+    Devuelve {} si falla."""
+    if not phone_number_id or not token:
+        return {}
+    url = f"{WA_GRAPH_URL}/{phone_number_id}"
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {
+        "fields": (
+            "verified_name,display_phone_number,quality_rating,name_status,"
+            "messaging_limit_tier,throughput,status,code_verification_status,"
+            "platform_type,account_mode,is_official_business_account"
+        )
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as cli:
+            resp = await cli.get(url, headers=headers, params=params)
+            if resp.status_code >= 400:
+                return {"error": f"Meta HTTP {resp.status_code}: {resp.text[:200]}"}
+            return resp.json() or {}
+    except Exception as e:
+        logger.error(f"WA fetch phone quality error: {e}")
+        return {"error": str(e)}
+
+
+async def _wa_fetch_waba_status(waba_id: str, token: str) -> dict:
+    """Consulta el estado de la WhatsApp Business Account (WABA) en sí.
+    Detecta cuentas DISABLED/RESTRICTED/FLAGGED a nivel cuenta — esos casos
+    son los más graves (todos los números pierden la capacidad de enviar)."""
+    if not waba_id or not token:
+        return {}
+    url = f"{WA_GRAPH_URL}/{waba_id}"
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {
+        "fields": (
+            "name,account_review_status,business_verification_status,"
+            "is_enabled_for_insights,timezone_id,message_template_namespace"
+        )
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as cli:
+            resp = await cli.get(url, headers=headers, params=params)
+            if resp.status_code >= 400:
+                return {"error": f"Meta HTTP {resp.status_code}: {resp.text[:200]}"}
+            return resp.json() or {}
+    except Exception as e:
+        logger.error(f"WA fetch waba status error: {e}")
+        return {}
+
+
+@api_router.get("/broadcasts/lines/health")
+async def broadcasts_lines_health(current_user=Depends(get_current_user)):
+    """Devuelve el quality_rating, messaging_limit_tier y volumen de envíos
+    de la última hora para cada línea que el usuario puede usar. La UI lo
+    usa para mostrar un semáforo y bloquear envíos si la línea está RED.
+    """
+    role = current_user.get("role")
+    if role not in ("cajero", "admin", "superadmin"):
+        raise HTTPException(status_code=403, detail="Sin permisos")
+    user_line_ids = current_user.get("line_ids") or []
+    query: dict = {}
+    if role == "cajero":
+        if not user_line_ids:
+            return {"lines": []}
+        query["id"] = {"$in": user_line_ids}
+    lines = await db.crm_lines.find(query, {"_id": 0}).to_list(200)
+
+    out = []
+    one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    for line in lines:
+        phone_id = line.get("phone_number_id")
+        waba_id = line.get("waba_id") or line.get("whatsapp_business_account_id")
+        token = line.get("whatsapp_token") or WHATSAPP_TOKEN
+        meta = await _wa_fetch_phone_quality(phone_id, token) if (phone_id and token) else {}
+        waba = await _wa_fetch_waba_status(waba_id, token) if (waba_id and token) else {}
+
+        sent_last_hour = await db.broadcast_messages.count_documents({
+            "line_id": line["id"],
+            "status": {"$in": ["sent", "delivered", "read"]},
+            "created_at": {"$gte": one_hour_ago},
+        })
+        rate_per_hour = int(line.get("broadcast_rate_per_hour") or BROADCAST_RATE_PER_HOUR_DEFAULT)
+        quality = (meta.get("quality_rating") or "UNKNOWN").upper()
+        tier = meta.get("messaging_limit_tier") or "UNKNOWN"
+
+        # Estado operativo del número (independiente del rating):
+        # CONNECTED, DISCONNECTED, FLAGGED, BANNED, RATE_LIMITED, RESTRICTED,
+        # MIGRATED, PENDING, OFFLINE. Solo CONNECTED significa "podés enviar".
+        number_status = (meta.get("status") or "").upper()
+        account_mode = (meta.get("account_mode") or "").upper()  # DISABLED si Meta bloqueó la WABA
+        waba_review = (waba.get("account_review_status") or "").upper()  # FLAGGED/REJECTED/DISABLED en cuentas problemáticas
+
+        # Detección de bloqueo a nivel cuenta (lo más grave). Meta deshabilita
+        # la cuenta y los números siguen "GREEN" porque el rating no se borra
+        # — pero el `status` y/o `account_mode` cambian.
+        BAD_NUMBER_STATUSES = {"BANNED", "RESTRICTED", "FLAGGED", "DISCONNECTED", "RATE_LIMITED", "MIGRATED"}
+        BAD_WABA_STATUSES = {"DISABLED", "REJECTED", "FLAGGED"}
+
+        reasons: list = []
+        if number_status and number_status in BAD_NUMBER_STATUSES:
+            reasons.append(f"Estado del número en Meta: {number_status}")
+        if account_mode == "DISABLED":
+            reasons.append("Cuenta deshabilitada por Meta (account_mode=DISABLED)")
+        if waba_review in BAD_WABA_STATUSES:
+            reasons.append(f"WhatsApp Business Account en estado: {waba_review}")
+        if quality == "RED":
+            reasons.append("Quality rating en RED")
+
+        # Calculamos el estado general del semáforo. Las razones graves tienen
+        # precedencia sobre el quality_rating: una cuenta DISABLED con rating
+        # GREEN sigue siendo `blocked`.
+        if account_mode == "DISABLED" or (number_status in BAD_NUMBER_STATUSES) or (waba_review in BAD_WABA_STATUSES):
+            health = "blocked"
+        elif quality == "RED":
+            health = "blocked"
+        elif quality == "YELLOW":
+            health = "warning"
+        elif quality == "GREEN" and number_status in ("CONNECTED", "", "PENDING"):
+            health = "ok"
+        elif not meta or meta.get("error"):
+            health = "unknown"
+        else:
+            health = "unknown"
+
+        out.append({
+            "line_id": line["id"],
+            "line_name": line.get("name"),
+            "phone_number": line.get("whatsapp_number") or meta.get("display_phone_number"),
+            "quality_rating": quality,
+            "messaging_limit_tier": tier,
+            "name_status": meta.get("name_status"),
+            "number_status": number_status or None,
+            "account_mode": account_mode or None,
+            "waba_review_status": waba_review or None,
+            "throughput": meta.get("throughput", {}).get("level") if isinstance(meta.get("throughput"), dict) else None,
+            "health": health,
+            "reasons": reasons,
+            "sent_last_hour": sent_last_hour,
+            "rate_per_hour": rate_per_hour,
+            "rate_per_hour_used_pct": round((sent_last_hour / rate_per_hour) * 100, 1) if rate_per_hour > 0 else 0,
+            "meta_error": meta.get("error"),
+        })
+    return {"lines": out}
+
+
 class BroadcastQuotaTopup(BaseModel):
     extra: int  # additional credits to add to the current period
 
@@ -9078,6 +9277,176 @@ class BroadcastTemplateCreate(BaseModel):
     footer_text: Optional[str] = None
     buttons: Optional[List[Dict]] = None
     example_body_vars: Optional[List[str]] = None
+
+
+class BroadcastTemplateValidate(BaseModel):
+    name: str
+    category: str = "MARKETING"
+    language: str = "es_AR"
+    body_text: str
+    header_text: Optional[str] = None
+    footer_text: Optional[str] = None
+    buttons: Optional[List[Dict]] = None
+    example_body_vars: Optional[List[str]] = None
+
+
+@api_router.post("/broadcasts/templates/validate")
+async def broadcasts_validate_template_with_ai(
+    payload: BroadcastTemplateValidate,
+    current_user=Depends(get_current_user),
+):
+    """Pre-flight check con Claude: predice si Meta va a aprobar la plantilla.
+
+    Devuelve veredicto + score + warnings + sugerencias concretas para
+    aumentar la probabilidad de aprobación, sin tocar Meta. Pura validación.
+    """
+    if not CLAUDE_API_KEY:
+        raise HTTPException(status_code=500, detail="Claude API key no configurada")
+
+    # Validaciones locales determinísticas (rápidas, sin llamar IA)
+    local_issues = []
+    if not re.fullmatch(r"[a-z0-9_]+", payload.name):
+        local_issues.append("El nombre debe ser snake_case (minúsculas, números y guión bajo). Meta rechaza nombres con mayúsculas o espacios.")
+    if payload.category not in ("MARKETING", "UTILITY", "AUTHENTICATION"):
+        local_issues.append(f"Categoría inválida: {payload.category}. Debe ser MARKETING, UTILITY o AUTHENTICATION.")
+    vars_in_body = len(re.findall(r"\{\{\d+\}\}", payload.body_text or ""))
+    if vars_in_body and (not payload.example_body_vars or len(payload.example_body_vars) != vars_in_body):
+        local_issues.append(f"Faltan ejemplos para las {vars_in_body} variables. Meta exige `example_body_vars` con un valor por cada {{{{n}}}}.")
+
+    template_dump = {
+        "name": payload.name,
+        "category": payload.category,
+        "language": payload.language,
+        "body_text": payload.body_text,
+        "header_text": payload.header_text,
+        "footer_text": payload.footer_text,
+        "buttons": payload.buttons,
+        "example_body_vars": payload.example_body_vars,
+    }
+
+    system_prompt = """Sos un revisor de plantillas de WhatsApp Business Cloud API que predice con precisión si Meta va a aprobar o rechazar. Estás entrenado en cientos de casos reales de rechazo. Sos ESTRICTO pero JUSTO: detectás los problemas reales, no inventás ni te ponés cosmético.
+
+## Sistema de scoring (empezá en 100 y restá)
+
+### Restas DURAS (rechazo casi seguro de Meta)
+- Lenguaje EXPLÍCITO de gambling: "apostá", "tirá", "ruleta", "casino", "tragamonedas", "póker", "ganá seguro", "100% ganador" → **-50**
+- Contenido para adultos, drogas, armas, productos prohibidos → **-100** (LIKELY_REJECTED automático)
+- Phishing implícito: pedir contraseñas/datos bancarios sin contexto comercial → **-60**
+- Una frase entera (5+ palabras) en MAYÚSCULAS → **-25**
+- Categoría UTILITY con contenido claramente promocional/marketing → **-40**
+
+### Restas MEDIAS (Meta marca alto riesgo, suele rechazar)
+- Claims absolutos sin sustento: "la más completa", "la mejor", "la #1", "única", "líder" → **-20**
+- Descuentos/promociones sin condiciones explícitas (sin fecha límite, sin "aplica a", sin "promoción válida hasta") tipo "+30%", "50% off", "2x1" → **-20**
+- Énfasis promocional en MAYÚSCULAS de palabras sueltas tipo "MUNDIAL", "OFERTA", "GRATIS", "URGENTE", "EXCLUSIVO" → **-15** por cada palabra (acumulable)
+- Verbos de ganancia económica ("ganar más dinero", "ganancia asegurada", "duplicá") fuera de contexto laboral/profesional → **-25** (Meta lo asocia con gambling/scams)
+- Variables sin contexto: "{{1}}" sin que se entienda qué es → **-15**
+- Faltan ejemplos para variables existentes → **-30**
+- "Aprovecha" + emoji explosivo (💥🔥💰) + número de descuento juntos = patrón típico spam → **-15**
+
+### Restas LIVIANAS (Meta a veces marca, depende del rating de la línea)
+- Sin firma/identificación de marca (no se sabe quién manda el mensaje) → **-10**
+- Sin opt-out tipo "Respondé BAJA" → **-5**
+- 3+ emojis consecutivos sin espacio entre ellos → **-5**
+
+## NO restes por
+- Tono informal, voseo, lenguaje argentino
+- Uso de "promoción", "oferta", "beneficio", "bono", "regalo" (palabras OK)
+- Mencionar "fin de semana", "finde", "feriado"
+- Hasta 2 emojis por línea sin abuso
+- Falta de opt-out si la plantilla tiene <100 caracteres
+
+## Veredicto según score final
+- **score >= 80** → LIKELY_APPROVED → warnings=[], suggestions=[], improved_body=null
+- **score 50-79** → NEEDS_CHANGES → listá los problemas detectados y sugerí el cambio puntual
+- **score < 50** → LIKELY_REJECTED → listá problemas + proponé improved_body re-escrito
+
+## Ejemplos de calibración (memorizalos)
+
+### Ejemplo A — APROBADA por Meta (score real: 95)
+"Hola, ¿cómo estás? Te escribo desde Plataforma X. Tenemos una promoción de fin de semana con beneficios para usuarios nuevos. ¿Querés que te pase los detalles?"
+→ Sin claims absolutos, sin %, sin mayúsculas. Score 95.
+
+### Ejemplo B — RECHAZADA por Meta (score real: 45)
+"Hola, bienvenidos! Aprovecha oferta MUNDIAL 💥. Hoy finde con extras +30% 🔥 para disfrutar y ganar mas 🔥 Accede a la plataforma mas completa del pais ☑️"
+→ MUNDIAL mayúsculas (-15), +30% sin condiciones (-20), "ganar más" (-25), "la más completa del país" claim absoluto (-20). Final ≈ 20-45.
+
+### Ejemplo C — NEEDS_CHANGES (score real: 65)
+"¡Hola! Tenemos una oferta de bienvenida del 30% extra este fin de semana. Respondé para más info."
+→ Solo el "30%" sin fecha exacta (-20). Score 80, pero como el 30% es marginal lo dejamos en 65/70.
+
+## Reglas críticas
+1. Si verdict es LIKELY_APPROVED, NO devuelvas warnings ni suggestions ni improved_body.
+2. NO cambies tu veredicto entre validaciones de la misma plantilla. Si el usuario aplicó tu sugerencia y arregló el problema, el nuevo body NO tiene ese problema → subí el score.
+3. category_suggested = null si la categoría declarada es correcta.
+
+## Output (CRÍTICO)
+Devolvé ÚNICAMENTE el objeto JSON, sin ningún texto antes ni después, sin markdown, sin ```, sin comentarios. La primera carácter de tu respuesta DEBE ser `{` y el último DEBE ser `}`. Cualquier texto adicional rompe el sistema.
+
+{
+  "verdict": "LIKELY_APPROVED" | "NEEDS_CHANGES" | "LIKELY_REJECTED",
+  "score": 0-100,
+  "category_suggested": "MARKETING" | "UTILITY" | "AUTHENTICATION" | null,
+  "warnings": [],
+  "suggestions": [],
+  "improved_body": null | "..."
+}"""
+
+    user_prompt = f"""Aplicá tu sistema de scoring estricto a esta plantilla. Empezá en 100 y restá por cada patrón detectado. Sé exhaustivo encontrando los patrones (mayúsculas sueltas, %, claims absolutos, verbos de ganancia, etc.).
+
+Plantilla:
+{json.dumps(template_dump, ensure_ascii=False, indent=2)}"""
+
+    try:
+        import anthropic
+        client_ai = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        message = client_ai.messages.create(
+            model="claude-sonnet-4-5-20250929",
+            max_tokens=1500,
+            temperature=0.2,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        raw = message.content[0].text.strip()
+        # Extraer JSON robustamente: Claude a veces lo envuelve en markdown,
+        # agrega texto antes/después, o pone múltiples líneas explicativas.
+        # Buscamos el primer bloque { ... } balanceado.
+        json_text = None
+        # 1) Markdown wrapper ```json ... ``` o ``` ... ```
+        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+        if m:
+            json_text = m.group(1)
+        else:
+            # 2) Primer bloque { ... } balanceado en el texto plano
+            start = raw.find("{")
+            if start >= 0:
+                depth = 0
+                for i in range(start, len(raw)):
+                    if raw[i] == "{":
+                        depth += 1
+                    elif raw[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            json_text = raw[start:i + 1]
+                            break
+        if not json_text:
+            json_text = raw  # último fallback
+        result = json.loads(json_text)
+
+        # Si hubo issues locales determinísticos, los anteponemos a las warnings
+        if local_issues:
+            result["warnings"] = local_issues + (result.get("warnings") or [])
+            if result.get("verdict") == "LIKELY_APPROVED":
+                result["verdict"] = "NEEDS_CHANGES"
+                result["score"] = min(result.get("score", 50), 60)
+
+        return result
+    except json.JSONDecodeError as e:
+        logger.error(f"Claude template validate: invalid JSON ({e}). Raw response (first 800 chars): {raw[:800]!r}")
+        raise HTTPException(status_code=502, detail="La IA respondió en formato inválido, reintentá.")
+    except Exception as e:
+        logger.error(f"Claude template validate error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error validando con IA: {str(e)[:200]}")
 
 
 @api_router.post("/broadcasts/templates/create")
@@ -9427,6 +9796,14 @@ NIGHT_PAUSE_FROM_HOUR = 23  # ART
 NIGHT_PAUSE_TO_HOUR   = 9   # ART
 ART_TZ = timezone(timedelta(hours=-3))  # Argentina UTC-3 (no DST)
 
+# ── Defaults anti-spam (a + c) ──────────────────────────────────────
+# Estos defaults se pueden override por línea con `line.broadcast_rate_per_hour`
+# y `line.broadcast_auto_pause_threshold_pct` desde el endpoint de edición de
+# líneas.
+BROADCAST_RATE_PER_HOUR_DEFAULT = 200      # máximo de envíos por hora
+BROADCAST_AUTOPAUSE_MIN_SAMPLE = 50        # min envíos antes de evaluar fail-rate
+BROADCAST_AUTOPAUSE_FAIL_PCT = 15.0        # si fallan ≥15% se pausa
+
 
 def _is_night_pause_now() -> bool:
     """True if current ART time is in the night-pause window [23:00, 09:00)."""
@@ -9442,6 +9819,67 @@ def _seconds_until_morning() -> int:
     if now_art >= target:
         target = target + timedelta(days=1)
     return max(60, int((target - now_art).total_seconds()))
+
+
+async def _broadcast_throttle_wait(line_id: str, line: dict) -> int:
+    """Rate limiter (a): cuenta los envíos de la última hora para este line_id
+    y, si supera `rate_per_hour`, devuelve los segundos que faltan hasta que
+    el envío más antiguo de la ventana caiga afuera (ese es el momento exacto
+    en que se libera un slot). Devuelve 0 si está OK para enviar ya.
+    """
+    rate_per_hour = int(line.get("broadcast_rate_per_hour") or BROADCAST_RATE_PER_HOUR_DEFAULT)
+    if rate_per_hour <= 0:
+        return 0  # sin límite
+    one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    count = await db.broadcast_messages.count_documents({
+        "line_id": line_id,
+        "status": {"$in": ["sent", "delivered", "read"]},
+        "created_at": {"$gte": one_hour_ago},
+    })
+    if count < rate_per_hour:
+        return 0
+    # Necesitamos esperar a que el más viejo de la ventana caiga. Tomamos el
+    # más viejo de la última hora y calculamos cuánto le falta para tener 1h.
+    oldest = await db.broadcast_messages.find(
+        {"line_id": line_id, "created_at": {"$gte": one_hour_ago}},
+        {"_id": 0, "created_at": 1},
+    ).sort("created_at", 1).limit(1).to_list(1)
+    if not oldest:
+        return 0
+    try:
+        oldest_dt = datetime.fromisoformat(oldest[0]["created_at"].replace("Z", "+00:00"))
+    except Exception:
+        return 60
+    wait = int((oldest_dt + timedelta(hours=1) - datetime.now(timezone.utc)).total_seconds())
+    return max(10, min(wait, 600))  # entre 10s y 10min
+
+
+async def _broadcast_check_autopause(campaign_id: str) -> Optional[str]:
+    """Auto-pause (c): si los primeros N envíos de la campaña tuvieron una
+    tasa de fallo superior al threshold de la línea, devuelve el motivo de
+    pausa. Si está OK o el sample es chico, devuelve None.
+    """
+    c = await db.broadcast_campaigns.find_one(
+        {"id": campaign_id},
+        {"_id": 0, "stats": 1, "line_id": 1, "autopause_disabled": 1}
+    )
+    if not c or c.get("autopause_disabled"):
+        return None
+    stats = c.get("stats") or {}
+    sent = int(stats.get("sent") or 0)
+    failed = int(stats.get("failed") or 0)
+    total = sent + failed
+    if total < BROADCAST_AUTOPAUSE_MIN_SAMPLE:
+        return None
+    line = await db.crm_lines.find_one({"id": c["line_id"]}, {"_id": 0, "broadcast_auto_pause_threshold_pct": 1})
+    threshold = float((line or {}).get("broadcast_auto_pause_threshold_pct") or BROADCAST_AUTOPAUSE_FAIL_PCT)
+    if threshold <= 0:
+        return None
+    fail_pct = (failed / total) * 100.0
+    if fail_pct >= threshold:
+        return f"Auto-pausa: {failed} de {total} envíos fallaron ({fail_pct:.1f}% ≥ {threshold:.0f}%). Revisá la plantilla y el rating de la línea."
+    return None
+
 
 
 class BroadcastSegmentQuery(BaseModel):
@@ -9517,9 +9955,12 @@ class BroadcastCampaignCreate(BaseModel):
     # Source — exactly ONE of these:
     audience_id: Optional[str] = None
     segment: Optional[BroadcastSegmentQuery] = None
-    # Template
+    # Template (single)
     template_name: str
     template_language: str = "es_AR"
+    # Rotación (d): si se pasan 2+ plantillas el sistema reparte uniformemente
+    # entre ellas durante el envío. `template_name` queda como fallback/single.
+    template_pool: Optional[List[str]] = None  # ej: ["bienvenida_a", "bienvenida_b", "promo_c"]
     # Mapping: variables[i] is the column name in audience contact's `vars`
     # (e.g. ["name", "var1"] => template {{1}}=name, {{2}}=var1).
     # The literal string "name" maps to contact.name.
@@ -9530,6 +9971,8 @@ class BroadcastCampaignCreate(BaseModel):
     # Auto-resend (optional)
     resend_after_hours: Optional[int] = None
     resend_template_name: Optional[str] = None
+    # Auto-pause (c): permite desactivar la auto-pausa para esta campaña
+    autopause_disabled: Optional[bool] = False
 
 
 @api_router.post("/broadcasts/campaigns")
@@ -9543,6 +9986,45 @@ async def broadcasts_create_campaign(
     line = await db.crm_lines.find_one({"id": payload.line_id}, {"_id": 0})
     if not line:
         raise HTTPException(status_code=404, detail="Línea no encontrada")
+
+    # Health check (b): bloqueamos broadcasts si Meta marca la línea como RED,
+    # BANNED, RESTRICTED, FLAGGED, DISCONNECTED, o si la WABA está DISABLED.
+    # Estos son los casos en que Meta NO va a entregar los mensajes y vamos
+    # a quemar la cuenta intentando. Si falla la consulta a Meta, dejamos
+    # pasar (no queremos romper el flow por un endpoint caído).
+    try:
+        meta = await _wa_fetch_phone_quality(
+            line.get("phone_number_id"),
+            line.get("whatsapp_token") or WHATSAPP_TOKEN,
+        )
+        waba_id = line.get("waba_id") or line.get("whatsapp_business_account_id")
+        waba = await _wa_fetch_waba_status(waba_id, line.get("whatsapp_token") or WHATSAPP_TOKEN) if waba_id else {}
+
+        number_status = (meta.get("status") or "").upper()
+        account_mode = (meta.get("account_mode") or "").upper()
+        waba_review = (waba.get("account_review_status") or "").upper()
+        quality = (meta.get("quality_rating") or "").upper()
+
+        if account_mode == "DISABLED" or waba_review in ("DISABLED", "REJECTED"):
+            raise HTTPException(
+                status_code=400,
+                detail="Esta línea pertenece a una cuenta de WhatsApp Business DESHABILITADA por Meta. No se pueden enviar mensajes. Tenés que apelar o usar un número nuevo en una cuenta nueva.",
+            )
+        if number_status in ("BANNED", "RESTRICTED", "FLAGGED"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"El número está en estado {number_status} en Meta. No se pueden enviar broadcasts hasta que Meta restablezca el número.",
+            )
+        if quality == "RED":
+            raise HTTPException(
+                status_code=400,
+                detail="Esta línea tiene quality rating RED en Meta. Pausá los envíos al menos 7 días para que el rating se recupere antes de programar nuevas campañas.",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # no romper si Meta no responde
+
     if not (payload.audience_id or payload.segment):
         raise HTTPException(status_code=400, detail="Debe especificar audience_id o segment")
     if payload.audience_id and payload.segment:
@@ -9597,11 +10079,13 @@ async def broadcasts_create_campaign(
         "segment": payload.segment.dict() if payload.segment else None,
         "template_name": payload.template_name,
         "template_language": payload.template_language,
+        "template_pool": [t for t in (payload.template_pool or []) if t] or None,
         "template_var_mapping": payload.template_var_mapping or [],
         "header_image_url": payload.header_image_url,
         "scheduled_at": payload.scheduled_at,
         "resend_after_hours": payload.resend_after_hours,
         "resend_template_name": payload.resend_template_name,
+        "autopause_disabled": bool(payload.autopause_disabled),
         "status": status,
         "target_count": target_count,
         "quota_truncated": quota_truncated,
@@ -9788,6 +10272,18 @@ async def _csv_campaign_worker(campaign_id: str):
         already_phones = {m["phone"] for m in already_sent}
 
         var_mapping = c.get("template_var_mapping") or []
+        # Rotación (d): si template_pool tiene 2+ plantillas, rotamos en
+        # round-robin con offset aleatorio por contacto. Si está vacío usamos
+        # template_name como única opción.
+        import random as _random
+        template_pool: List[str] = list(c.get("template_pool") or [])
+        if not template_pool:
+            template_pool = [c["template_name"]]
+        # Mezclamos al iniciar la campaña para que Meta no vea "todas la A
+        # primero, todas la B después" (eso es justo lo que detecta el spam
+        # algoritmo).
+        _random.shuffle(template_pool)
+        _tpl_idx = 0
 
         for contact in contacts:
             # Cancel/pause check
@@ -9844,6 +10340,27 @@ async def _csv_campaign_worker(campaign_id: str):
                     logger.info(f"campaign {campaign_id} paused: monthly quota reached for {owner_email}")
                     return
 
+            # Rate limiter (a): si superamos N envíos/hora para esta línea,
+            # esperamos hasta liberar slot. Esto distribuye los envíos para
+            # que Meta no vea ráfagas.
+            wait_s = await _broadcast_throttle_wait(c["line_id"], line)
+            while wait_s > 0:
+                await db.broadcast_campaigns.update_one(
+                    {"id": campaign_id},
+                    {"$set": {"paused_reason": f"Rate limit: esperando {wait_s}s para liberar slot horario"}}
+                )
+                await asyncio.sleep(min(wait_s, 60))
+                # re-check status mientras esperamos
+                state = await db.broadcast_campaigns.find_one(
+                    {"id": campaign_id}, {"_id": 0, "status": 1}
+                )
+                if not state or state.get("status") not in ("running",):
+                    return
+                wait_s = await _broadcast_throttle_wait(c["line_id"], line)
+            await db.broadcast_campaigns.update_one(
+                {"id": campaign_id}, {"$set": {"paused_reason": None}}
+            )
+
             # Build template variables
             tpl_vars: List[str] = []
             for col in var_mapping:
@@ -9853,10 +10370,14 @@ async def _csv_campaign_worker(campaign_id: str):
                     v = (contact.get("vars") or {}).get(col, "")
                     tpl_vars.append(str(v) if v is not None else "")
 
+            # Rotación (d): elegimos la próxima plantilla del pool
+            chosen_template = template_pool[_tpl_idx % len(template_pool)]
+            _tpl_idx += 1
+
             msg_id = str(uuid.uuid4())
             send_result = await wa_send_template(
                 phone=phone,
-                template_name=c["template_name"],
+                template_name=chosen_template,
                 language=c.get("template_language") or "es_AR",
                 variables=tpl_vars or None,
                 header_image_url=c.get("header_image_url"),
@@ -9882,7 +10403,7 @@ async def _csv_campaign_worker(campaign_id: str):
                 "line_id": c["line_id"],
                 "phone": phone,
                 "name": contact.get("name", ""),
-                "template_name": c["template_name"],
+                "template_name": chosen_template,
                 "wa_message_id": wa_msg_id,
                 "status": "sent" if success else "failed",
                 "error": err,
@@ -9895,6 +10416,17 @@ async def _csv_campaign_worker(campaign_id: str):
             # Increment quota usage on successful send (skip admins — unlimited)
             if success and owner_email and owner_user and owner_user.get("role") != "admin":
                 await _quota_increment(owner_email, by=1)
+
+            # Auto-pause (c): si el % de fallos supera el threshold con muestra
+            # mínima, frenamos automáticamente para no quemar la línea.
+            autopause_reason = await _broadcast_check_autopause(campaign_id)
+            if autopause_reason:
+                await db.broadcast_campaigns.update_one(
+                    {"id": campaign_id},
+                    {"$set": {"status": "paused", "paused_reason": autopause_reason}}
+                )
+                logger.warning(f"campaign {campaign_id} auto-paused (high fail rate): {autopause_reason}")
+                return
 
             # Auto-pause on Meta rate-limit (#80007 / #131056) or auth error
             if err and any(k in err for k in ("131056", "80007", "rate", "OAuthException")):
@@ -10977,6 +11509,7 @@ def _dashboard_date_range(
 @api_router.get("/crm/contacts/history")
 async def crm_contacts_history(
     fmt: str = Query("json", regex="^(json|csv)$"),
+    status: Optional[str] = Query("all", description="Filtro: all | valido | consultas | nuevo"),
     current_user=Depends(get_current_user),
 ):
     """Histórico de contactos para los cajeros: teléfono + monto cargado total
@@ -10984,6 +11517,8 @@ async def crm_contacts_history(
     automáticamente por las líneas asignadas al cajero.
 
     `fmt=csv` devuelve un archivo CSV listo para descargar.
+    `status` permite descargar solo un segmento (ej: consultas para usar como
+    audiencia de broadcast de reactivación).
     """
     role = current_user.get("role")
     if role not in ("cajero", "admin", "superadmin"):
@@ -10995,6 +11530,22 @@ async def crm_contacts_history(
         if not user_line_ids:
             return [] if fmt == "json" else _csv_response([], filename="contactos.csv")
         match["line_id"] = {"$in": user_line_ids}
+
+    # Filtro por status (el cajero quiere bajar solo válidos / solo consultas
+    # / solo nuevos para alimentar audiencias de broadcast).
+    status_norm = (status or "all").lower().strip()
+    status_map = {
+        "valido": "valido",
+        "validos": "valido",
+        "consultas": "consultas",
+        "consulta": "consultas",
+        "nuevo": "nuevo",
+        "nuevos": "nuevo",
+    }
+    if status_norm in status_map:
+        match["status"] = status_map[status_norm]
+    elif status_norm not in ("all", ""):
+        raise HTTPException(status_code=400, detail=f"Status inválido: {status_norm}")
 
     pipe = [
         {"$match": match},
