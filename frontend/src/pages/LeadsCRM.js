@@ -2,10 +2,10 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Users, Plus, Search, Phone, MessageCircle,
   Check, X, Trash2, RefreshCw,
-  DollarSign, UserCheck, AlertTriangle,
+  DollarSign, UserCheck, AlertTriangle, AlertCircle,
   GripVertical, Eye, Settings, Smartphone,
-  ArrowRight, BarChart3, Zap, Copy, User, Target,
-  Megaphone, Radio,
+  ArrowRight, ArrowLeft, BarChart3, Zap, Copy, User, Target,
+  Megaphone, Radio, Download,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -687,6 +687,226 @@ const AdminLeadModal = ({ lead, onClose, onUpdate }) => {
   );
 };
 
+// ─── Export Contacts Modal ────────────────────────────────────────
+
+const ContactsExportModal = ({ onClose }) => {
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [downloading, setDownloading] = useState(false);
+
+  const OPTIONS = [
+    { value: 'all',       label: 'Todos los contactos',         hint: 'Toda la base sin filtrar' },
+    { value: 'valido',    label: 'Solo Válidos',                hint: 'Los que ya cargaron alguna vez' },
+    { value: 'consultas', label: 'Solo Consultas',              hint: 'Preguntaron pero no cargaron — ideal para reactivación' },
+    { value: 'nuevo',     label: 'Solo Nuevos (sin clasificar)', hint: 'Leads sin estado todavía' },
+  ];
+
+  const download = async () => {
+    setDownloading(true);
+    try {
+      const url = `/crm/contacts/history?fmt=csv&status=${encodeURIComponent(statusFilter)}`;
+      const res = await api.get(url, { responseType: 'blob' });
+      const blobUrl = window.URL.createObjectURL(new Blob([res.data], { type: 'text/csv;charset=utf-8' }));
+      const a = document.createElement('a');
+      const suffix = statusFilter === 'all' ? 'todos' : statusFilter;
+      a.href = blobUrl;
+      a.download = `contactos-${suffix}-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(a); a.click(); a.remove();
+      window.URL.revokeObjectURL(blobUrl);
+      toast.success('Contactos exportados');
+      onClose();
+    } catch {
+      toast.error('Error exportando contactos');
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+      onClick={onClose} data-testid="contacts-export-modal-backdrop">
+      <div className="w-full max-w-md rounded-xl border border-slate-700 bg-slate-900 shadow-2xl p-5"
+        onClick={e => e.stopPropagation()} data-testid="contacts-export-modal">
+        <div className="flex items-center justify-between mb-1">
+          <p className="text-base font-semibold text-white">Descargar contactos</p>
+          <button onClick={onClose} className="p-1.5 rounded hover:bg-slate-800 text-slate-400"
+            data-testid="contacts-export-close-btn">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <p className="text-xs text-slate-400 mb-4">Elegí qué segmento querés bajar como CSV.</p>
+
+        <div className="space-y-2">
+          {OPTIONS.map(opt => (
+            <label key={opt.value}
+              className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                statusFilter === opt.value
+                  ? 'border-emerald-500/50 bg-emerald-500/10'
+                  : 'border-slate-700 bg-slate-800/40 hover:bg-slate-800/80'
+              }`}
+              data-testid={`contacts-export-opt-${opt.value}`}>
+              <input
+                type="radio"
+                name="contacts-export-status"
+                value={opt.value}
+                checked={statusFilter === opt.value}
+                onChange={e => setStatusFilter(e.target.value)}
+                className="mt-0.5 accent-emerald-500"
+                data-testid={`contacts-export-radio-${opt.value}`}
+              />
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-white">{opt.label}</p>
+                <p className="text-[11px] text-slate-400">{opt.hint}</p>
+              </div>
+            </label>
+          ))}
+        </div>
+
+        <div className="mt-5 flex justify-end gap-2">
+          <Button variant="outline" onClick={onClose}
+            className="border-slate-600 text-slate-300 hover:bg-slate-800"
+            data-testid="contacts-export-cancel-btn">
+            Cancelar
+          </Button>
+          <Button onClick={download} disabled={downloading}
+            className="bg-emerald-600 hover:bg-emerald-500 text-white"
+            data-testid="contacts-export-download-btn">
+            {downloading ? <RefreshCw className="w-4 h-4 mr-1 animate-spin" /> : <Download className="w-4 h-4 mr-1" />}
+            Descargar CSV
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ─── Admin Lines Panel ────────────────────────────────────────────
+// Vista limpia para admin: cards de líneas con mini-stats + botón "Ver
+// como cajero". Cada línea muestra cuántos leads tiene en cada estado
+// para que el admin pueda priorizar dónde meterse.
+
+const AdminLinesPanel = ({ lines, leads, onSelectLine, onRefresh, onBroadcast }) => {
+  const [showLinesManager, setShowLinesManager] = useState(false);
+  // Computamos stats por línea sobre los leads ya cargados (los mismos que
+  // usa el CRM cuando admin entra normal).
+  const statsByLine = React.useMemo(() => {
+    const map = {};
+    for (const l of leads) {
+      const lid = l.line_id;
+      if (!lid) continue;
+      if (!map[lid]) map[lid] = { total: 0, nuevo: 0, consultas: 0, valido: 0, no_responde: 0, unread: 0, today: 0 };
+      map[lid].total += 1;
+      const status = l.status || 'nuevo';
+      if (map[lid][status] !== undefined) map[lid][status] += 1;
+      if (l.unread_count > 0 || l.has_unread_messages) map[lid].unread += 1;
+      const ci = l.created_at;
+      if (ci && new Date(ci).toDateString() === new Date().toDateString()) {
+        map[lid].today += 1;
+      }
+    }
+    return map;
+  }, [leads]);
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-white" data-testid="admin-lines-panel">
+      <div className="max-w-6xl mx-auto p-4 sm:p-6">
+        {/* Header */}
+        <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-lg bg-blue-500/15 flex items-center justify-center">
+              <Users className="w-5 h-5 text-blue-400" />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold">Administración de líneas</h1>
+              <p className="text-xs text-slate-400">Vista admin · entrá a cualquier línea para operarla como cajero</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button onClick={() => setShowLinesManager(v => !v)} variant="outline"
+              className={`border-emerald-500/40 ${showLinesManager ? 'bg-emerald-500/20 text-emerald-200' : 'text-emerald-300 bg-emerald-500/10'} hover:bg-emerald-500/20`}
+              data-testid="admin-panel-toggle-lines-manager">
+              <Settings className="w-4 h-4 mr-2" /> {showLinesManager ? 'Ocultar gestor' : 'Gestionar líneas'}
+            </Button>
+            <Button onClick={onBroadcast} variant="outline"
+              className="border-purple-500/40 text-purple-300 bg-purple-500/10 hover:bg-purple-500/20"
+              data-testid="admin-panel-broadcast-btn">
+              <Radio className="w-4 h-4 mr-2" /> Envío masivo
+            </Button>
+            <Button onClick={onRefresh} variant="outline" className="border-slate-600"
+              data-testid="admin-panel-refresh-btn">
+              <RefreshCw className="w-4 h-4 mr-2" /> Actualizar
+            </Button>
+          </div>
+        </div>
+
+        {/* Gestor de líneas plegable: crear/editar/eliminar líneas */}
+        {showLinesManager && (
+          <div className="mb-5">
+            <LinesManager lines={lines} onRefresh={onRefresh} onSelectLine={() => {}} selectedLineId={null} />
+          </div>
+        )}
+
+        {/* Líneas en grid */}
+        {lines.length === 0 ? (
+          <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-8 text-center">
+            <AlertCircle className="w-8 h-8 text-amber-400 mx-auto mb-2 opacity-60" />
+            <p className="text-sm font-medium text-amber-200">No hay líneas configuradas</p>
+            <p className="text-xs text-slate-400 mt-1">Configurá líneas WhatsApp desde el gestor de líneas para empezar.</p>
+          </div>
+        ) : (
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {lines.map(line => {
+              const s = statsByLine[line.id] || { total: 0, nuevo: 0, consultas: 0, valido: 0, no_responde: 0, unread: 0, today: 0 };
+              return (
+                <div key={line.id}
+                  className="rounded-lg border border-slate-800 bg-slate-900/60 p-4 hover:border-slate-700 transition-colors"
+                  data-testid={`admin-line-card-${line.id}`}>
+                  <div className="flex items-start justify-between gap-2 mb-3">
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-white truncate">{line.name}</p>
+                      <p className="text-[11px] text-slate-500 font-mono truncate">{line.whatsapp_number}</p>
+                    </div>
+                    {s.unread > 0 && (
+                      <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-red-500/20 text-red-300 shrink-0"
+                        title="Conversaciones con mensajes sin leer">
+                        {s.unread} sin leer
+                      </span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 mb-3 text-center">
+                    <div className="rounded bg-slate-800/50 p-2">
+                      <p className="text-[10px] text-slate-500 uppercase">Hoy</p>
+                      <p className="text-lg font-bold text-emerald-300">{s.today}</p>
+                    </div>
+                    <div className="rounded bg-slate-800/50 p-2">
+                      <p className="text-[10px] text-slate-500 uppercase">Nuevos</p>
+                      <p className="text-lg font-bold text-blue-300">{s.nuevo}</p>
+                    </div>
+                    <div className="rounded bg-slate-800/50 p-2">
+                      <p className="text-[10px] text-slate-500 uppercase">Total</p>
+                      <p className="text-lg font-bold text-white">{s.total}</p>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-1 mb-3">
+                    {s.consultas > 0 && <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300">Consultas: {s.consultas}</span>}
+                    {s.valido > 0 && <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300">Válidos: {s.valido}</span>}
+                    {s.no_responde > 0 && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/15 text-red-300">No responde: {s.no_responde}</span>}
+                  </div>
+                  <Button onClick={() => onSelectLine(line.id)} size="sm"
+                    className="w-full bg-blue-600 hover:bg-blue-500 text-white"
+                    data-testid={`admin-view-as-cajero-${line.id}`}>
+                    Ver como cajero →
+                  </Button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+
 // ─── Main Component ───────────────────────────────────────────────
 
 export default function LeadsCRM() {
@@ -706,6 +926,11 @@ export default function LeadsCRM() {
 
   const isAdmin = !currentUser?.role || currentUser?.role === 'admin';
 
+  // Modo "Ver como cajero": cuando admin elige una línea desde el panel
+  // limpio, entra al CRM normal pero filtrando los leads de esa línea
+  // (operando como si fuera el cajero de la línea, con permisos plenos).
+  const [adminViewAsLineId, setAdminViewAsLineId] = useState(null);
+
   // ── PWA install prompt ─────────────────────────────────────────
   const [pwaPrompt, setPwaPrompt] = useState(null);
   const [pwaInstalled, setPwaInstalled] = useState(false);
@@ -718,6 +943,7 @@ export default function LeadsCRM() {
   }, []);
 
   const [broadcastOpen, setBroadcastOpen] = useState(false);
+  const [exportModalOpen, setExportModalOpen] = useState(false);
 
   useEffect(() => {
     if ('serviceWorker' in navigator) {
@@ -1192,7 +1418,10 @@ export default function LeadsCRM() {
     const matchSearch = !searchTerm ||
       (lead.name || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
       (lead.phone || '').includes(searchTerm);
-    return matchStatus && matchSearch;
+    // Si admin está en modo "Ver como cajero" filtramos solo los leads de
+    // esa línea (todos los cajeros que la operan).
+    const matchAdminView = !adminViewAsLineId || lead.line_id === adminViewAsLineId;
+    return matchStatus && matchSearch && matchAdminView;
   });
 
   // Open a lead from the chat list — marks as read.
@@ -1203,6 +1432,27 @@ export default function LeadsCRM() {
   }, []);
 
   const closeLead = useCallback(() => setSelectedLead(null), []);
+
+  // ── ADMIN PANEL (vista limpia con cards de líneas) ─────────────
+  // Si admin entra sin haber elegido línea, mostramos el panel limpio.
+  // Si elige una línea, cae a la vista normal (filtrada por esa línea con
+  // el botón "Volver a líneas" arriba).
+  if (isAdmin && !adminViewAsLineId) {
+    return (
+      <>
+        <AdminLinesPanel
+          lines={lines}
+          leads={leads}
+          onSelectLine={(lid) => setAdminViewAsLineId(lid)}
+          onRefresh={() => { loadLeads(); loadLines(); loadFunnel(); }}
+          onBroadcast={() => setBroadcastOpen(true)}
+        />
+        {broadcastOpen && (
+          <BroadcastModal lines={lines} currentUser={currentUser} onClose={() => setBroadcastOpen(false)} />
+        )}
+      </>
+    );
+  }
 
   // ── CAJERO VIEW ────────────────────────────────────────────────
   if (currentUser && !isAdmin) {
@@ -1234,17 +1484,7 @@ export default function LeadsCRM() {
             onInstall={installPWA}
             onBroadcast={() => setBroadcastOpen(true)}
             onRefresh={loadLeads}
-            onContactsExport={async () => {
-              try {
-                const res = await api.get('/crm/contacts/history?fmt=csv', { responseType: 'blob' });
-                const url = window.URL.createObjectURL(new Blob([res.data], { type: 'text/csv;charset=utf-8' }));
-                const a = document.createElement('a');
-                a.href = url; a.download = `contactos-${new Date().toISOString().slice(0, 10)}.csv`;
-                document.body.appendChild(a); a.click(); a.remove();
-                window.URL.revokeObjectURL(url);
-                toast.success('Contactos exportados');
-              } catch { toast.error('Error exportando contactos'); }
-            }}
+            onContactsExport={() => setExportModalOpen(true)}
             unreadCount={leads.filter(l => (l.unread_count > 0 || l.has_unread_messages) && selectedLead?.id !== l.id).length}
           />
         )}
@@ -1504,6 +1744,10 @@ export default function LeadsCRM() {
         {broadcastOpen && (
           <BroadcastModal lines={lines} currentUser={currentUser} onClose={() => setBroadcastOpen(false)} />
         )}
+
+        {exportModalOpen && (
+          <ContactsExportModal onClose={() => setExportModalOpen(false)} />
+        )}
       </div>
     );
   }
@@ -1518,6 +1762,21 @@ export default function LeadsCRM() {
   return (
     <div className={`min-h-screen ${bgMain} p-3 sm:p-6`}>
       <div className="max-w-[1800px] mx-auto mb-6">
+        {/* Breadcrumb "Volver a líneas" cuando admin entró desde el panel */}
+        {adminViewAsLineId && (
+          <button
+            onClick={() => { setAdminViewAsLineId(null); setSelectedLead(null); }}
+            className="mb-3 inline-flex items-center gap-1.5 text-xs text-slate-400 hover:text-white px-2 py-1 rounded hover:bg-slate-800 transition-colors"
+            data-testid="admin-back-to-lines-btn"
+          >
+            <ArrowLeft className="w-3.5 h-3.5" />
+            Volver a líneas
+            <span className="text-slate-600 mx-1">·</span>
+            <span className="text-slate-300 font-medium">
+              {lines.find(l => l.id === adminViewAsLineId)?.name || 'Línea'}
+            </span>
+          </button>
+        )}
         <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
           <div>
             <h1 className={`text-xl sm:text-2xl font-bold ${textPrimary} flex items-center gap-3`}>
@@ -1601,6 +1860,9 @@ export default function LeadsCRM() {
       )}
       {broadcastOpen && (
         <BroadcastModal lines={lines} currentUser={currentUser} onClose={() => setBroadcastOpen(false)} />
+      )}
+      {exportModalOpen && (
+        <ContactsExportModal onClose={() => setExportModalOpen(false)} />
       )}
     </div>
   );

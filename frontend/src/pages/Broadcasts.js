@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
   Megaphone, Upload, Users, Ban, FileText, Play, Pause, X as XIcon,
   RefreshCw, Calendar, AlertCircle, CheckCircle2, Clock, Trash2, Plus,
-  Eye, Send, Filter, FilePlus,
+  Eye, Send, Filter, FilePlus, Sparkles, ShieldCheck,
 } from 'lucide-react';
 import api from '@/utils/api';
 import { Button } from '@/components/ui/button';
@@ -12,6 +12,22 @@ import { toast } from 'sonner';
 
 // ── Shared helpers ─────────────────────────────────────────────────
 const fmt = (iso) => iso ? new Date(iso).toLocaleString('es-AR', { hour12: false }) : '—';
+
+/** Normaliza un error que puede venir como string o como objeto de Meta
+ *  Graph API ({message, code, error_subcode, fbtrace_id, type}). Renderear
+ *  el objeto crudo en JSX rompe con React error #31. */
+const normalizeErr = (err) => {
+  if (!err) return '';
+  if (typeof err === 'string') return err;
+  if (typeof err === 'object') {
+    if (err.message) {
+      const code = err.code ? ` (código ${err.code}${err.error_subcode ? `/${err.error_subcode}` : ''})` : '';
+      return `${err.message}${code}`;
+    }
+    try { return JSON.stringify(err); } catch { return String(err); }
+  }
+  return String(err);
+};
 
 const STATUS_COLORS = {
   draft:     { bg: 'bg-slate-700', text: 'text-slate-300', label: 'Borrador' },
@@ -281,6 +297,9 @@ const CampaignWizard = ({ lines, audiences, prefilledAudience, onClose, onCreate
   const [templatesLoading, setTemplatesLoading] = useState(false);
   const [templatesError, setTemplatesError] = useState('');
   const [selectedTpl, setSelectedTpl] = useState(null);
+  // Rotación (d): plantillas adicionales para alternar durante el envío.
+  // El nombre principal (selectedTpl) cuenta como la primera del pool.
+  const [rotationPool, setRotationPool] = useState([]); // array de template names
   const [varMapping, setVarMapping] = useState([]); // [{from: 'name'|'var1'|...}]
   const [scheduledAt, setScheduledAt] = useState('');
   const [resendAfterHours, setResendAfterHours] = useState('');
@@ -299,9 +318,9 @@ const CampaignWizard = ({ lines, audiences, prefilledAudience, onClose, onCreate
     api.get(`/broadcasts/templates?line_id=${lineId}`)
       .then(({ data }) => {
         setTemplates(data.templates || []);
-        if (data.error) setTemplatesError(data.error);
+        if (data.error) setTemplatesError(normalizeErr(data.error));
       })
-      .catch(e => setTemplatesError(e?.response?.data?.detail || 'Error cargando plantillas'))
+      .catch(e => setTemplatesError(normalizeErr(e?.response?.data?.detail) || 'Error cargando plantillas'))
       .finally(() => setTemplatesLoading(false));
   }, [lineId, step]);
 
@@ -345,6 +364,11 @@ const CampaignWizard = ({ lines, audiences, prefilledAudience, onClose, onCreate
         template_var_mapping: varMapping,
         scheduled_at: scheduledAt ? new Date(scheduledAt).toISOString() : null,
       };
+      // Rotación (d): si el usuario agregó plantillas extra, las mandamos
+      // como pool. El backend reparte uniformemente entre todas.
+      if (rotationPool.length > 0) {
+        body.template_pool = [selectedTpl.name, ...rotationPool];
+      }
       if (resendAfterHours && resendTemplateName) {
         body.resend_after_hours = Number(resendAfterHours);
         body.resend_template_name = resendTemplateName;
@@ -513,6 +537,61 @@ const CampaignWizard = ({ lines, audiences, prefilledAudience, onClose, onCreate
                     </select>
                   </div>
                 ))}
+              </div>
+            )}
+
+            {/* Rotación de plantillas (d) — anti-spam.
+                Si elegís 2+ plantillas, el sistema reparte uniformemente los
+                envíos. Meta deja de leer todos los mensajes como "el mismo
+                texto masivo" → score de spam más bajo. */}
+            {selectedTpl && templates.length > 1 && (
+              <div className="rounded border border-purple-500/30 bg-purple-500/5 p-3 space-y-2" data-testid="wizard-rotation-section">
+                <div className="flex items-center gap-2">
+                  <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+                  <p className="text-xs font-medium text-purple-200">Rotación anti-spam (opcional pero recomendado)</p>
+                </div>
+                <p className="text-[11px] text-purple-200/70">
+                  Elegí 1-4 plantillas adicionales del mismo tipo. El sistema reparte uniformemente entre todas las plantillas seleccionadas (incluyendo la principal), distribuyendo el envío para que Meta no detecte el broadcast como mensajes masivos.
+                </p>
+                <div className="grid gap-1 max-h-40 overflow-y-auto">
+                  {templates
+                    .filter(t => t.name !== selectedTpl.name && t.var_count === selectedTpl.var_count)
+                    .map(t => {
+                      const checked = rotationPool.includes(t.name);
+                      return (
+                        <label key={t.name}
+                          className={`flex items-start gap-2 p-2 rounded border cursor-pointer text-xs transition-colors ${
+                            checked ? 'border-purple-500/60 bg-purple-500/10' : 'border-slate-700 hover:border-slate-600'
+                          }`}
+                          data-testid={`wizard-rot-${t.name}`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={!checked && rotationPool.length >= 4}
+                            onChange={e => {
+                              setRotationPool(prev => e.target.checked
+                                ? [...prev, t.name]
+                                : prev.filter(n => n !== t.name));
+                            }}
+                            className="mt-0.5 accent-purple-500"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <p className="text-white font-medium truncate">{t.name}</p>
+                            {t.body_text && <p className="text-[10px] text-slate-400 line-clamp-1">{t.body_text}</p>}
+                          </div>
+                        </label>
+                      );
+                    })}
+                </div>
+                {rotationPool.length > 0 && (
+                  <p className="text-[11px] text-purple-200">
+                    Pool actual: <strong>{1 + rotationPool.length}</strong> plantillas · cada una recibirá ~{Math.round(100 / (1 + rotationPool.length))}% de los envíos.
+                  </p>
+                )}
+                {templates.filter(t => t.name !== selectedTpl.name && t.var_count === selectedTpl.var_count).length === 0 && (
+                  <p className="text-[11px] text-slate-500 italic">No hay otras plantillas aprobadas con la misma cantidad de variables ({selectedTpl.var_count}) para rotar.</p>
+                )}
               </div>
             )}
 
@@ -763,6 +842,9 @@ const TemplateCreateModal = ({ lines, onClose, onCreated }) => {
   const [headerText, setHeaderText] = useState('');
   const [footerText, setFooterText] = useState('');
   const [busy, setBusy] = useState(false);
+  // IA pre-flight check (Claude predice si Meta lo va a aprobar)
+  const [validating, setValidating] = useState(false);
+  const [aiReport, setAiReport] = useState(null);
 
   // Detect variables in body to ask for example values (Meta requires them)
   const varCount = useMemo(() => {
@@ -806,6 +888,39 @@ const TemplateCreateModal = ({ lines, onClose, onCreated }) => {
     } catch (e) {
       toast.error(e?.response?.data?.detail || 'Error creando plantilla');
     } finally { setBusy(false); }
+  };
+
+  const validateWithAI = async () => {
+    if (!name || !bodyText) {
+      toast.error('Completá al menos nombre y cuerpo del mensaje');
+      return;
+    }
+    if (varCount && exampleVars.some(v => !v)) {
+      toast.error('Completá los ejemplos de las variables antes de validar');
+      return;
+    }
+    setValidating(true);
+    setAiReport(null);
+    try {
+      const { data } = await api.post('/broadcasts/templates/validate', {
+        name, category, language,
+        body_text: bodyText,
+        header_text: headerText || null,
+        footer_text: footerText || null,
+        example_body_vars: varCount ? exampleVars : null,
+      });
+      setAiReport(data);
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || 'Error validando con IA');
+    } finally { setValidating(false); }
+  };
+
+  const applyImprovedBody = () => {
+    if (aiReport?.improved_body) {
+      setBodyText(aiReport.improved_body);
+      setAiReport(null);
+      toast.success('Body actualizado con la sugerencia de la IA. Revisá y volvé a validar si querés.');
+    }
   };
 
   return (
@@ -923,14 +1038,90 @@ const TemplateCreateModal = ({ lines, onClose, onCreated }) => {
               <p>• Ejemplo de variables claros y reales, no placeholders tipo "xxx".</p>
             </div>
           </div>
+
+          {aiReport && (() => {
+            const verdictMeta = {
+              LIKELY_APPROVED: { bg: 'bg-emerald-500/10 border-emerald-500/40', text: 'text-emerald-200', label: 'Lista para enviar a Meta', icon: CheckCircle2, dot: 'text-emerald-400' },
+              NEEDS_CHANGES:   { bg: 'bg-amber-500/10 border-amber-500/40',    text: 'text-amber-200',   label: 'Necesita ajustes',    icon: AlertCircle,  dot: 'text-amber-400' },
+              LIKELY_REJECTED: { bg: 'bg-red-500/10 border-red-500/40',        text: 'text-red-200',     label: 'Probable rechazo',    icon: XIcon,        dot: 'text-red-400' },
+            };
+            const vm = verdictMeta[aiReport.verdict] || verdictMeta.NEEDS_CHANGES;
+            const Icon = vm.icon;
+            const isApproved = aiReport.verdict === 'LIKELY_APPROVED';
+            return (
+              <div className={`rounded-lg border p-3 space-y-2 ${vm.bg}`} data-testid="ai-report">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Icon className={`w-4 h-4 ${vm.dot}`} />
+                    <p className={`text-sm font-semibold ${vm.text}`}>{vm.label}</p>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[10px] uppercase tracking-wide text-slate-400">Score</span>
+                    <span className={`text-sm font-bold ${vm.text}`} data-testid="ai-score">{aiReport.score}/100</span>
+                  </div>
+                </div>
+
+                {isApproved && (
+                  <p className="text-[11px] text-emerald-200/90">
+                    No detectamos problemas. Podés mandarla a Meta con el botón <strong>Enviar a Meta</strong>.
+                  </p>
+                )}
+
+                {aiReport.category_suggested && aiReport.category_suggested !== category && (
+                  <div className="text-[11px] text-amber-200 flex items-start gap-1.5">
+                    <AlertCircle className="w-3 h-3 shrink-0 mt-0.5" />
+                    <span>La IA sugiere usar categoría <strong>{aiReport.category_suggested}</strong> en lugar de <strong>{category}</strong>.
+                      <button type="button" onClick={() => { setCategory(aiReport.category_suggested); }}
+                        className="ml-1 underline hover:text-amber-100" data-testid="ai-apply-category">
+                        Aplicar
+                      </button>
+                    </span>
+                  </div>
+                )}
+
+                {aiReport.warnings?.length > 0 && (
+                  <ul className="text-[11px] text-slate-200 space-y-0.5 list-disc list-inside">
+                    {aiReport.warnings.map((w, i) => <li key={`w-${i}`}>{w}</li>)}
+                  </ul>
+                )}
+
+                {aiReport.suggestions?.length > 0 && (
+                  <div className="pt-1 border-t border-white/5">
+                    <p className="text-[10px] uppercase tracking-wide text-slate-400 mb-1">Sugerencias</p>
+                    <ul className="text-[11px] text-slate-200 space-y-0.5 list-disc list-inside">
+                      {aiReport.suggestions.map((s, i) => <li key={`s-${i}`}>{s}</li>)}
+                    </ul>
+                  </div>
+                )}
+
+                {aiReport.improved_body && !isApproved && (
+                  <div className="pt-2 border-t border-white/5">
+                    <p className="text-[10px] uppercase tracking-wide text-slate-400 mb-1">Versión mejorada sugerida</p>
+                    <p className="text-[12px] text-slate-100 whitespace-pre-wrap bg-slate-900/60 rounded p-2 border border-slate-700">{aiReport.improved_body}</p>
+                    <Button size="sm" onClick={applyImprovedBody}
+                      className="mt-2 h-7 px-2 text-xs bg-violet-600 hover:bg-violet-500" data-testid="ai-apply-body">
+                      <Sparkles className="w-3 h-3 mr-1" /> Aplicar texto sugerido
+                    </Button>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </div>
 
-        <div className="mt-4 flex justify-end gap-2">
-          <Button variant="outline" onClick={onClose} className="border-slate-600 text-slate-300 hover:bg-slate-800" data-testid="template-cancel-btn">Cancelar</Button>
-          <Button onClick={submit} disabled={busy} className="bg-emerald-600 hover:bg-emerald-500" data-testid="template-submit-btn">
-            {busy ? <RefreshCw className="w-4 h-4 mr-1 animate-spin" /> : <Send className="w-4 h-4 mr-1" />}
-            Enviar a Meta
+        <div className="mt-4 flex flex-wrap justify-between gap-2">
+          <Button variant="outline" onClick={validateWithAI} disabled={validating || !name || !bodyText}
+            className="border-violet-500/40 text-violet-300 hover:bg-violet-500/10" data-testid="template-validate-ai-btn">
+            {validating ? <RefreshCw className="w-4 h-4 mr-1 animate-spin" /> : <ShieldCheck className="w-4 h-4 mr-1" />}
+            Validar con IA antes de enviar
           </Button>
+          <div className="flex gap-2">
+            <Button variant="outline" onClick={onClose} className="border-slate-600 text-slate-300 hover:bg-slate-800" data-testid="template-cancel-btn">Cancelar</Button>
+            <Button onClick={submit} disabled={busy} className="bg-emerald-600 hover:bg-emerald-500" data-testid="template-submit-btn">
+              {busy ? <RefreshCw className="w-4 h-4 mr-1 animate-spin" /> : <Send className="w-4 h-4 mr-1" />}
+              Enviar a Meta
+            </Button>
+          </div>
         </div>
       </div>
     </div>
@@ -955,9 +1146,9 @@ const TemplatesTab = ({ lines }) => {
     try {
       const { data } = await api.get(`/broadcasts/templates?line_id=${lineId}&include_all=true`);
       setTemplates(data.templates || []);
-      if (data.error) setError(data.error);
+      if (data.error) setError(normalizeErr(data.error));
     } catch (e) {
-      setError(e?.response?.data?.detail || 'Error cargando plantillas');
+      setError(normalizeErr(e?.response?.data?.detail) || 'Error cargando plantillas');
       setTemplates([]);
     } finally { setLoading(false); }
   }, [lineId]);
@@ -1036,7 +1227,7 @@ const TemplatesTab = ({ lines }) => {
                     {t.rejected_reason && !['NONE', 'PENDING', null, ''].includes(t.rejected_reason) && (
                       <p className="text-[11px] text-red-300 mt-1">
                         <AlertCircle className="w-3 h-3 inline-block mr-1" />
-                        Razón de rechazo: {t.rejected_reason}
+                        Razón de rechazo: {normalizeErr(t.rejected_reason)}
                       </p>
                     )}
                   </div>
@@ -1162,6 +1353,153 @@ const OptoutsTab = ({ lines }) => {
 };
 
 // ════════════════════════════════════════════════════════════════════
+// LINES HEALTH BANNER — Quality Rating de Meta + uso de rate-limit (b)
+// ════════════════════════════════════════════════════════════════════
+
+const LinesHealthBanner = () => {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [collapsed, setCollapsed] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const { data: res } = await api.get('/broadcasts/lines/health');
+      setData(res);
+    } catch { /* silent */ }
+    finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => {
+    load();
+    const iv = setInterval(load, 60_000); // refresh cada 60s
+    return () => clearInterval(iv);
+  }, [load]);
+
+  if (loading && !data) {
+    return (
+      <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3 mb-4 flex items-center gap-2 text-xs text-slate-400">
+        <RefreshCw className="w-3.5 h-3.5 animate-spin" /> Cargando health check de líneas…
+      </div>
+    );
+  }
+
+  if (!data?.lines?.length) return null;
+
+  const HEALTH_META = {
+    ok:      { label: 'OK',         dot: 'bg-emerald-500', text: 'text-emerald-300', bg: 'bg-emerald-500/10 border-emerald-500/30' },
+    warning: { label: 'Atención',   dot: 'bg-amber-500',   text: 'text-amber-300',   bg: 'bg-amber-500/10 border-amber-500/30' },
+    blocked: { label: 'BLOQUEADA',  dot: 'bg-red-500',     text: 'text-red-300',     bg: 'bg-red-500/10 border-red-500/40' },
+    unknown: { label: 'Sin datos',  dot: 'bg-slate-500',   text: 'text-slate-300',   bg: 'bg-slate-500/10 border-slate-500/30' },
+  };
+
+  const worst = data.lines.find(l => l.health === 'blocked')
+    || data.lines.find(l => l.health === 'warning')
+    || data.lines[0];
+  const worstMeta = HEALTH_META[worst.health] || HEALTH_META.unknown;
+
+  return (
+    <div className={`rounded-lg border p-3 mb-4 ${worstMeta.bg}`} data-testid="lines-health-banner">
+      <button onClick={() => setCollapsed(v => !v)}
+        className="w-full flex items-center justify-between gap-2 text-left"
+        data-testid="lines-health-toggle">
+        <div className="flex items-center gap-2">
+          <ShieldCheck className={`w-4 h-4 ${worstMeta.text}`} />
+          <p className={`text-sm font-semibold ${worstMeta.text}`}>
+            Health check de líneas — peor estado: {worstMeta.label}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] text-slate-400">{data.lines.length} líneas</span>
+          <RefreshCw className={`w-3 h-3 text-slate-500 ${loading ? 'animate-spin' : ''}`} />
+        </div>
+      </button>
+
+      {!collapsed && (
+        <div className="mt-3 grid gap-2">
+          {data.lines.map(l => {
+            const hm = HEALTH_META[l.health] || HEALTH_META.unknown;
+            const usagePct = Math.min(100, l.rate_per_hour_used_pct || 0);
+            return (
+              <div key={l.line_id} className="rounded border border-slate-700 bg-slate-900/50 p-2.5"
+                data-testid={`line-health-${l.line_id}`}>
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div className="flex items-center gap-2 min-w-0 flex-1">
+                    <span className={`w-2 h-2 rounded-full shrink-0 ${hm.dot}`} />
+                    <p className="text-sm text-white truncate">{l.line_name}</p>
+                    <span className="text-[10px] text-slate-500 truncate">{l.phone_number}</span>
+                  </div>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${hm.bg} ${hm.text}`}>
+                      Quality: {l.quality_rating}
+                    </span>
+                    {l.number_status && l.number_status !== 'CONNECTED' && (
+                      <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-red-500/20 text-red-300">
+                        Número: {l.number_status}
+                      </span>
+                    )}
+                    {l.account_mode === 'DISABLED' && (
+                      <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-red-500/30 text-red-200">
+                        Cuenta: DISABLED
+                      </span>
+                    )}
+                    {l.waba_review_status && ['DISABLED', 'REJECTED', 'FLAGGED'].includes(l.waba_review_status) && (
+                      <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-red-500/30 text-red-200">
+                        WABA: {l.waba_review_status}
+                      </span>
+                    )}
+                    {l.messaging_limit_tier && l.messaging_limit_tier !== 'UNKNOWN' && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-700 text-slate-300">
+                        Tier: {l.messaging_limit_tier.replace('TIER_', '')}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="mt-1.5 flex items-center gap-2">
+                  <div className="flex-1 h-1 bg-slate-800 rounded overflow-hidden">
+                    <div className={`h-full transition-all ${
+                      usagePct >= 90 ? 'bg-red-500' : usagePct >= 70 ? 'bg-amber-500' : 'bg-emerald-500'
+                    }`} style={{ width: `${usagePct}%` }} />
+                  </div>
+                  <span className="text-[10px] text-slate-400 whitespace-nowrap">
+                    {l.sent_last_hour}/{l.rate_per_hour}/h
+                  </span>
+                </div>
+                {l.reasons?.length > 0 && (
+                  <ul className="mt-1.5 space-y-0.5">
+                    {l.reasons.map((r, i) => (
+                      <li key={i} className="text-[11px] text-red-300 flex items-start gap-1">
+                        <span className="shrink-0">⛔</span> {r}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {l.health === 'blocked' && l.reasons?.length > 0 && (
+                  <p className="mt-1.5 text-[11px] text-red-300">
+                    Esta línea no puede enviar broadcasts. Si la cuenta fue deshabilitada permanentemente, vas a tener que usar un número nuevo en una WABA nueva.
+                  </p>
+                )}
+                {l.health === 'warning' && (
+                  <p className="mt-1.5 text-[11px] text-amber-300">
+                    ⚠️ Rating en YELLOW. Reducí el volumen y revisá el contenido antes de seguir.
+                  </p>
+                )}
+                {l.meta_error && (
+                  <p className="mt-1.5 text-[10px] text-slate-500 italic line-clamp-1" title={l.meta_error}>
+                    {l.meta_error}
+                  </p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+};
+
+
+// ════════════════════════════════════════════════════════════════════
 // PAGE
 // ════════════════════════════════════════════════════════════════════
 
@@ -1247,6 +1585,9 @@ const Broadcasts = () => {
             </div>
           </div>
         )}
+
+        {/* Health check (b) de líneas con Quality Rating de Meta */}
+        <LinesHealthBanner />
 
         {/* Tabs */}
         <div className="flex gap-1 border-b border-slate-800 mb-4 overflow-x-auto">

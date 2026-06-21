@@ -21,6 +21,7 @@ import MetaDiagnostics from '@/pages/MetaDiagnostics';
 import MetaInsights from '@/pages/MetaInsights';
 import Broadcasts from '@/pages/Broadcasts';
 import Finanzas from '@/pages/Finanzas';
+import MiConfiguracion from '@/pages/MiConfiguracion';
 import '@/App.css';
 
 function App() {
@@ -49,6 +50,7 @@ function App() {
               <Route path="meta-insights" element={<MetaInsights />} />
               <Route path="broadcasts" element={<Broadcasts />} />
               <Route path="finanzas" element={<Finanzas />} />
+              <Route path="mi-configuracion" element={<MiConfiguracion />} />
               {/* Catch-all: redirect unknown routes to dashboard (fixes PWA blank screen) */}
               <Route path="*" element={<Navigate to="/dashboard" replace />} />
             </Route>
