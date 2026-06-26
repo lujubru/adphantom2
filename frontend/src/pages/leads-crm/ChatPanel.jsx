@@ -201,6 +201,63 @@ export const ChatPanel = ({
   const inputRef = useRef(null);
   const handleImagePick = () => fileInputRef.current?.click();
 
+  // Drag & drop + clipboard paste: el cajero arrastra una imagen desde su
+  // escritorio o copia/pega un screenshot y se envía igual que con el botón
+  // adjuntar. Solo se aceptan tipos image/*.
+  const [isDragging, setIsDragging] = useState(false);
+  const dragCounterRef = useRef(0);
+
+  const handleDragEnter = (e) => {
+    e.preventDefault(); e.stopPropagation();
+    if (!e.dataTransfer?.types?.includes('Files')) return;
+    dragCounterRef.current += 1;
+    setIsDragging(true);
+  };
+  const handleDragLeave = (e) => {
+    e.preventDefault(); e.stopPropagation();
+    dragCounterRef.current -= 1;
+    if (dragCounterRef.current <= 0) {
+      dragCounterRef.current = 0;
+      setIsDragging(false);
+    }
+  };
+  const handleDragOver = (e) => {
+    e.preventDefault(); e.stopPropagation();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  };
+  const handleDrop = (e) => {
+    e.preventDefault(); e.stopPropagation();
+    dragCounterRef.current = 0;
+    setIsDragging(false);
+    const files = Array.from(e.dataTransfer?.files || []);
+    if (files.length === 0) return;
+    // Solo procesamos imágenes; ignoramos PDFs/zips/etc. (Meta Cloud API
+    // exige endpoints distintos para otros tipos y para acá el caso de uso
+    // es comprobantes/screenshots).
+    const images = files.filter(f => f.type.startsWith('image/'));
+    if (images.length === 0) {
+      toast.error('Solo se permiten imágenes. Para otros archivos usá el botón adjuntar.');
+      return;
+    }
+    if (images.length > 1) {
+      toast.info(`Enviando ${images.length} imagen${images.length === 1 ? '' : 'es'}…`);
+    }
+    // Mandamos una por una respetando el orden del drop
+    images.reduce((p, f) => p.then(() => sendImage(f)), Promise.resolve());
+  };
+
+  // Paste de imágenes desde el portapapeles (Ctrl+V con un screenshot)
+  const handlePaste = (e) => {
+    const items = Array.from(e.clipboardData?.items || []);
+    const imgs = items
+      .filter(it => it.type.startsWith('image/'))
+      .map(it => it.getAsFile())
+      .filter(Boolean);
+    if (imgs.length === 0) return; // dejar que el paste normal de texto siga
+    e.preventDefault();
+    imgs.reduce((p, f) => p.then(() => sendImage(f)), Promise.resolve());
+  };
+
   const sendImage = async (file) => {
     if (!file) return;
     if (file.size > 10 * 1024 * 1024) {
@@ -479,7 +536,25 @@ Le envio nuestros datos de cuenta 👇`;
   const dotColor = STATUS_CONFIG[lead.status]?.dot || 'bg-blue-400';
 
   return (
-    <div className="flex flex-col h-full w-full flex-1 min-w-0 bg-slate-950">
+    <div
+      className="flex flex-col h-full w-full flex-1 min-w-0 bg-slate-950 relative"
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
+      data-testid="chat-drop-zone"
+    >
+      {/* Overlay visual cuando el usuario arrastra archivos sobre el chat */}
+      {isDragging && (
+        <div className="absolute inset-0 z-30 pointer-events-none flex items-center justify-center bg-emerald-500/10 backdrop-blur-sm border-4 border-dashed border-emerald-400/60 rounded-lg"
+          data-testid="chat-drop-overlay">
+          <div className="bg-slate-900/90 border border-emerald-500/60 rounded-xl px-6 py-4 text-center shadow-2xl">
+            <ImageIcon className="w-10 h-10 text-emerald-400 mx-auto mb-2" />
+            <p className="text-sm font-semibold text-white">Soltá la imagen para enviarla</p>
+            <p className="text-[11px] text-slate-400 mt-0.5">Acepta JPG, PNG, WEBP, GIF</p>
+          </div>
+        </div>
+      )}
       {/* Header */}
       <div className="px-3 py-2.5 border-b border-slate-700 bg-slate-900/80 flex items-center justify-between shrink-0 backdrop-blur">
         <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -843,9 +918,10 @@ Le envio nuestros datos de cuenta 👇`;
             </Button>
             <Textarea
               ref={inputRef}
-              placeholder={sending ? 'Enviando...' : 'Escribí un mensaje... (Shift+Enter = nueva línea)'}
+              placeholder={sending ? 'Enviando...' : 'Escribí un mensaje... (Shift+Enter = nueva línea, Ctrl+V para pegar imagen)'}
               value={newMessage}
               onChange={e => setNewMessage(e.target.value)}
+              onPaste={handlePaste}
               onKeyDown={e => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
