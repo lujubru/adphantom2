@@ -784,6 +784,69 @@ const ContactsExportModal = ({ onClose }) => {
 // como cajero". Cada línea muestra cuántos leads tiene en cada estado
 // para que el admin pueda priorizar dónde meterse.
 
+const LineNotesField = ({ line, onSaved }) => {
+  const [value, setValue] = useState(line?.notes || '');
+  const [saving, setSaving] = useState(false);
+  const [savedAt, setSavedAt] = useState(null);
+  const debounceRef = useRef(null);
+  const initialRef = useRef(line?.notes || '');
+
+  // Si el padre refresca y la nota cambió por afuera, re-sincronizamos
+  useEffect(() => {
+    if ((line?.notes || '') !== initialRef.current) {
+      initialRef.current = line?.notes || '';
+      setValue(line?.notes || '');
+    }
+  }, [line?.notes]);
+
+  const onChange = (e) => {
+    const next = e.target.value;
+    setValue(next);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(async () => {
+      if (next === initialRef.current) return;
+      setSaving(true);
+      try {
+        await api.put(`/crm/lines/${line.id}`, { notes: next });
+        initialRef.current = next;
+        setSavedAt(Date.now());
+        onSaved?.();
+      } catch {
+        toast.error('No se guardaron las observaciones');
+      } finally {
+        setSaving(false);
+      }
+    }, 900);
+  };
+
+  // Indicador visual: "Guardando..." mientras tipea, "Guardado ✓" 2s después
+  const showSavedBadge = savedAt && Date.now() - savedAt < 2500;
+
+  return (
+    <div className="mt-2.5" data-testid={`line-notes-${line.id}`}>
+      <div className="flex items-center justify-between mb-1">
+        <label className="text-[10px] uppercase tracking-wide text-slate-500">
+          Observaciones
+        </label>
+        {saving ? (
+          <span className="text-[10px] text-slate-500 italic">guardando…</span>
+        ) : showSavedBadge ? (
+          <span className="text-[10px] text-emerald-400">guardado ✓</span>
+        ) : null}
+      </div>
+      <textarea
+        value={value}
+        onChange={onChange}
+        rows={2}
+        placeholder="Ej: número de Naranjax, asignada a Juan, usa CBU del banco X..."
+        className="w-full text-xs bg-slate-800/60 border border-slate-700 rounded px-2 py-1.5 text-slate-200 placeholder:text-slate-600 resize-none focus:outline-none focus:border-blue-500/60"
+        data-testid={`line-notes-input-${line.id}`}
+      />
+    </div>
+  );
+};
+
+
 const AdminLinesPanel = ({ lines, leads, onSelectLine, onRefresh, onBroadcast }) => {
   const [showLinesManager, setShowLinesManager] = useState(false);
   // Computamos stats por línea sobre los leads ya cargados (los mismos que
@@ -896,6 +959,8 @@ const AdminLinesPanel = ({ lines, leads, onSelectLine, onRefresh, onBroadcast })
                     data-testid={`admin-view-as-cajero-${line.id}`}>
                     Ver como cajero →
                   </Button>
+
+                  <LineNotesField line={line} onSaved={onRefresh} />
                 </div>
               );
             })}
