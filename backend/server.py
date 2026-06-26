@@ -3878,6 +3878,7 @@ class CRMLineUpdate(BaseModel):
     meta_access_token: Optional[str] = None
     meta_pixel_id: Optional[str] = None
     description: Optional[str] = None
+    notes: Optional[str] = None  # Observaciones admin: a qué corresponde la línea, recordatorios, etc.
     is_active: Optional[bool] = None
 
 # ─── CRM Pydantic Models ───────────────────────────────────────────
