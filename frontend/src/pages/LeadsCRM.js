@@ -1498,6 +1498,34 @@ export default function LeadsCRM() {
 
   const closeLead = useCallback(() => setSelectedLead(null), []);
 
+  // Atajo global: ESC cierra el chat abierto y vuelve a la lista de chats.
+  // Ignoramos el ESC si el foco está en un input/textarea/contenteditable
+  // (para no interrumpir a los cajeros cuando escriben y usan ESC para
+  // cerrar un dropdown, un modal, o borrar el texto). También ignoramos si
+  // hay algún modal shadcn abierto (que gestiona su propio ESC).
+  useEffect(() => {
+    const isTypingInField = (el) => {
+      if (!el) return false;
+      const tag = (el.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+      if (el.isContentEditable) return true;
+      return false;
+    };
+    const onKey = (e) => {
+      if (e.key !== 'Escape') return;
+      // Si hay un dialog radix/shadcn abierto, dejar que él maneje su propio ESC
+      if (document.querySelector('[role="dialog"][data-state="open"]')) return;
+      // Si el usuario está tipeando, no interceptamos
+      if (isTypingInField(e.target)) return;
+      // Solo actúa si hay un chat abierto
+      if (!selectedLead) return;
+      e.preventDefault();
+      setSelectedLead(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selectedLead]);
+
   // ── ADMIN PANEL (vista limpia con cards de líneas) ─────────────
   // Si admin entra sin haber elegido línea, mostramos el panel limpio.
   // Si elige una línea, cae a la vista normal (filtrada por esa línea con
