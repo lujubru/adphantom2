@@ -4661,6 +4661,149 @@ async def crm_get_line(line_id: str, current_user=Depends(get_current_user)):
     
     return line
 
+class LinesMigratePayload(BaseModel):
+    source_line_id: str
+    target_line_id: str
+
+
+@api_router.post("/crm/lines/migrate")
+async def crm_migrate_lines(payload: LinesMigratePayload, current_user=Depends(get_current_user)):
+    """Migrar todos los chats/mensajes de una línea a otra.
+
+    Comportamiento:
+    - Si un lead del source tiene el mismo `phone` que uno del target, se
+      FUSIONAN: los mensajes viejos del source pasan al lead del target
+      (que gana en identidad — se conserva su ID, name, status del lead
+      con `updated_at` más reciente), y el lead del source se borra.
+    - Si el phone no existe en target, el lead se re-etiqueta con
+      `line_id=target` (mueve el lead entero sin duplicar).
+    - Broadcast messages / receipts también se re-etiquetan.
+    - La línea source NO se elimina ni desactiva: queda vacía pero operativa
+      (puede seguir recibiendo chats nuevos por webhook si el número sigue
+      registrado en Meta).
+    """
+    role = current_user.get("role")
+    if role not in ("admin", "superadmin"):
+        raise HTTPException(status_code=403, detail="Solo admin puede migrar líneas")
+    if payload.source_line_id == payload.target_line_id:
+        raise HTTPException(status_code=400, detail="Origen y destino deben ser distintos")
+
+    source = await db.crm_lines.find_one({"id": payload.source_line_id}, {"_id": 0, "id": 1, "name": 1})
+    target = await db.crm_lines.find_one({"id": payload.target_line_id}, {"_id": 0, "id": 1, "name": 1})
+    if not source:
+        raise HTTPException(status_code=404, detail="Línea origen no encontrada")
+    if not target:
+        raise HTTPException(status_code=404, detail="Línea destino no encontrada")
+
+    stats = {"leads_moved": 0, "leads_merged": 0, "messages_reassigned": 0, "receipts_reassigned": 0, "broadcast_msgs_reassigned": 0}
+
+    # Iteramos leads del source y decidimos si mover o fusionar
+    src_leads = await db.crm_leads.find({"line_id": payload.source_line_id}, {"_id": 0}).to_list(100000)
+    for lead in src_leads:
+        phone = lead.get("phone")
+        if not phone:
+            # sin phone es raro pero por seguridad lo movemos como está
+            await db.crm_leads.update_one({"id": lead["id"]}, {"$set": {"line_id": payload.target_line_id}})
+            stats["leads_moved"] += 1
+            continue
+
+        # Buscar si ya existe un lead con este phone en el target
+        target_lead = await db.crm_leads.find_one(
+            {"line_id": payload.target_line_id, "phone": phone},
+            {"_id": 0}
+        )
+
+        if not target_lead:
+            # Move-in-place: cambio de line_id, sin duplicar
+            await db.crm_leads.update_one(
+                {"id": lead["id"]},
+                {"$set": {"line_id": payload.target_line_id}}
+            )
+            # Sus mensajes también se re-etiquetan
+            r = await db.crm_messages.update_many(
+                {"lead_id": lead["id"]},
+                {"$set": {"line_id": payload.target_line_id}}
+            )
+            stats["messages_reassigned"] += r.modified_count
+            stats["leads_moved"] += 1
+        else:
+            # MERGE: mensajes del lead source pasan al lead target.
+            # Elegimos como "ganador" el lead con updated_at más reciente
+            # (o el target si empatan) — su ID, name, status se conservan.
+            src_upd = lead.get("updated_at") or lead.get("last_interaction") or ""
+            tgt_upd = target_lead.get("updated_at") or target_lead.get("last_interaction") or ""
+            winner_id = target_lead["id"] if tgt_upd >= src_upd else lead["id"]
+            loser_id = lead["id"] if winner_id == target_lead["id"] else target_lead["id"]
+
+            # Re-etiquetamos TODOS los mensajes del loser al winner con line_id destino
+            r_msgs = await db.crm_messages.update_many(
+                {"lead_id": loser_id},
+                {"$set": {"lead_id": winner_id, "line_id": payload.target_line_id}}
+            )
+            stats["messages_reassigned"] += r_msgs.modified_count
+            # Si el winner viene del source, sus mensajes propios también
+            # tienen line_id source — los movemos al target también.
+            r_own = await db.crm_messages.update_many(
+                {"lead_id": winner_id, "line_id": payload.source_line_id},
+                {"$set": {"line_id": payload.target_line_id}}
+            )
+            stats["messages_reassigned"] += r_own.modified_count
+
+            # Re-etiquetamos receipts
+            r_rec = await db.crm_receipts.update_many(
+                {"lead_id": loser_id},
+                {"$set": {"lead_id": winner_id, "line_id": payload.target_line_id}}
+            )
+            stats["receipts_reassigned"] += r_rec.modified_count
+            r_rec2 = await db.crm_receipts.update_many(
+                {"lead_id": winner_id, "line_id": payload.source_line_id},
+                {"$set": {"line_id": payload.target_line_id}}
+            )
+            stats["receipts_reassigned"] += r_rec2.modified_count
+
+            # Consolidamos contadores del ganador (messages_count acumulado)
+            src_count = int(lead.get("messages_count") or 0)
+            tgt_count = int(target_lead.get("messages_count") or 0)
+            combined = src_count + tgt_count
+
+            # Si el ganador es el target y el loser es source: actualizamos
+            # target con el count combinado y la última interacción más nueva.
+            latest_interaction = max(
+                lead.get("last_interaction") or "",
+                target_lead.get("last_interaction") or "",
+            )
+            await db.crm_leads.update_one(
+                {"id": winner_id},
+                {"$set": {
+                    "line_id": payload.target_line_id,
+                    "messages_count": combined,
+                    "last_interaction": latest_interaction,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }}
+            )
+            # Borramos el loser (que quedó vacío después del merge)
+            await db.crm_leads.delete_one({"id": loser_id})
+            stats["leads_merged"] += 1
+
+    # También movemos broadcast_messages de la línea source
+    r_bcast = await db.broadcast_messages.update_many(
+        {"line_id": payload.source_line_id},
+        {"$set": {"line_id": payload.target_line_id}}
+    )
+    stats["broadcast_msgs_reassigned"] = r_bcast.modified_count
+
+    logger.info(
+        f"Line migration {source.get('name')} → {target.get('name')}: "
+        f"moved={stats['leads_moved']} merged={stats['leads_merged']} "
+        f"msgs={stats['messages_reassigned']} bcast={stats['broadcast_msgs_reassigned']}"
+    )
+    return {
+        "ok": True,
+        "source": source.get("name"),
+        "target": target.get("name"),
+        "stats": stats,
+    }
+
 @api_router.put("/crm/lines/{line_id}")
 async def crm_update_line(line_id: str, data: CRMLineUpdate, current_user=Depends(get_current_user)):
     """Update a line"""
