@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { UserPlus, Edit2, Trash2, X, Check, Plus, Phone, Landmark, Megaphone, Zap } from 'lucide-react';
+import { UserPlus, Edit2, Trash2, X, Check, Plus, Phone, Landmark, Megaphone, Zap, GitMerge, RefreshCw, ArrowRight } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import api from '@/utils/api';
 import { toast } from 'sonner';
@@ -15,6 +15,11 @@ const UserManagement = () => {
   const [editingUserQuota, setEditingUserQuota] = useState(null);  // {used, quota, base, extra, period, remaining}
   const [topupAmount, setTopupAmount] = useState('');
   const [topupSaving, setTopupSaving] = useState(false);
+  // Migración de chats entre líneas
+  const [showMigrateModal, setShowMigrateModal] = useState(false);
+  const [migrateSourceId, setMigrateSourceId] = useState('');
+  const [migrateTargetId, setMigrateTargetId] = useState('');
+  const [migrating, setMigrating] = useState(false);
   const [formData, setFormData] = useState({
     email: '',
     password: '',
@@ -184,6 +189,44 @@ Le envio nuestros datos de cuenta 👇`,
     );
   }
 
+  const runMigration = async () => {
+    if (!migrateSourceId || !migrateTargetId) {
+      toast.error('Elegí origen y destino');
+      return;
+    }
+    if (migrateSourceId === migrateTargetId) {
+      toast.error('Origen y destino deben ser distintos');
+      return;
+    }
+    const src = lines.find(l => l.id === migrateSourceId)?.name || 'origen';
+    const tgt = lines.find(l => l.id === migrateTargetId)?.name || 'destino';
+    if (!window.confirm(
+      `¿Migrar TODOS los chats de "${src}" a "${tgt}"?\n\n` +
+      `- Los leads/mensajes de "${src}" se moverán a "${tgt}".\n` +
+      `- Si un mismo número existe en ambos lados, los mensajes se FUSIONAN en un solo chat (se conserva el lead más reciente).\n` +
+      `- "${src}" quedará vacía pero seguirá activa.\n\n` +
+      `Esta operación es IRREVERSIBLE.`
+    )) return;
+    setMigrating(true);
+    try {
+      const { data } = await api.post('/crm/lines/migrate', {
+        source_line_id: migrateSourceId,
+        target_line_id: migrateTargetId,
+      });
+      const s = data.stats || {};
+      toast.success(
+        `Migración OK · ${s.leads_moved || 0} movidos, ${s.leads_merged || 0} fusionados, ${s.messages_reassigned || 0} mensajes reasignados`
+      );
+      setShowMigrateModal(false);
+      setMigrateSourceId('');
+      setMigrateTargetId('');
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || 'Error migrando');
+    } finally {
+      setMigrating(false);
+    }
+  };
+
   return (
     <div className="max-w-7xl mx-auto px-6 py-8">
       <div className="flex justify-between items-center mb-8">
@@ -191,14 +234,25 @@ Le envio nuestros datos de cuenta 👇`,
           <h1 className={`text-2xl font-bold ${textPrimary}`}>Gestión de Usuarios</h1>
           <p className={textSecondary}>Crear y administrar usuarios del sistema</p>
         </div>
-        <Button
-          onClick={() => { resetForm(); setEditingUser(null); setShowModal(true); }}
-          data-testid="create-user-btn"
-          className="bg-teal-600 hover:bg-teal-700 text-white"
-        >
-          <UserPlus className="w-4 h-4 mr-2" />
-          Nuevo Usuario
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            onClick={() => { setMigrateSourceId(''); setMigrateTargetId(''); setShowMigrateModal(true); }}
+            data-testid="migrate-lines-btn"
+            variant="outline"
+            className="border-amber-500/40 text-amber-300 bg-amber-500/10 hover:bg-amber-500/20"
+          >
+            <GitMerge className="w-4 h-4 mr-2" />
+            Migrar chats
+          </Button>
+          <Button
+            onClick={() => { resetForm(); setEditingUser(null); setShowModal(true); }}
+            data-testid="create-user-btn"
+            className="bg-teal-600 hover:bg-teal-700 text-white"
+          >
+            <UserPlus className="w-4 h-4 mr-2" />
+            Nuevo Usuario
+          </Button>
+        </div>
       </div>
 
       {/* Users Table */}
@@ -641,6 +695,90 @@ Le envio nuestros datos de cuenta 👇`,
                 </Button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: Migrar chats entre líneas */}
+      {showMigrateModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+          onClick={() => !migrating && setShowMigrateModal(false)}
+          data-testid="migrate-modal-backdrop">
+          <div className={`w-full max-w-md rounded-xl border ${cardBg} shadow-2xl p-5`}
+            onClick={e => e.stopPropagation()}
+            data-testid="migrate-modal">
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-lg bg-amber-500/15 flex items-center justify-center">
+                  <GitMerge className="w-4 h-4 text-amber-400" />
+                </div>
+                <div>
+                  <p className={`text-sm font-semibold ${textPrimary}`}>Migrar chats entre líneas</p>
+                  <p className={`text-xs ${textSecondary}`}>Mover leads + mensajes de una línea a otra</p>
+                </div>
+              </div>
+              <Button variant="ghost" size="icon" onClick={() => !migrating && setShowMigrateModal(false)}
+                data-testid="migrate-close-btn">
+                <X className="w-4 h-4" />
+              </Button>
+            </div>
+
+            <div className="rounded bg-blue-500/10 border border-blue-500/30 p-2.5 mb-4">
+              <p className={`text-[11px] ${textSecondary}`}>
+                💡 Si un mismo número existe en ambas líneas, los chats se <strong>fusionan</strong> en el más reciente. La línea origen queda vacía pero <strong>seguirá activa</strong>.
+              </p>
+            </div>
+
+            <div className="space-y-3">
+              <div>
+                <label className={`text-xs font-medium ${textSecondary} block mb-1`}>Línea ORIGEN (de dónde salen los chats)</label>
+                <select value={migrateSourceId}
+                  onChange={e => setMigrateSourceId(e.target.value)}
+                  className={`w-full h-9 px-2 rounded border ${inputBg} text-sm`}
+                  disabled={migrating}
+                  data-testid="migrate-source-select">
+                  <option value="">— Elegir línea —</option>
+                  {lines.map(l => (
+                    <option key={l.id} value={l.id}>{l.name} · {l.whatsapp_number}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="flex justify-center">
+                <ArrowRight className="w-4 h-4 text-slate-500" />
+              </div>
+
+              <div>
+                <label className={`text-xs font-medium ${textSecondary} block mb-1`}>Línea DESTINO (a dónde van todos)</label>
+                <select value={migrateTargetId}
+                  onChange={e => setMigrateTargetId(e.target.value)}
+                  className={`w-full h-9 px-2 rounded border ${inputBg} text-sm`}
+                  disabled={migrating}
+                  data-testid="migrate-target-select">
+                  <option value="">— Elegir línea —</option>
+                  {lines
+                    .filter(l => l.id !== migrateSourceId)
+                    .map(l => (
+                      <option key={l.id} value={l.id}>{l.name} · {l.whatsapp_number}</option>
+                    ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="mt-5 flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setShowMigrateModal(false)}
+                disabled={migrating}
+                data-testid="migrate-cancel-btn">
+                Cancelar
+              </Button>
+              <Button onClick={runMigration}
+                disabled={migrating || !migrateSourceId || !migrateTargetId}
+                className="bg-amber-600 hover:bg-amber-500 text-white"
+                data-testid="migrate-confirm-btn">
+                {migrating ? <RefreshCw className="w-4 h-4 mr-1 animate-spin" /> : <GitMerge className="w-4 h-4 mr-1" />}
+                Migrar chats
+              </Button>
+            </div>
           </div>
         </div>
       )}
