@@ -17,6 +17,7 @@ import re
 import hashlib
 import string
 import random
+import secrets
 import base64
 import json
 import httpx
@@ -12419,6 +12420,260 @@ async def dashboard_device_stats(
         "devices": await _agg("device"),
         "os": await _agg("os"),
         "browsers": await _agg("browser"),
+    }
+
+
+# ─── Mercado Pago OAuth (Marketplace-style per-cashier) ───────────
+# Each cashier connects their own MP account so their sales can be
+# auto-matched against WhatsApp receipts. Admin owns a single MP app
+# (Client ID + Secret); each cashier gets their own access/refresh
+# token pair stored in `mp_connections`.
+
+MP_CLIENT_ID = os.environ.get("MP_CLIENT_ID", "")
+MP_CLIENT_SECRET = os.environ.get("MP_CLIENT_SECRET", "")
+MP_REDIRECT_URI = os.environ.get("MP_REDIRECT_URI", "")
+MP_AUTH_URL = "https://auth.mercadopago.com.ar/authorization"
+MP_TOKEN_URL = "https://api.mercadopago.com/oauth/token"
+MP_PAYMENTS_SEARCH_URL = "https://api.mercadopago.com/v1/payments/search"
+# Frontend URL cashier lands on after a successful/failed connect
+MP_FRONTEND_RETURN_PATH = "/mi-configuracion?mp="
+
+
+def _mp_configured() -> bool:
+    return bool(MP_CLIENT_ID and MP_CLIENT_SECRET and MP_REDIRECT_URI)
+
+
+async def _mp_exchange_code(code: str) -> dict:
+    payload = {
+        "client_id": MP_CLIENT_ID,
+        "client_secret": MP_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": MP_REDIRECT_URI,
+    }
+    async with httpx.AsyncClient(timeout=30) as http:
+        r = await http.post(MP_TOKEN_URL, json=payload)
+    if r.status_code != 200:
+        logger.error(f"MP exchange_code failed: {r.status_code} {r.text}")
+        raise HTTPException(status_code=400, detail=f"Mercado Pago rechazó el código: {r.text}")
+    return r.json()
+
+
+async def _mp_refresh_token(refresh_token_value: str) -> dict:
+    payload = {
+        "client_id": MP_CLIENT_ID,
+        "client_secret": MP_CLIENT_SECRET,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token_value,
+    }
+    async with httpx.AsyncClient(timeout=30) as http:
+        r = await http.post(MP_TOKEN_URL, json=payload)
+    if r.status_code != 200:
+        logger.error(f"MP refresh_token failed: {r.status_code} {r.text}")
+        raise HTTPException(status_code=400, detail=f"Mercado Pago no pudo renovar el token: {r.text}")
+    return r.json()
+
+
+async def _mp_get_valid_token(user_id: str) -> dict:
+    """Get a valid access token for the given cajero user. Refreshes if near expiry."""
+    conn = await db.mp_connections.find_one({"user_id": user_id}, {"_id": 0})
+    if not conn:
+        raise HTTPException(status_code=404, detail="El cajero no conectó su cuenta de Mercado Pago")
+
+    now = datetime.now(timezone.utc)
+    expires_at_raw = conn.get("token_expires_at")
+    try:
+        expires_at = datetime.fromisoformat(expires_at_raw) if expires_at_raw else None
+    except Exception:
+        expires_at = None
+    # Refresh 5 minutes before expiry
+    if expires_at and expires_at > now + timedelta(minutes=5):
+        return conn
+
+    refreshed = await _mp_refresh_token(conn["refresh_token"])
+    new_expires = (now + timedelta(seconds=int(refreshed.get("expires_in") or 15552000))).isoformat()
+    updates = {
+        "access_token": refreshed["access_token"],
+        "refresh_token": refreshed.get("refresh_token", conn["refresh_token"]),
+        "token_expires_at": new_expires,
+        "scope": refreshed.get("scope"),
+        "updated_at": now.isoformat(),
+    }
+    await db.mp_connections.update_one({"user_id": user_id}, {"$set": updates})
+    return {**conn, **updates}
+
+
+@api_router.get("/mercadopago/status")
+async def mp_status(current_user=Depends(get_current_user)):
+    """Return connection state for current user."""
+    if not _mp_configured():
+        return {"configured": False, "connected": False}
+    conn = await db.mp_connections.find_one(
+        {"user_id": current_user["id"]},
+        {"_id": 0, "mp_user_id": 1, "mp_nickname": 1, "token_expires_at": 1, "live_mode": 1, "connected_at": 1, "updated_at": 1},
+    )
+    return {
+        "configured": True,
+        "connected": bool(conn),
+        "connection": conn,
+    }
+
+
+@api_router.get("/mercadopago/oauth/init")
+async def mp_oauth_init(current_user=Depends(get_current_user)):
+    """Kick off the OAuth flow: create a state and return the MP auth URL."""
+    if not _mp_configured():
+        raise HTTPException(status_code=400, detail="Mercado Pago no está configurado en el servidor")
+
+    state = secrets.token_urlsafe(32)
+    await db.mp_oauth_states.insert_one({
+        "state": state,
+        "user_id": current_user["id"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    # Expire states older than 15 min to keep collection small
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+    await db.mp_oauth_states.delete_many({"created_at": {"$lt": cutoff}})
+
+    url = (
+        f"{MP_AUTH_URL}?response_type=code"
+        f"&client_id={MP_CLIENT_ID}"
+        f"&platform_id=mp"
+        f"&state={state}"
+        f"&redirect_uri={MP_REDIRECT_URI}"
+    )
+    return {"authorization_url": url}
+
+
+@api_router.get("/mercadopago/oauth/callback")
+async def mp_oauth_callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
+    """Callback endpoint MP redirects to after user authorizes."""
+    base_return = (os.environ.get("APP_URL") or "").rstrip("/") + MP_FRONTEND_RETURN_PATH
+
+    if error or not code or not state:
+        return RedirectResponse(f"{base_return}error&reason={error or 'missing_params'}")
+
+    # Consume state
+    state_doc = await db.mp_oauth_states.find_one_and_delete({"state": state})
+    if not state_doc:
+        return RedirectResponse(f"{base_return}error&reason=invalid_state")
+
+    user_id = state_doc["user_id"]
+    try:
+        token = await _mp_exchange_code(code)
+    except HTTPException as e:
+        logger.error(f"MP callback exchange failed for user {user_id}: {e.detail}")
+        return RedirectResponse(f"{base_return}error&reason=exchange_failed")
+
+    now = datetime.now(timezone.utc)
+    expires_at = (now + timedelta(seconds=int(token.get("expires_in") or 15552000))).isoformat()
+
+    # Optionally fetch nickname
+    nickname = None
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            r = await http.get(
+                "https://api.mercadopago.com/users/me",
+                headers={"Authorization": f"Bearer {token['access_token']}"},
+            )
+            if r.status_code == 200:
+                data = r.json()
+                nickname = data.get("nickname") or data.get("first_name")
+    except Exception as e:
+        logger.warning(f"MP users/me failed: {e}")
+
+    doc = {
+        "user_id": user_id,
+        "mp_user_id": token.get("user_id"),
+        "mp_nickname": nickname,
+        "access_token": token["access_token"],
+        "refresh_token": token.get("refresh_token"),
+        "token_expires_at": expires_at,
+        "live_mode": token.get("live_mode", True),
+        "scope": token.get("scope"),
+        "connected_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+    }
+    await db.mp_connections.update_one(
+        {"user_id": user_id},
+        {"$set": doc},
+        upsert=True,
+    )
+
+    return RedirectResponse(f"{base_return}connected")
+
+
+@api_router.delete("/mercadopago/disconnect")
+async def mp_disconnect(current_user=Depends(get_current_user)):
+    res = await db.mp_connections.delete_one({"user_id": current_user["id"]})
+    return {"disconnected": res.deleted_count > 0}
+
+
+@api_router.get("/mercadopago/payments/search")
+async def mp_payments_search(
+    amount: float = Query(..., ge=0, description="Monto exacto en ARS a buscar"),
+    hours: int = Query(24, ge=1, le=168, description="Ventana hacia atrás en horas (max 168 = 7 días)"),
+    current_user=Depends(get_current_user),
+):
+    """Search cashier's MP payments for an exact amount within the last N hours."""
+    conn = await _mp_get_valid_token(current_user["id"])
+    access_token = conn["access_token"]
+
+    now = datetime.now(timezone.utc)
+    begin = now - timedelta(hours=hours)
+
+    # MP wants ISO with milliseconds and Z
+    def _mp_iso(dt):
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    params = {
+        "sort": "date_approved",
+        "criteria": "desc",
+        "range": "date_created",
+        "begin_date": _mp_iso(begin),
+        "end_date": _mp_iso(now),
+        "limit": 50,
+        "offset": 0,
+    }
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as http:
+            r = await http.get(MP_PAYMENTS_SEARCH_URL, params=params, headers=headers)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Error consultando Mercado Pago: {e}")
+
+    if r.status_code != 200:
+        logger.error(f"MP payments search failed: {r.status_code} {r.text}")
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+
+    data = r.json()
+    results = data.get("results", [])
+    # Match exact amount (allow 1 ARS tolerance for rounding weirdness)
+    matches = [
+        p for p in results
+        if abs(float(p.get("transaction_amount", 0)) - float(amount)) < 1.0
+    ]
+    simplified = [{
+        "id": p.get("id"),
+        "status": p.get("status"),
+        "transaction_amount": p.get("transaction_amount"),
+        "date_approved": p.get("date_approved"),
+        "date_created": p.get("date_created"),
+        "payer": {
+            "id": (p.get("payer") or {}).get("id"),
+            "email": (p.get("payer") or {}).get("email"),
+            "first_name": (p.get("payer") or {}).get("first_name"),
+            "last_name": (p.get("payer") or {}).get("last_name"),
+        },
+        "payment_method_id": p.get("payment_method_id"),
+        "description": p.get("description"),
+    } for p in matches]
+    return {
+        "amount": amount,
+        "hours": hours,
+        "total_scanned": len(results),
+        "matches_count": len(simplified),
+        "matches": simplified,
     }
 
 
