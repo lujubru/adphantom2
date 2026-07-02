@@ -6,6 +6,7 @@ import {
   GripVertical, Eye, Settings, Smartphone,
   ArrowRight, ArrowLeft, BarChart3, Zap, Copy, User, Target,
   Megaphone, Radio, Download,
+  Tag as TagIcon,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -19,7 +20,9 @@ import { StatusBadge } from './leads-crm/StatusSelector';
 import { ChatPanel } from './leads-crm/ChatPanel';
 import { BroadcastModal } from './leads-crm/BroadcastModal';
 import { ChatListItem } from './leads-crm/ChatListItem';
-import { HamburgerMenu } from './leads-crm/HamburgerMenu';
+import { TagsManagerModal, TagChipList } from './leads-crm/LeadTags';
+import { SidebarNav } from './leads-crm/SidebarNav';
+import { LeadAvatar } from './leads-crm/LeadAvatar';
 
 // ─── Funnel (admin only) ───────────────────────────────────────────
 
@@ -630,6 +633,9 @@ const LeadCard = ({ lead, onClick, onDragStart }) => {
             {hasNewMessage && <span className="text-red-400">● nuevo</span>}
           </div>
         )}
+        {Array.isArray(lead.tag_details) && lead.tag_details.length > 0 && (
+          <div className="pt-0.5"><TagChipList tags={lead.tag_details} max={3} size="xs" /></div>
+        )}
       </div>
     </div>
   );
@@ -975,7 +981,7 @@ const AdminLinesPanel = ({ lines, leads, onSelectLine, onRefresh, onBroadcast })
 // ─── Main Component ───────────────────────────────────────────────
 
 export default function LeadsCRM() {
-  const { darkMode } = useTheme();
+  const { darkMode, toggleTheme } = useTheme();
   const [currentUser, setCurrentUser] = useState(null);
   const [leads, setLeads] = useState([]);
   const [lines, setLines] = useState([]);
@@ -1009,6 +1015,10 @@ export default function LeadsCRM() {
 
   const [broadcastOpen, setBroadcastOpen] = useState(false);
   const [exportModalOpen, setExportModalOpen] = useState(false);
+  // ── Tags (Etiquetas) ──────────────────────────────────────────
+  const [tagsModalOpen, setTagsModalOpen] = useState(false);
+  const [tagFilter, setTagFilter] = useState('all'); // tag_id or 'all'
+  const [tagFilterOptions, setTagFilterOptions] = useState([]);
 
   useEffect(() => {
     if ('serviceWorker' in navigator) {
@@ -1360,6 +1370,22 @@ export default function LeadsCRM() {
 
   useEffect(() => { loadLeads(); loadLines(); loadFunnel(); }, [loadLeads, loadLines, loadFunnel]);
 
+  // Load available tags for current line/view context (filter dropdown)
+  useEffect(() => {
+    const scope = selectedLineId || adminViewAsLineId || null;
+    const load = async () => {
+      try {
+        const params = {};
+        if (scope) params.line_id = scope;
+        const { data } = await api.get('/crm/tags', { params });
+        setTagFilterOptions(data || []);
+      } catch { /* silent */ }
+    };
+    load();
+    // Reset filter when scope changes
+    setTagFilter('all');
+  }, [selectedLineId, adminViewAsLineId]);
+
   // Reset del tracking de unread al cambiar de línea: el set de leads visibles
   // cambia, así que prevUnreadMap quedaría obsoleto y dispararía sonidos
   // fantasma al "redescubrir" leads de otra línea.
@@ -1486,7 +1512,8 @@ export default function LeadsCRM() {
     // Si admin está en modo "Ver como cajero" filtramos solo los leads de
     // esa línea (todos los cajeros que la operan).
     const matchAdminView = !adminViewAsLineId || lead.line_id === adminViewAsLineId;
-    return matchStatus && matchSearch && matchAdminView;
+    const matchTag = tagFilter === 'all' || (Array.isArray(lead.tags) && lead.tags.includes(tagFilter));
+    return matchStatus && matchSearch && matchAdminView && matchTag;
   });
 
   // Open a lead from the chat list — marks as read.
@@ -1547,8 +1574,8 @@ export default function LeadsCRM() {
     );
   }
 
-  // ── CAJERO VIEW ────────────────────────────────────────────────
-  if (currentUser && !isAdmin) {
+  // ── CAJERO VIEW (also used by admin when drilled into a line) ────
+  if (currentUser && (!isAdmin || adminViewAsLineId)) {
     const bgMain = darkMode ? 'bg-slate-950' : 'bg-gray-50';
     const bgCard = darkMode ? 'bg-slate-900/80' : 'bg-white';
     const borderColor = darkMode ? 'border-slate-800' : 'border-gray-200';
@@ -1560,13 +1587,13 @@ export default function LeadsCRM() {
     const mobileChatOpen = isMobile && selectedLead;
 
     return (
-      <div className={`${bgMain} flex flex-col`} style={{ height: 'calc(100dvh - 4rem)', minHeight: 'calc(100dvh - 4rem)' }}>
-        {/* Hamburger menu — desktop only, hidden on mobile (mobile keeps top bar) */}
+      <div className={`${bgMain} flex`} style={{ height: 'calc(100dvh - 4rem)', minHeight: 'calc(100dvh - 4rem)' }}>
+        {/* Kommo-style vertical sidebar — desktop only */}
         {!mobileChatOpen && !isMobile && (
-          <HamburgerMenu
+          <SidebarNav
             currentUser={currentUser}
             darkMode={darkMode}
-            funnel={funnel}
+            onThemeToggle={toggleTheme}
             onFunnelOpen={() => setShowFunnelModal(true)}
             soundEnabled={soundEnabled}
             onSoundToggle={soundEnabled ? () => setSoundEnabled(false) : enableSound}
@@ -1576,10 +1603,32 @@ export default function LeadsCRM() {
             pwaInstalled={pwaInstalled}
             onInstall={installPWA}
             onBroadcast={() => setBroadcastOpen(true)}
+            onTagsOpen={() => setTagsModalOpen(true)}
             onRefresh={loadLeads}
-            onContactsExport={() => setExportModalOpen(true)}
+            onContactsExport={isAdmin ? () => setExportModalOpen(true) : undefined}
             unreadCount={leads.filter(l => (l.unread_count > 0 || l.has_unread_messages) && selectedLead?.id !== l.id).length}
+            showBackToLines={isAdmin && !!adminViewAsLineId}
+            onBackToLines={() => { setAdminViewAsLineId(null); setSelectedLead(null); }}
           />
+        )}
+
+        <div className="flex flex-col flex-1 min-w-0">
+        {/* Admin drill-down breadcrumb (desktop) */}
+        {isAdmin && adminViewAsLineId && !isMobile && (
+          <div className={`flex items-center gap-2 px-4 py-2 border-b ${borderColor} ${bgCard} shrink-0`}>
+            <button
+              onClick={() => { setAdminViewAsLineId(null); setSelectedLead(null); }}
+              data-testid="admin-drill-back-btn"
+              className="inline-flex items-center gap-1.5 text-xs text-slate-400 hover:text-white px-2 py-1 rounded hover:bg-slate-800 transition-colors"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" />
+              Volver a líneas
+            </button>
+            <span className="text-slate-600 text-xs">·</span>
+            <span className="text-xs font-medium text-slate-200">
+              Operando como cajero de: {lines.find(l => l.id === adminViewAsLineId)?.name || 'Línea'}
+            </span>
+          </div>
         )}
 
         {/* Mobile top bar (preserved as-is) */}
@@ -1651,6 +1700,17 @@ export default function LeadsCRM() {
                   <span className="hidden sm:inline">Masivo</span>
                 </button>
               )}
+              {(currentUser?.role === 'admin' || (currentUser?.line_ids && currentUser.line_ids.length > 0)) && (
+                <button
+                  onClick={() => setTagsModalOpen(true)}
+                  title="Gestionar etiquetas"
+                  data-testid="tags-manager-open-btn"
+                  className="flex items-center gap-1 px-2 h-8 rounded-lg text-xs font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/25"
+                >
+                  <TagIcon className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Etiquetas</span>
+                </button>
+              )}
               <button onClick={loadLeads} className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors" data-testid="refresh-leads-btn">
                 <RefreshCw className="w-4 h-4" />
               </button>
@@ -1712,6 +1772,36 @@ export default function LeadsCRM() {
                   </button>
                 ))}
               </div>
+              {tagFilterOptions.length > 0 && (
+                <div className="flex gap-1 flex-wrap items-center" data-testid="tag-filter-bar">
+                  <button
+                    onClick={() => setTagFilter('all')}
+                    data-testid="tag-filter-all"
+                    className={`px-2 py-0.5 rounded-full text-[10px] font-medium border transition-all ${tagFilter === 'all' ? 'bg-slate-600 text-white border-slate-500' : 'text-slate-400 border-slate-700 hover:text-slate-200'}`}
+                  >
+                    Sin filtro
+                  </button>
+                  {tagFilterOptions.map(t => {
+                    const active = tagFilter === t.id;
+                    return (
+                      <button
+                        key={t.id}
+                        onClick={() => setTagFilter(active ? 'all' : t.id)}
+                        data-testid={`tag-filter-${t.id}`}
+                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium border transition-all ${active ? 'text-white' : 'text-slate-300 hover:brightness-125'}`}
+                        style={{
+                          backgroundColor: active ? t.color : 'transparent',
+                          borderColor: t.color,
+                        }}
+                        title={t.name}
+                      >
+                        <span className="inline-block w-2 h-2 rounded-full" style={{ backgroundColor: t.color }} />
+                        <span className="truncate max-w-[80px]">{t.name}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
             </div>
 
             {/* Unread summary banner */}
@@ -1751,17 +1841,17 @@ export default function LeadsCRM() {
                     }`}>
                     {hasUnread && <span className="absolute left-0 top-0 bottom-0 w-0.5 bg-red-500 rounded-r" />}
                     <div className="flex items-start gap-3">
-                      <div className="relative shrink-0">
-                        <div className={`w-12 h-12 rounded-full flex items-center justify-center ${hasUnread ? 'bg-red-900/40 ring-2 ring-red-500/50' : 'bg-slate-700'}`}>
-                          <User className={`w-6 h-6 ${hasUnread ? 'text-red-300' : 'text-slate-400'}`} />
-                        </div>
-                        <span className={`absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-slate-900 ${cfg.dot}`} />
-                        {hasUnread && (
-                          <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center px-1 shadow-lg shadow-red-500/40 animate-pulse">
-                            {lead.unread_count > 9 ? '9+' : lead.unread_count || '!'}
-                          </span>
-                        )}
-                      </div>
+                      <LeadAvatar
+                        lead={lead}
+                        size="sm"
+                        ring={hasUnread}
+                        statusClass={cfg.dot}
+                      />
+                      {hasUnread && (
+                        <span className="absolute top-2 left-14 min-w-[18px] h-[18px] bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center px-1 shadow-lg shadow-red-500/40 animate-pulse pointer-events-none">
+                          {lead.unread_count > 9 ? '9+' : lead.unread_count || '!'}
+                        </span>
+                      )}
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center justify-between gap-1">
                           <span className={`text-sm truncate ${hasUnread ? 'font-bold text-red-100' : 'font-semibold text-white'}`}>
@@ -1785,6 +1875,11 @@ export default function LeadsCRM() {
                             </span>
                           )}
                         </div>
+                        {Array.isArray(lead.tag_details) && lead.tag_details.length > 0 && (
+                          <div className="mt-1">
+                            <TagChipList tags={lead.tag_details} max={3} size="xs" />
+                          </div>
+                        )}
                       </div>
                     </div>
                   </button>
@@ -1841,6 +1936,17 @@ export default function LeadsCRM() {
         {exportModalOpen && (
           <ContactsExportModal onClose={() => setExportModalOpen(false)} />
         )}
+        <TagsManagerModal
+          open={tagsModalOpen}
+          onClose={() => setTagsModalOpen(false)}
+          lines={
+            currentUser?.role === 'admin'
+              ? lines
+              : lines.filter(l => (currentUser?.line_ids || []).includes(l.id))
+          }
+          defaultLineId={selectedLineId || adminViewAsLineId}
+        />
+        </div>
       </div>
     );
   }
@@ -1886,6 +1992,16 @@ export default function LeadsCRM() {
                 data-testid="admin-broadcast-btn"
               >
                 <Radio className="w-4 h-4 mr-2" /> Envío masivo
+              </Button>
+            )}
+            {(currentUser?.role === 'admin' || currentUser?.role === 'superadmin') && (
+              <Button
+                onClick={() => setTagsModalOpen(true)}
+                variant="outline"
+                className="border-emerald-500/40 text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20"
+                data-testid="admin-tags-btn"
+              >
+                <TagIcon className="w-4 h-4 mr-2" /> Etiquetas
               </Button>
             )}
             <Button onClick={() => { loadLeads(); loadLines(); loadFunnel(); }} variant="outline" className={darkMode ? "border-slate-600" : "border-gray-300"}>
@@ -1957,6 +2073,12 @@ export default function LeadsCRM() {
       {exportModalOpen && (
         <ContactsExportModal onClose={() => setExportModalOpen(false)} />
       )}
+      <TagsManagerModal
+        open={tagsModalOpen}
+        onClose={() => setTagsModalOpen(false)}
+        lines={lines}
+        defaultLineId={selectedLineId || adminViewAsLineId}
+      />
     </div>
   );
 }

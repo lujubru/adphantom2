@@ -13,6 +13,8 @@ import { STATUS_CONFIG } from './constants';
 import { StatusSelector } from './StatusSelector';
 import { ChatMessage } from './ChatMessage';
 import { AdPreviewCard } from './AdPreviewCard';
+import { LeadTagsBar } from './LeadTags';
+import { LeadAvatar } from './LeadAvatar';
 
 export const ChatPanel = ({
   lead,
@@ -568,12 +570,7 @@ Le envio nuestros datos de cuenta 👇`;
               <ArrowLeft className="w-5 h-5" />
             </button>
           )}
-          <div className="relative shrink-0">
-            <div className="w-9 h-9 rounded-full bg-slate-700 flex items-center justify-center">
-              <User className="w-4 h-4 text-slate-400" />
-            </div>
-            <span className={`absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-slate-900 ${dotColor}`} />
-          </div>
+          <LeadAvatar lead={lead} size="sm" statusClass={dotColor} />
           <div className="min-w-0 flex-1">
             {editingName ? (
               <div className="flex items-center gap-1.5">
@@ -648,6 +645,16 @@ Le envio nuestros datos de cuenta 👇`;
             </button>
           )}
         </div>
+      </div>
+
+      {/* Tags row */}
+      <div className="px-3 py-1.5 border-b border-slate-800 bg-slate-900/40 shrink-0">
+        <LeadTagsBar
+          lead={lead}
+          onChange={({ tags, tag_details }) => {
+            onLeadUpdated?.({ ...lead, tags, tag_details });
+          }}
+        />
       </div>
 
       {/* Conversion value modal — centered overlay to avoid z-index issues

@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { Settings, Save, RefreshCw, Plus, Trash2, Info, MessageSquare, UserCheck, Landmark, Share2 } from 'lucide-react';
+import { Settings, Save, RefreshCw, Plus, Trash2, Info, MessageSquare, UserCheck, Landmark, Share2, CreditCard, Link2, Unlink, CheckCircle2, AlertCircle } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
 import api from '@/utils/api';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -27,6 +28,69 @@ export default function MiConfiguracion() {
   const [cbuList, setCbuList] = useState([]); // [{cbu, name}]
   const [derivationMessage, setDerivationMessage] = useState('');
   const [derivationNumbers, setDerivationNumbers] = useState([]);
+
+  // ── Mercado Pago OAuth ───────────────────────────────────────
+  const [mpStatus, setMpStatus] = useState({ configured: false, connected: false, connection: null });
+  const [mpLoading, setMpLoading] = useState(false);
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  const loadMpStatus = useCallback(async () => {
+    try {
+      const { data } = await api.get('/mercadopago/status');
+      setMpStatus(data);
+    } catch { /* silent */ }
+  }, []);
+
+  useEffect(() => {
+    loadMpStatus();
+  }, [loadMpStatus]);
+
+  // Toast on return from OAuth flow (redirects to /mi-configuracion?mp=connected|error)
+  useEffect(() => {
+    const mp = searchParams.get('mp');
+    if (mp === 'connected') {
+      toast.success('¡Mercado Pago conectado correctamente! 🎉');
+      loadMpStatus();
+      searchParams.delete('mp');
+      setSearchParams(searchParams, { replace: true });
+    } else if (mp === 'error') {
+      const reason = searchParams.get('reason');
+      toast.error(`Error conectando Mercado Pago${reason ? ': ' + reason : ''}`);
+      searchParams.delete('mp');
+      searchParams.delete('reason');
+      setSearchParams(searchParams, { replace: true });
+    }
+  }, [searchParams, setSearchParams, loadMpStatus]);
+
+  const connectMp = async () => {
+    setMpLoading(true);
+    try {
+      const { data } = await api.get('/mercadopago/oauth/init');
+      if (data?.authorization_url) {
+        window.location.href = data.authorization_url;
+      } else {
+        toast.error('No se pudo iniciar la conexión con Mercado Pago');
+      }
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || 'Error conectando con Mercado Pago');
+    } finally {
+      setMpLoading(false);
+    }
+  };
+
+  const disconnectMp = async () => {
+    if (!window.confirm('¿Desconectar tu cuenta de Mercado Pago? Podés volver a conectarla cuando quieras.')) return;
+    setMpLoading(true);
+    try {
+      await api.delete('/mercadopago/disconnect');
+      toast.success('Cuenta de Mercado Pago desconectada');
+      loadMpStatus();
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || 'Error desconectando');
+    } finally {
+      setMpLoading(false);
+    }
+  };
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -244,6 +308,100 @@ export default function MiConfiguracion() {
               <Info className="w-3 h-3 shrink-0 mt-0.5" />
               El botón "Derivar" del chat le manda al cliente el texto + un número de esta lista.
             </p>
+          </section>
+
+          {/* Mercado Pago Connect */}
+          <section className="rounded-lg border border-slate-800 bg-slate-900/40 p-4" data-testid="section-mp">
+            <div className="flex items-center gap-2 mb-3">
+              <CreditCard className="w-4 h-4 text-sky-400" />
+              <h2 className="text-sm font-semibold">💳 Mercado Pago</h2>
+              {mpStatus.connected && (
+                <span className="ml-auto inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 text-[10px] font-semibold">
+                  <CheckCircle2 className="w-3 h-3" /> Conectado
+                </span>
+              )}
+            </div>
+
+            {!mpStatus.configured ? (
+              <div className="flex items-start gap-2 rounded-md bg-amber-500/10 border border-amber-500/30 text-amber-200 px-3 py-2 text-xs">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>El admin todavía no configuró la app de Mercado Pago en el servidor. Contactalo para habilitar esta función.</span>
+              </div>
+            ) : mpStatus.connected ? (
+              <>
+                <div className="rounded-md bg-slate-800/60 border border-slate-700 p-3 space-y-1.5 text-xs">
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Cuenta MP</span>
+                    <span className="text-white font-medium" data-testid="mp-nickname">
+                      {mpStatus.connection?.mp_nickname || `#${mpStatus.connection?.mp_user_id}`}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Modo</span>
+                    <span className={mpStatus.connection?.live_mode ? 'text-emerald-300 font-medium' : 'text-amber-300 font-medium'}>
+                      {mpStatus.connection?.live_mode ? 'Producción' : 'Sandbox'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Token expira</span>
+                    <span className="text-slate-200">
+                      {mpStatus.connection?.token_expires_at
+                        ? new Date(mpStatus.connection.token_expires_at).toLocaleDateString('es-AR', { day: '2-digit', month: 'short', year: 'numeric' })
+                        : '—'}
+                    </span>
+                  </div>
+                </div>
+                <div className="flex gap-2 mt-3">
+                  <Button
+                    onClick={connectMp}
+                    disabled={mpLoading}
+                    variant="outline"
+                    size="sm"
+                    className="border-sky-500/40 text-sky-300 hover:bg-sky-500/10 text-xs"
+                    data-testid="mp-reconnect-btn"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 mr-1 ${mpLoading ? 'animate-spin' : ''}`} />
+                    Reconectar
+                  </Button>
+                  <Button
+                    onClick={disconnectMp}
+                    disabled={mpLoading}
+                    variant="outline"
+                    size="sm"
+                    className="border-red-500/40 text-red-300 hover:bg-red-500/10 text-xs"
+                    data-testid="mp-disconnect-btn"
+                  >
+                    <Unlink className="w-3.5 h-3.5 mr-1" />
+                    Desconectar
+                  </Button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  Conectá tu cuenta de Mercado Pago para que cuando un cliente te mande un comprobante,
+                  el CRM busque automáticamente el pago en tus ingresos y lo valide.
+                </p>
+                <ul className="mt-2 text-[11px] text-slate-500 space-y-0.5 list-disc list-inside">
+                  <li>Solo lectura: el sistema NUNCA cobra ni transfiere plata</li>
+                  <li>Cada cajero conecta su propia cuenta MP</li>
+                  <li>Podés desconectarla en cualquier momento</li>
+                </ul>
+                <Button
+                  onClick={connectMp}
+                  disabled={mpLoading}
+                  className="mt-3 bg-sky-600 hover:bg-sky-500 text-white"
+                  data-testid="mp-connect-btn"
+                >
+                  {mpLoading ? (
+                    <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
+                  ) : (
+                    <Link2 className="w-4 h-4 mr-2" />
+                  )}
+                  Conectar Mercado Pago
+                </Button>
+              </>
+            )}
           </section>
 
           {/* Submit footer */}

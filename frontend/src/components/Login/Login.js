@@ -40,7 +40,7 @@ const handleSubmit = async (e) => {
         <div className="bg-slate-900/50 backdrop-blur-xl border border-slate-800 rounded-2xl p-8 shadow-2xl">
           <div className="flex flex-col items-center mb-8">
             <img src="/logo.png" alt="aplicacion" className="w-20 h-20 rounded-xl mb-4 object-contain" />
-            <h1 className="text-2xl font-bold text-white mb-1">BlackGuardian</h1>
+            <h1 className="text-2xl font-bold text-white mb-1">aplicacion</h1>
             <p className="text-slate-400 text-sm">Portal de Administración</p>
           </div>
 

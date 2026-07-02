@@ -1,6 +1,8 @@
 import React from 'react';
 import { STATUS_CONFIG, BADGE_COLORS } from './constants';
 import { formatRelative } from './utils';
+import { TagChipList } from './LeadTags';
+import { LeadAvatar } from './LeadAvatar';
 
 export const ChatListItem = ({ lead, onClick }) => {
   const cfg = STATUS_CONFIG[lead.status] || STATUS_CONFIG.nuevo;
@@ -17,12 +19,7 @@ export const ChatListItem = ({ lead, onClick }) => {
       data-testid={`chat-list-item-${lead.id}`}
       className="w-full flex items-center gap-3 px-3 py-3 active:bg-slate-800/70 hover:bg-slate-800/40 transition-colors text-left border-b border-slate-800/60"
     >
-      <div className="relative shrink-0">
-        <div className={`w-12 h-12 rounded-full flex items-center justify-center text-white font-semibold ${cfg.dot} bg-opacity-80`}>
-          {(lead.name || '?').slice(0, 1).toUpperCase()}
-        </div>
-        <span className={`absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-slate-950 ${cfg.dot}`} />
-      </div>
+      <LeadAvatar lead={lead} size="sm" ring={hasUnread} statusClass={cfg.dot} />
       <div className="flex-1 min-w-0">
         <div className="flex items-center justify-between gap-2">
           <span className="text-white text-sm font-medium truncate">{lead.name || lead.phone}</span>
@@ -43,6 +40,11 @@ export const ChatListItem = ({ lead, onClick }) => {
             </span>
           )}
         </div>
+        {Array.isArray(lead.tag_details) && lead.tag_details.length > 0 && (
+          <div className="mt-1">
+            <TagChipList tags={lead.tag_details} max={3} size="xs" />
+          </div>
+        )}
       </div>
     </button>
   );
