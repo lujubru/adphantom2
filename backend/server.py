@@ -5145,6 +5145,223 @@ async def crm_assign_lead_to_line(
     return {"message": f"Lead asignado a línea {line['name']}"}
 
 
+# ─── CRM Tags (Etiquetas) ─────────────────────────────────────────
+# Etiquetas por línea. Cada línea tiene su propio set de etiquetas.
+# Cajero solo puede ver/crear/editar/borrar etiquetas de sus líneas.
+# Máx 5 etiquetas por lead.
+
+TAG_MAX_PER_LEAD = 5
+# Paleta segura (Tailwind-friendly), pero color libre HEX permitido.
+TAG_DEFAULT_COLORS = [
+    "#ef4444",  # red
+    "#f59e0b",  # amber
+    "#eab308",  # yellow
+    "#22c55e",  # green
+    "#14b8a6",  # teal
+    "#3b82f6",  # blue
+    "#8b5cf6",  # violet
+    "#ec4899",  # pink
+    "#64748b",  # slate
+]
+
+_HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+
+
+def _normalize_tag_color(color: Optional[str]) -> str:
+    color = (color or "").strip()
+    if not color:
+        return TAG_DEFAULT_COLORS[0]
+    if not _HEX_COLOR_RE.match(color):
+        raise HTTPException(status_code=400, detail="Color inválido. Usá formato HEX #RRGGBB")
+    return color.lower()
+
+
+def _normalize_tag_name(name: Optional[str]) -> str:
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="El nombre de la etiqueta es obligatorio")
+    if len(name) > 40:
+        raise HTTPException(status_code=400, detail="Nombre demasiado largo (máx 40)")
+    return name
+
+
+class CRMTagCreate(BaseModel):
+    line_id: str
+    name: str
+    color: Optional[str] = None
+
+
+class CRMTagUpdate(BaseModel):
+    name: Optional[str] = None
+    color: Optional[str] = None
+
+
+class CRMLeadTagsUpdate(BaseModel):
+    tag_ids: List[str]
+
+
+@api_router.get("/crm/tags")
+async def crm_list_tags(
+    line_id: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    """List tags. Cajero ve solo las de sus líneas. Admin ve todas o filtra por line_id."""
+    query: dict = {}
+    role = current_user.get("role")
+    user_line_ids = current_user.get("line_ids") or []
+
+    if role == "cajero":
+        if not user_line_ids:
+            return []
+        if line_id:
+            if line_id not in user_line_ids:
+                raise HTTPException(status_code=403, detail="Sin acceso a esta línea")
+            query["line_id"] = line_id
+        else:
+            query["line_id"] = {"$in": user_line_ids}
+    else:
+        if line_id:
+            query["line_id"] = line_id
+
+    tags = await db.crm_tags.find(query, {"_id": 0}).sort([("line_id", 1), ("name", 1)]).to_list(500)
+    return tags
+
+
+@api_router.post("/crm/tags")
+async def crm_create_tag(data: CRMTagCreate, current_user=Depends(get_current_user)):
+    """Create a tag scoped to a specific line."""
+    if not _user_can_use_line(current_user, data.line_id):
+        raise HTTPException(status_code=403, detail="Sin acceso a esta línea")
+
+    line = await db.crm_lines.find_one({"id": data.line_id}, {"_id": 0, "id": 1, "name": 1})
+    if not line:
+        raise HTTPException(status_code=404, detail="Línea no encontrada")
+
+    name = _normalize_tag_name(data.name)
+    color = _normalize_tag_color(data.color)
+
+    # Unique por (line_id, name) case-insensitive
+    dup = await db.crm_tags.find_one({
+        "line_id": data.line_id,
+        "name": {"$regex": f"^{re.escape(name)}$", "$options": "i"},
+    })
+    if dup:
+        raise HTTPException(status_code=400, detail="Ya existe una etiqueta con ese nombre en esta línea")
+
+    now = datetime.now(timezone.utc).isoformat()
+    tag = {
+        "id": str(uuid.uuid4()),
+        "line_id": data.line_id,
+        "name": name,
+        "color": color,
+        "created_by": current_user.get("email"),
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.crm_tags.insert_one(tag)
+    tag.pop("_id", None)
+    return tag
+
+
+@api_router.put("/crm/tags/{tag_id}")
+async def crm_update_tag(tag_id: str, data: CRMTagUpdate, current_user=Depends(get_current_user)):
+    tag = await db.crm_tags.find_one({"id": tag_id}, {"_id": 0})
+    if not tag:
+        raise HTTPException(status_code=404, detail="Etiqueta no encontrada")
+    if not _user_can_use_line(current_user, tag.get("line_id")):
+        raise HTTPException(status_code=403, detail="Sin acceso a esta etiqueta")
+
+    update: dict = {}
+    if data.name is not None:
+        new_name = _normalize_tag_name(data.name)
+        if new_name.lower() != (tag.get("name") or "").lower():
+            dup = await db.crm_tags.find_one({
+                "line_id": tag["line_id"],
+                "name": {"$regex": f"^{re.escape(new_name)}$", "$options": "i"},
+                "id": {"$ne": tag_id},
+            })
+            if dup:
+                raise HTTPException(status_code=400, detail="Ya existe una etiqueta con ese nombre en esta línea")
+        update["name"] = new_name
+    if data.color is not None:
+        update["color"] = _normalize_tag_color(data.color)
+
+    if not update:
+        return tag
+    update["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.crm_tags.update_one({"id": tag_id}, {"$set": update})
+    updated = await db.crm_tags.find_one({"id": tag_id}, {"_id": 0})
+    return updated
+
+
+@api_router.delete("/crm/tags/{tag_id}")
+async def crm_delete_tag(tag_id: str, current_user=Depends(get_current_user)):
+    """Delete a tag and remove it from every lead that has it."""
+    tag = await db.crm_tags.find_one({"id": tag_id}, {"_id": 0})
+    if not tag:
+        raise HTTPException(status_code=404, detail="Etiqueta no encontrada")
+    if not _user_can_use_line(current_user, tag.get("line_id")):
+        raise HTTPException(status_code=403, detail="Sin acceso a esta etiqueta")
+
+    await db.crm_tags.delete_one({"id": tag_id})
+    # Remove tag_id from all leads
+    await db.crm_leads.update_many(
+        {"tags": tag_id},
+        {"$pull": {"tags": tag_id}},
+    )
+    return {"message": "Etiqueta eliminada", "tag_id": tag_id}
+
+
+@api_router.patch("/crm/leads/{lead_id}/tags")
+async def crm_set_lead_tags(
+    lead_id: str,
+    data: CRMLeadTagsUpdate,
+    current_user=Depends(get_current_user),
+):
+    """Set the list of tags assigned to a lead (replaces existing).
+
+    Validations:
+      - Max TAG_MAX_PER_LEAD tag IDs.
+      - Every tag_id must exist and belong to the same line as the lead.
+      - Cajero must have access to the lead's line.
+    """
+    lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead no encontrado")
+    if not _user_can_use_line(current_user, lead.get("line_id")):
+        raise HTTPException(status_code=403, detail="Sin acceso a este lead")
+
+    # Deduplicate while preserving order
+    seen = set()
+    tag_ids: List[str] = []
+    for tid in (data.tag_ids or []):
+        if tid and tid not in seen:
+            seen.add(tid)
+            tag_ids.append(tid)
+
+    if len(tag_ids) > TAG_MAX_PER_LEAD:
+        raise HTTPException(status_code=400, detail=f"Máximo {TAG_MAX_PER_LEAD} etiquetas por lead")
+
+    if tag_ids:
+        line_id = lead.get("line_id")
+        found = await db.crm_tags.find({"id": {"$in": tag_ids}}, {"_id": 0, "id": 1, "line_id": 1}).to_list(len(tag_ids))
+        found_ids = {t["id"] for t in found}
+        missing = [t for t in tag_ids if t not in found_ids]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Etiquetas inexistentes: {missing}")
+        bad_line = [t["id"] for t in found if t.get("line_id") != line_id]
+        if bad_line:
+            raise HTTPException(status_code=400, detail="Alguna etiqueta no pertenece a la línea del lead")
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.crm_leads.update_one(
+        {"id": lead_id},
+        {"$set": {"tags": tag_ids, "tags_updated_at": now, "updated_at": now}},
+    )
+    updated = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
+    return {"lead_id": lead_id, "tags": tag_ids, "lead": updated}
+
+
 # ─── CRM Line-specific Webhook ─────────────────────────────────────
 
 @api_router.get("/crm/webhook/{line_id}")
@@ -5972,6 +6189,7 @@ async def crm_get_all_leads(
     status: Optional[str] = None,
     line_id: Optional[str] = None,
     min_score: int = 0,
+    tag_id: Optional[str] = None,
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=500),
     current_user=Depends(get_current_user)
@@ -5983,6 +6201,8 @@ async def crm_get_all_leads(
         query["status"] = status
     if min_score > 0:
         query["score"] = {"$gte": min_score}
+    if tag_id:
+        query["tags"] = tag_id
 
     # Filtro por líneas según rol del usuario
     user_line_ids = current_user.get("line_ids", [])
@@ -6003,6 +6223,20 @@ async def crm_get_all_leads(
 
     leads = await db.crm_leads.find(query, {"_id": 0}).sort("last_interaction", -1).skip(skip).limit(limit).to_list(limit)
 
+    # Batch fetch tag details for all leads in this page
+    all_tag_ids: set = set()
+    for lead in leads:
+        for tid in (lead.get("tags") or []):
+            if tid:
+                all_tag_ids.add(tid)
+    tag_map: dict = {}
+    if all_tag_ids:
+        tag_docs = await db.crm_tags.find(
+            {"id": {"$in": list(all_tag_ids)}},
+            {"_id": 0, "id": 1, "name": 1, "color": 1, "line_id": 1},
+        ).to_list(len(all_tag_ids))
+        tag_map = {t["id"]: t for t in tag_docs}
+
     # Add line info and unread flag to each lead
     for lead in leads:
         if lead.get("line_id"):
@@ -6010,6 +6244,8 @@ async def crm_get_all_leads(
             lead["line_name"] = line["name"] if line else None
             lead["line_type"] = line["line_type"] if line else None
         lead["has_unread_messages"] = lead.get("unread_count", 0) > 0
+        # Populate tag details
+        lead["tag_details"] = [tag_map[tid] for tid in (lead.get("tags") or []) if tid in tag_map]
         # Attribution flags for quick display in kanban/list (Kommo-style)
         referral = lead.get("referral") or {}
         has_ctwa = bool(lead.get("ctwa_clid") or referral.get("ctwa_clid"))
@@ -6032,12 +6268,23 @@ async def crm_get_all_leads(
 
 
 async def _enrich_lead_for_list(lead: dict) -> dict:
-    """Add line_name/line_type, has_unread_messages and ad_badge to a lead dict."""
+    """Add line_name/line_type, has_unread_messages, tag_details and ad_badge to a lead dict."""
     if lead.get("line_id"):
         line = await db.crm_lines.find_one({"id": lead["line_id"]}, {"_id": 0, "name": 1, "line_type": 1})
         lead["line_name"] = line["name"] if line else None
         lead["line_type"] = line["line_type"] if line else None
     lead["has_unread_messages"] = lead.get("unread_count", 0) > 0
+    # Populate tag details
+    tag_ids = [t for t in (lead.get("tags") or []) if t]
+    if tag_ids:
+        tag_docs = await db.crm_tags.find(
+            {"id": {"$in": tag_ids}},
+            {"_id": 0, "id": 1, "name": 1, "color": 1, "line_id": 1},
+        ).to_list(len(tag_ids))
+        tag_map = {t["id"]: t for t in tag_docs}
+        lead["tag_details"] = [tag_map[tid] for tid in tag_ids if tid in tag_map]
+    else:
+        lead["tag_details"] = []
     referral = lead.get("referral") or {}
     has_ctwa = bool(lead.get("ctwa_clid") or referral.get("ctwa_clid"))
     has_landing = bool(lead.get("landing_code"))
