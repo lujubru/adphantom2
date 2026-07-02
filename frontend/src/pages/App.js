@@ -1,0 +1,67 @@
+import React from 'react';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { Toaster } from '@/components/ui/sonner';
+import { ThemeProvider } from '@/contexts/ThemeContext';
+import Layout from '@/components/Layout';
+import Login from '@/components/Login/Login';
+import Dashboard from '@/components/Dashboard/Dashboard';
+import Campaigns from '@/components/Campaigns/Campaigns';
+import CustomFilters from '@/components/CustomFilters/CustomFilters';
+import Reports from '@/components/Reports/Reports';
+import Analytics from '@/components/Analytics/Analytics';
+import AIIntelligence from '@/components/AIIntelligence/AIIntelligence';
+import AIGenerator from '@/components/AIGenerator/AIGenerator';
+import ClickForensics from '@/pages/ClickForensics';
+import WhatsAppCRM from '@/pages/WhatsAppCRM';
+import WALandings from '@/pages/WALandings';
+import WALandingForensics from '@/pages/WALandingForensics';
+import LeadsCRM from '@/pages/LeadsCRM';
+import UserManagement from '@/pages/UserManagement';
+import MetaDiagnostics from '@/pages/MetaDiagnostics';
+import MetaInsights from '@/pages/MetaInsights';
+import Broadcasts from '@/pages/Broadcasts';
+import Finanzas from '@/pages/Finanzas';
+import MiConfiguracion from '@/pages/MiConfiguracion';
+import '@/App.css';
+
+function App() {
+  return (
+    <ThemeProvider>
+      <div className="App">
+        <BrowserRouter>
+          <Routes>
+            <Route path="/login" element={<Login />} />
+            <Route path="/" element={<Layout />}>
+              <Route index element={<Navigate to="/dashboard" replace />} />
+              <Route path="dashboard" element={<Dashboard />} />
+              <Route path="campaigns" element={<Campaigns />} />
+              <Route path="custom-filters" element={<CustomFilters />} />
+              <Route path="reports" element={<Reports />} />
+              <Route path="analytics" element={<Analytics />} />
+              <Route path="ai-intelligence" element={<AIIntelligence />} />
+              <Route path="ai-generator" element={<AIGenerator />} />
+              <Route path="click-forensics" element={<ClickForensics />} />
+              <Route path="whatsapp-crm" element={<WhatsAppCRM />} />
+              <Route path="wa-landings" element={<WALandings />} />
+              <Route path="wa-landing-forensics" element={<WALandingForensics />} />
+              <Route path="leads-crm" element={<LeadsCRM />} />
+              <Route path="user-management" element={<UserManagement />} />
+              <Route path="meta-diagnostics" element={<MetaDiagnostics />} />
+              <Route path="meta-insights" element={<MetaInsights />} />
+              <Route path="broadcasts" element={<Broadcasts />} />
+              <Route path="finanzas" element={<Finanzas />} />
+              <Route path="mi-configuracion" element={<MiConfiguracion />} />
+              {/* Catch-all: redirect unknown routes to dashboard (fixes PWA blank screen) */}
+              <Route path="*" element={<Navigate to="/dashboard" replace />} />
+            </Route>
+            {/* Top-level catch-all */}
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </BrowserRouter>
+        <Toaster position="top-right" richColors />
+      </div>
+    </ThemeProvider>
+  );
+}
+
+export default App;
