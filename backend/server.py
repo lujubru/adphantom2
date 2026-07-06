@@ -44,7 +44,13 @@ if env_file.exists():
 # MongoDB connection
 mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
 db_name = os.environ.get('DB_NAME', 'traffic_guardian')
-client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
+client = AsyncIOMotorClient(
+    mongo_url,
+    serverSelectionTimeoutMS=5000,
+    maxPoolSize=200,
+    minPoolSize=10,
+    waitQueueTimeoutMS=10000,
+)
 db = client[db_name]
 
 
@@ -1909,6 +1915,45 @@ class PageGenRequest(BaseModel):
 
 WA_GRAPH_URL = "https://graph.facebook.com/v20.0"
 
+
+# ─── Background task tracking ───────────────────────────────────
+# asyncio.create_task returns a Task that gets GC'd if no reference is
+# held. To keep fire-and-forget tasks alive we register them here and
+# clean up on completion.
+_BG_TASKS: set = set()
+
+
+def _spawn_bg(coro):
+    """Fire-and-forget an awaitable, keeping a strong ref until it completes."""
+    import asyncio as _asyncio
+    task = _asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
+
+# ─── Shared httpx client for Meta calls (connection pooling + keep-alive) ─
+# Creating an AsyncClient per request costs 150-300ms of TCP+TLS handshake.
+# At scale (10+ active WA lines) this is the main bottleneck. Using a shared
+# module-level client with HTTP/2 + high connection limits reuses established
+# TLS sessions and slashes tail latency.
+_META_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+
+
+def _get_meta_http() -> httpx.AsyncClient:
+    global _META_HTTP_CLIENT
+    if _META_HTTP_CLIENT is None or _META_HTTP_CLIENT.is_closed:
+        _META_HTTP_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            limits=httpx.Limits(
+                max_connections=200,
+                max_keepalive_connections=50,
+                keepalive_expiry=60.0,
+            ),
+            http2=False,  # Meta Graph API is HTTP/1.1 friendlier
+        )
+    return _META_HTTP_CLIENT
+
 # ─── Purchase Currency Override ────────────────────────────────────
 # Single source of truth for the currency reported to Meta CAPI on
 # Purchase events across this deployment. Set via env var PURCHASE_CURRENCY
@@ -1947,8 +1992,213 @@ async def get_wa_settings():
         settings.pop("_id", None)
     return settings
 
+
+async def _send_crm_image_to_wa_async(
+    message_id: str,
+    file_bytes: bytes,
+    filename: str,
+    mime_type: str,
+    phone: str,
+    caption: str,
+    token: str,
+    phone_id: str,
+    line_name: Optional[str] = None,
+):
+    """Background task: upload an image to Meta and send it to the lead,
+    then update the crm_messages doc with wa_message_id + delivery_status.
+
+    Same pattern as _send_crm_message_to_wa_async but for images. Without
+    this, the image endpoint blocks the frontend request during Meta's
+    slow media upload AND the message never gets a wa_message_id, so the
+    delivery-status webhook can NEVER match it → cajero never sees ✓/✓✓
+    on images and thinks they didn't arrive.
+    """
+    try:
+        upload_res = await wa_upload_media(
+            file_bytes=file_bytes,
+            filename=filename,
+            mime_type=mime_type,
+            token=token,
+            phone_id=phone_id,
+        )
+        media_id = upload_res.get("id") if isinstance(upload_res, dict) else None
+        if not media_id:
+            logger.error(f"CRM: WA media upload FAILED for msg {message_id}: {upload_res}")
+            err = (upload_res or {}).get("error") or {}
+            await db.crm_messages.update_one(
+                {"id": message_id},
+                {"$set": {
+                    "delivery_status": "failed",
+                    "wa_result": upload_res,
+                    "delivery_error_title": (err.get("message") if isinstance(err, dict) else None) or "upload_failed",
+                    "delivery_error_code": err.get("code") if isinstance(err, dict) else None,
+                }},
+            )
+            return
+
+        send_res = await wa_send_image(
+            phone=phone,
+            media_id=media_id,
+            caption=caption or "",
+            token=token,
+            phone_id=phone_id,
+        )
+        logger.info(f"CRM: Sent WA image to {phone} via line {line_name}: {send_res}")
+        wamid = None
+        if isinstance(send_res, dict):
+            try:
+                wamid = (send_res.get("messages") or [{}])[0].get("id")
+            except Exception:
+                wamid = None
+        update = {
+            "wa_result": send_res,
+            "wa_message_id": wamid,
+            "media_id": media_id,
+            "delivery_status": "sent" if wamid else "failed",
+        }
+        if not wamid and isinstance(send_res, dict):
+            err = send_res.get("error") or {}
+            if isinstance(err, dict):
+                update["delivery_error_code"] = err.get("code")
+                update["delivery_error_title"] = err.get("message") or err.get("title")
+        await db.crm_messages.update_one({"id": message_id}, {"$set": update})
+    except Exception as e:
+        logger.error(f"CRM: Background WA image send FAILED for msg {message_id}: {e}")
+        try:
+            await db.crm_messages.update_one(
+                {"id": message_id},
+                {"$set": {"delivery_status": "failed", "delivery_error_title": str(e)[:200]}},
+            )
+        except Exception:
+            pass
+
+
+async def _send_crm_audio_to_wa_async(
+    message_id: str,
+    file_bytes: bytes,
+    filename: str,
+    mime_type: str,
+    phone: str,
+    token: str,
+    phone_id: str,
+    line_name: Optional[str] = None,
+):
+    """Background task: upload audio to Meta + send it as voice note.
+    Same rationale as _send_crm_image_to_wa_async — the endpoint must
+    return fast and the delivery status must update via wa_message_id.
+    """
+    try:
+        upload_res = await wa_upload_media(
+            file_bytes=file_bytes,
+            filename=filename,
+            mime_type=mime_type,
+            token=token,
+            phone_id=phone_id,
+        )
+        media_id = upload_res.get("id") if isinstance(upload_res, dict) else None
+        if not media_id:
+            logger.error(f"CRM: WA audio upload FAILED for msg {message_id}: {upload_res}")
+            err = (upload_res or {}).get("error") or {}
+            await db.crm_messages.update_one(
+                {"id": message_id},
+                {"$set": {
+                    "delivery_status": "failed",
+                    "wa_result": upload_res,
+                    "delivery_error_title": (err.get("message") if isinstance(err, dict) else None) or "upload_failed",
+                    "delivery_error_code": err.get("code") if isinstance(err, dict) else None,
+                }},
+            )
+            return
+
+        send_res = await wa_send_audio(
+            phone=phone,
+            media_id=media_id,
+            token=token,
+            phone_id=phone_id,
+            as_voice=True,
+        )
+        logger.info(f"CRM: Sent WA audio to {phone} via line {line_name}: {send_res}")
+        wamid = None
+        if isinstance(send_res, dict):
+            try:
+                wamid = (send_res.get("messages") or [{}])[0].get("id")
+            except Exception:
+                wamid = None
+        update = {
+            "wa_result": send_res,
+            "wa_message_id": wamid,
+            "media_id": media_id,
+            "delivery_status": "sent" if wamid else "failed",
+        }
+        if not wamid and isinstance(send_res, dict):
+            err = send_res.get("error") or {}
+            if isinstance(err, dict):
+                update["delivery_error_code"] = err.get("code")
+                update["delivery_error_title"] = err.get("message") or err.get("title")
+        await db.crm_messages.update_one({"id": message_id}, {"$set": update})
+    except Exception as e:
+        logger.error(f"CRM: Background WA audio send FAILED for msg {message_id}: {e}")
+        try:
+            await db.crm_messages.update_one(
+                {"id": message_id},
+                {"$set": {"delivery_status": "failed", "delivery_error_title": str(e)[:200]}},
+            )
+        except Exception:
+            pass
+
+
+async def _send_crm_message_to_wa_async(
+    message_id: str,
+    phone: str,
+    content: str,
+    token: str,
+    phone_id: str,
+    line_name: Optional[str] = None,
+):
+    """Background task: send a crm_messages doc's content via WhatsApp and
+    update its delivery_status + wa_result. Isolated from the HTTP request
+    so the cashier's UI shows the message immediately even if Meta is slow.
+    """
+    try:
+        wa_result = await wa_send_text(
+            phone=phone,
+            message=content,
+            token=token,
+            phone_id=phone_id,
+        )
+        logger.info(f"CRM: Sent WhatsApp message to {phone} via line {line_name}: {wa_result}")
+        wamid = None
+        if isinstance(wa_result, dict):
+            try:
+                wamid = (wa_result.get("messages") or [{}])[0].get("id")
+            except Exception:
+                wamid = None
+        update = {
+            "wa_result": wa_result,
+            "wa_message_id": wamid,
+            "delivery_status": "sent" if wamid else "error",
+        }
+        if not wamid and isinstance(wa_result, dict):
+            err = wa_result.get("error") or {}
+            if isinstance(err, dict):
+                update["delivery_error_code"] = err.get("code")
+                update["delivery_error_title"] = err.get("message") or err.get("title")
+        await db.crm_messages.update_one({"id": message_id}, {"$set": update})
+    except Exception as e:
+        logger.error(f"CRM: Background WA send FAILED for msg {message_id}: {e}")
+        try:
+            await db.crm_messages.update_one(
+                {"id": message_id},
+                {"$set": {"delivery_status": "error", "delivery_error_title": str(e)[:200]}},
+            )
+        except Exception:
+            pass
+
+
 async def wa_send_text(phone: str, message: str, token: str = None, phone_id: str = None):
-    """Send a WhatsApp text message via Cloud API"""
+    """Send a WhatsApp text message via Cloud API. Uses a module-level
+    httpx client with connection pooling + keep-alive so 10+ concurrent
+    lines don't each pay TCP+TLS handshake latency (150-300ms per call)."""
     settings = await get_wa_settings()
     tk = token or settings.get("whatsapp_token") or WHATSAPP_TOKEN
     pid = phone_id or settings.get("phone_number_id") or WHATSAPP_PHONE_NUMBER_ID
@@ -1963,9 +2213,9 @@ async def wa_send_text(phone: str, message: str, token: str = None, phone_id: st
         "text": {"body": message}
     }
     try:
-        async with httpx.AsyncClient(timeout=30) as c:
-            resp = await c.post(url, json=payload, headers=headers)
-            return resp.json()
+        c = _get_meta_http()
+        resp = await c.post(url, json=payload, headers=headers)
+        return resp.json()
     except Exception as e:
         logger.error(f"WA send error: {e}")
         return {"error": str(e)}
@@ -2368,9 +2618,28 @@ async def send_auto_welcome(crm_lead: dict, line: dict):
             phone_id=line["phone_number_id"],
         )
 
+        # Extract wa_message_id + delivery_status so the delivery-status
+        # webhook can match this message and update ✓/✓✓ correctly. Same
+        # bug pattern as the image/audio endpoints (fixed elsewhere): if
+        # we don't persist wa_message_id here, the cajero's UI never sees
+        # a delivery indicator on the welcome and thinks it failed.
+        wamid = None
+        if isinstance(result, dict):
+            try:
+                wamid = (result.get("messages") or [{}])[0].get("id")
+            except Exception:
+                wamid = None
+        delivery_error_title = None
+        delivery_error_code = None
+        if not wamid and isinstance(result, dict):
+            err = result.get("error") or {}
+            if isinstance(err, dict):
+                delivery_error_code = err.get("code")
+                delivery_error_title = err.get("message") or err.get("title")
+
         # Persist in chat history so cajero sees it
         now = datetime.now(timezone.utc).isoformat()
-        await db.crm_messages.insert_one({
+        doc = {
             "id": str(uuid.uuid4()),
             "lead_id": lead_id,
             "content": welcome_msg,
@@ -2380,7 +2649,14 @@ async def send_auto_welcome(crm_lead: dict, line: dict):
             "sent_by": welcome_by,
             "created_at": now,
             "wa_result": result,
-        })
+            "wa_message_id": wamid,
+            "delivery_status": "sent" if wamid else "failed",
+        }
+        if delivery_error_title:
+            doc["delivery_error_title"] = delivery_error_title
+        if delivery_error_code is not None:
+            doc["delivery_error_code"] = delivery_error_code
+        await db.crm_messages.insert_one(doc)
         await db.crm_leads.update_one(
             {"id": lead_id},
             {
@@ -3881,6 +4157,7 @@ class CRMLineUpdate(BaseModel):
     description: Optional[str] = None
     notes: Optional[str] = None  # Observaciones admin: a qué corresponde la línea, recordatorios, etc.
     is_active: Optional[bool] = None
+    receipt_ocr_enabled: Optional[bool] = None  # Claude Vision receipt OCR + auto-match to MP inbox
 
 # ─── CRM Pydantic Models ───────────────────────────────────────────
 
@@ -3915,6 +4192,7 @@ class CRMLeadUpdate(BaseModel):
 class CRMMessageCreate(BaseModel):
     content: str
     sender: str = "admin"  # "admin" or "lead"
+    force: Optional[bool] = False  # Bypass 24h WhatsApp service-window check
 
 class CRMReceiptValidation(BaseModel):
     status: str  # "approved" or "rejected"
@@ -5457,6 +5735,28 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                         {"wa_message_id": wa_id}, {"_id": 0, "campaign_id": 1, "status": 1}
                     )
                     if not bm:
+                        # Not a broadcast — could be a regular chat message.
+                        # Update the corresponding crm_messages doc so cashiers
+                        # can see the real delivery status (esp. failed 131047
+                        # "Re-engagement message" outside the 24h window).
+                        errors = st.get("errors") or []
+                        err_code = errors[0].get("code") if errors else None
+                        err_title = errors[0].get("title") if errors else None
+                        set_fields = {
+                            "delivery_status": new_status,
+                            f"{new_status}_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        if err_code is not None:
+                            set_fields["delivery_error_code"] = err_code
+                            set_fields["delivery_error_title"] = err_title
+                        upd = await db.crm_messages.update_one(
+                            {"wa_message_id": wa_id},
+                            {"$set": set_fields},
+                        )
+                        if upd.matched_count and new_status == "failed":
+                            logger.warning(
+                                f"CRM message wa_id={wa_id} FAILED: {err_code} {err_title}"
+                            )
                         continue
                     prev_status = bm.get("status")
                     rank = {"failed": -1, "sent": 0, "delivered": 1, "read": 2}
@@ -5813,6 +6113,25 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                     fresh_lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0}) or crm_lead
                     preview_text = text if msg_type == "text" else f"[{msg_type}]"
                     _asyncio.create_task(notify_line_cajeros_of_new_message(fresh_lead, line, preview_text))
+
+                    # ── Receipt OCR (Claude Vision) — opt-in per line ─
+                    # If the incoming message is an image and the line has
+                    # receipt_ocr_enabled=true, extract sender/amount and try
+                    # to match against the cashier's MP inbox. Fully async
+                    # so it never blocks the webhook.
+                    if (
+                        msg_type == "image"
+                        and media_id
+                        and line.get("receipt_ocr_enabled")
+                        and CLAUDE_API_KEY
+                    ):
+                        _asyncio.create_task(_process_receipt_ocr(
+                            message_id=crm_message["id"],
+                            lead_id=lead_id,
+                            media_id=media_id,
+                            mime_type=mime_type or "image/jpeg",
+                            line=line,
+                        ))
 
     except Exception as e:
         logger.error(f"CRM Line webhook error: {e}")
@@ -6853,7 +7172,7 @@ async def crm_mark_lead_read(lead_id: str, current_user=Depends(get_current_user
 async def crm_get_lead_messages(
     lead_id: str,
     page: int = Query(1, ge=1),
-    limit: int = Query(100, ge=1, le=500),
+    limit: int = Query(300, ge=1, le=1000),
     unified: bool = Query(True),
     current_user=Depends(get_current_user)
 ):
@@ -6869,6 +7188,14 @@ async def crm_get_lead_messages(
     different line shows up).
 
     Pass ?unified=false to force strictly the single lead's messages.
+
+    Pagination: ALWAYS returns the NEWEST `limit` messages first (in
+    chronological order for display). page=2 returns the previous `limit`
+    older messages (for infinite scroll upward). This is critical — long
+    chats (>100 msgs) previously lost their newest messages because
+    the query was `sort ASC + skip 0 + limit 100` which returned the
+    100 OLDEST and cut off the newest. Reported bug: Kaki456x/ORO with
+    113 msgs → cashier's chat froze at message #100.
     """
     lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
@@ -6894,17 +7221,23 @@ async def crm_get_lead_messages(
         unified_used = False
 
     total = await db.crm_messages.count_documents(query)
-    skip = (page - 1) * limit
 
+    # Fetch the NEWEST `limit` messages (skip=0, page=1) or the previous
+    # `limit` block for older pages (infinite scroll upward).
+    skip = (page - 1) * limit
     messages = await db.crm_messages.find(
         query, {"_id": 0}
-    ).sort("created_at", 1).skip(skip).limit(limit).to_list(limit)
+    ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    # Reverse to chronological ASC so the frontend can render top→bottom
+    # without extra sorting.
+    messages.reverse()
 
     return {
         "messages": messages,
         "total": total,
         "page": page,
         "unified": unified_used,
+        "has_more": (skip + len(messages)) < total,
     }
 
 @api_router.get("/crm/messages/{message_id}/image")
@@ -7043,22 +7376,90 @@ async def crm_send_message(
         raise HTTPException(status_code=404, detail="Lead no encontrado")
     
     now = datetime.now(timezone.utc).isoformat()
-    
-    # If admin is sending, send to WhatsApp via the line's credentials
-    wa_result = None
+
+    # ── WhatsApp 24-hour service window check ──────────────────
+    # Meta only allows free-form messages within 24hs of the last inbound
+    # message from the customer. Outside that window, the API returns 200 +
+    # wamid but the message is silently DROPPED (a webhook 'statuses.failed'
+    # with error 131047 arrives later). We block preemptively with a clear
+    # error so the cashier knows to use a broadcast template instead.
+    # `data.force=True` bypasses the check for admins that know what
+    # they're doing (e.g. sending a template).
+    force = bool(getattr(data, "force", False))
+
+    if data.sender == "admin" and not force:
+        last_inbound = await db.crm_messages.find_one(
+            {"lead_id": lead_id, "sender": "lead"},
+            {"_id": 0, "created_at": 1},
+            sort=[("created_at", -1)],
+        )
+        if last_inbound and last_inbound.get("created_at"):
+            try:
+                last_ts = datetime.fromisoformat(last_inbound["created_at"].replace("Z", "+00:00"))
+                hours_since = (datetime.now(timezone.utc) - last_ts).total_seconds() / 3600.0
+                # Use 23.5h as safety margin (Meta clock drift)
+                if hours_since >= 23.5:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "outside_24h_window",
+                            "message": (
+                                f"Ventana de 24hs cerrada (última respuesta del cliente hace "
+                                f"{round(hours_since, 1)}h). WhatsApp NO entrega este mensaje "
+                                f"aunque parezca enviado. Usá un template desde el Broadcast."
+                            ),
+                            "hours_since_last_inbound": round(hours_since, 1),
+                            "last_inbound_at": last_inbound["created_at"],
+                        }
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning(f"24h window check parse error: {e}")
+
+    # ── Insert message FIRST with delivery_status='sending' ─────
+    # Order matters: if we call Meta first (wa_send_text) BEFORE the
+    # DB insert, the cashier's polling (every 10s) can arrive during
+    # the Meta call and NOT see the message yet, giving the impression
+    # the send failed. Bug reported by user on lines EX 3 / hijo EX3.
+    # Now we insert immediately and update the wa_result asynchronously.
+    message_id = str(uuid.uuid4())
+    initial_status = "sending" if data.sender == "admin" else None
+    message = {
+        "id": message_id,
+        "lead_id": lead_id,
+        "content": data.content,
+        "sender": data.sender,  # "admin" or "lead"
+        "created_at": now,
+        "wa_result": None,
+        "wa_message_id": None,
+        "delivery_status": initial_status,
+    }
+    await db.crm_messages.insert_one(message)
+
+    # If admin is sending, fire off the WhatsApp call in the background so
+    # this endpoint returns immediately with the inserted message visible
+    # to the cashier's UI. The background task updates the same message
+    # doc with wa_result + wa_message_id + delivery_status when Meta
+    # responds.
     if data.sender == "admin" and lead.get("line_id") and lead.get("phone"):
         line = await db.crm_lines.find_one({"id": lead["line_id"]}, {"_id": 0})
         if line and line.get("whatsapp_token") and line.get("phone_number_id"):
-            wa_result = await wa_send_text(
+            _spawn_bg(_send_crm_message_to_wa_async(
+                message_id=message_id,
                 phone=lead["phone"],
-                message=data.content,
+                content=data.content,
                 token=line["whatsapp_token"],
-                phone_id=line["phone_number_id"]
-            )
-            logger.info(f"CRM: Sent WhatsApp message to {lead['phone']} via line {line.get('name')}: {wa_result}")
+                phone_id=line["phone_number_id"],
+                line_name=line.get("name"),
+            ))
         else:
             logger.warning(f"CRM: Line {lead.get('line_id')} missing whatsapp_token or phone_number_id")
-    
+            await db.crm_messages.update_one(
+                {"id": message_id},
+                {"$set": {"delivery_status": "error", "delivery_error_title": "Línea sin token/phone_number_id"}},
+            )
+
     # Check if this is the first message from the lead (for Contact event)
     is_first_lead_message = False
     if data.sender == "lead":
@@ -7067,17 +7468,6 @@ async def crm_send_message(
             "sender": "lead"
         })
         is_first_lead_message = existing_lead_messages == 0
-    
-    message = {
-        "id": str(uuid.uuid4()),
-        "lead_id": lead_id,
-        "content": data.content,
-        "sender": data.sender,  # "admin" or "lead"
-        "created_at": now,
-        "wa_result": wa_result  # Store WhatsApp API response if sent
-    }
-    
-    await db.crm_messages.insert_one(message)
     
     # Update lead's last interaction and message count
 # Update lead's last interaction, message count, and unread flag
@@ -7131,8 +7521,8 @@ async def crm_send_message(
     message.pop("_id", None)
     return {
         "message": message,
-        "whatsapp_sent": wa_result is not None and "error" not in wa_result,
-        "whatsapp_result": wa_result,
+        "whatsapp_sent": data.sender == "admin",  # queued; actual result via delivery_status polling
+        "whatsapp_result": None,
         "contact_event_sent": meta_result is not None,
         "meta_result": meta_result
         }
@@ -7146,9 +7536,24 @@ async def crm_send_image_message(
     lead_id: str,
     file: UploadFile = File(...),
     caption: str = Form(""),
+    force: bool = Form(False),
     current_user=Depends(get_current_user)
 ):
-    """Upload an image and send it via WhatsApp to the lead. Stores it in chat history."""
+    """Upload an image and send it via WhatsApp to the lead.
+
+    Flow (mirrors text send for consistency + reliability):
+      1. Validate file + line credentials.
+      2. Check WhatsApp 24h service window (block silently-dropped sends).
+      3. Read bytes + save locally + insert crm_messages doc with
+         delivery_status='sending'.
+      4. Return immediately so the cashier's UI shows the image at once.
+      5. Background task uploads media + sends via WA and updates the
+         message doc with wa_message_id + delivery_status.
+
+    Prior version was fully synchronous and NEVER stored wa_message_id
+    (see Kaki456x/ORO bug: delivery_status webhook could not match
+    outbound images, so cajero never saw ✓/✓✓ and thought sends failed).
+    """
     lead = await db.crm_leads.find_one({"id": lead_id})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead no encontrado")
@@ -7164,9 +7569,39 @@ async def crm_send_image_message(
     if not line or not line.get("whatsapp_token") or not line.get("phone_number_id"):
         raise HTTPException(status_code=400, detail="Línea sin credenciales de WhatsApp")
 
+    # ── 24h window check (same as text send) ─────────────────────
+    if not force:
+        last_inbound = await db.crm_messages.find_one(
+            {"lead_id": lead_id, "sender": "lead"},
+            {"_id": 0, "created_at": 1},
+            sort=[("created_at", -1)],
+        )
+        if last_inbound and last_inbound.get("created_at"):
+            try:
+                last_ts = datetime.fromisoformat(last_inbound["created_at"].replace("Z", "+00:00"))
+                hours_since = (datetime.now(timezone.utc) - last_ts).total_seconds() / 3600.0
+                if hours_since >= 23.5:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "outside_24h_window",
+                            "message": (
+                                f"Ventana de 24hs cerrada (última respuesta del cliente hace "
+                                f"{round(hours_since, 1)}h). WhatsApp NO entrega este mensaje "
+                                f"aunque parezca enviado."
+                            ),
+                            "hours_since_last_inbound": round(hours_since, 1),
+                            "last_inbound_at": last_inbound["created_at"],
+                        },
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning(f"24h window check parse error (image): {e}")
+
     # Read file bytes
     file_bytes = await file.read()
-    if len(file_bytes) > 10 * 1024 * 1024:  # 10 MB limit (WA max ~5MB but leave margin)
+    if len(file_bytes) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Imagen muy grande (máx 10MB)")
 
     # Save locally for chat history preview
@@ -7178,30 +7613,8 @@ async def crm_send_image_message(
     with open(file_path, "wb") as f:
         f.write(file_bytes)
 
-    # 1. Upload media to WhatsApp
-    upload_res = await wa_upload_media(
-        file_bytes=file_bytes,
-        filename=file.filename or file_name,
-        mime_type=file.content_type,
-        token=line["whatsapp_token"],
-        phone_id=line["phone_number_id"],
-    )
-    media_id = upload_res.get("id") if isinstance(upload_res, dict) else None
-    if not media_id:
-        logger.error(f"WA media upload failed for lead {lead_id}: {upload_res}")
-        raise HTTPException(status_code=502, detail=f"Error subiendo imagen a WhatsApp: {upload_res}")
-
-    # 2. Send image to the lead
-    send_res = await wa_send_image(
-        phone=lead["phone"],
-        media_id=media_id,
-        caption=caption or "",
-        token=line["whatsapp_token"],
-        phone_id=line["phone_number_id"],
-    )
-    whatsapp_ok = isinstance(send_res, dict) and "error" not in send_res and send_res.get("messages")
-
-    # 3. Store message in chat history
+    # Insert message FIRST with delivery_status='sending' so the cashier
+    # sees it immediately in the chat, even before Meta responds.
     now = datetime.now(timezone.utc).isoformat()
     message = {
         "id": image_id,
@@ -7212,7 +7625,9 @@ async def crm_send_image_message(
         "image_path": file_name,
         "caption": caption or "",
         "created_at": now,
-        "wa_result": send_res,
+        "wa_result": None,
+        "wa_message_id": None,
+        "delivery_status": "sending",
     }
     await db.crm_messages.insert_one(message)
     await db.crm_leads.update_one(
@@ -7223,12 +7638,27 @@ async def crm_send_image_message(
         }
     )
 
+    # Fire off Meta upload+send in the background. Frontend gets the
+    # inserted message right away and the delivery_status webhook can
+    # match wa_message_id later.
+    _spawn_bg(_send_crm_image_to_wa_async(
+        message_id=image_id,
+        file_bytes=file_bytes,
+        filename=file.filename or file_name,
+        mime_type=file.content_type,
+        phone=lead["phone"],
+        caption=caption or "",
+        token=line["whatsapp_token"],
+        phone_id=line["phone_number_id"],
+        line_name=line.get("name"),
+    ))
+
     message.pop("_id", None)
     return {
         "message": message,
-        "whatsapp_sent": bool(whatsapp_ok),
-        "whatsapp_result": send_res,
-        "media_id": media_id,
+        "whatsapp_sent": True,  # queued; actual result via delivery_status polling
+        "whatsapp_result": None,
+        "media_id": None,
     }
 
 
@@ -7341,28 +7771,9 @@ async def crm_send_audio_message(
         with open(file_path, "wb") as f:
             f.write(file_bytes)
 
-    # Upload to WhatsApp with the Meta-accepted MIME
-    upload_res = await wa_upload_media(
-        file_bytes=file_bytes,
-        filename=file.filename or file_name,
-        mime_type=meta_mime,
-        token=line["whatsapp_token"],
-        phone_id=line["phone_number_id"],
-    )
-    media_id = upload_res.get("id") if isinstance(upload_res, dict) else None
-    if not media_id:
-        logger.error(f"WA audio upload failed for lead {lead_id}: {upload_res}")
-        raise HTTPException(status_code=502, detail=f"Error subiendo audio: {upload_res}")
-
-    send_res = await wa_send_audio(
-        phone=lead["phone"],
-        media_id=media_id,
-        token=line["whatsapp_token"],
-        phone_id=line["phone_number_id"],
-        as_voice=True,
-    )
-    whatsapp_ok = isinstance(send_res, dict) and "error" not in send_res and send_res.get("messages")
-
+    # Upload + send to WhatsApp in the background so the cashier's UI gets
+    # the message immediately and the delivery-status webhook can update
+    # this doc via wa_message_id.
     now = datetime.now(timezone.utc).isoformat()
     message = {
         "id": audio_id,
@@ -7373,7 +7784,9 @@ async def crm_send_audio_message(
         "audio_path": file_name,
         "audio_mime": meta_mime,
         "created_at": now,
-        "wa_result": send_res,
+        "wa_result": None,
+        "wa_message_id": None,
+        "delivery_status": "sending",
     }
     await db.crm_messages.insert_one(message)
     await db.crm_leads.update_one(
@@ -7383,12 +7796,22 @@ async def crm_send_audio_message(
             "$inc": {"messages_count": 1}
         }
     )
+    _spawn_bg(_send_crm_audio_to_wa_async(
+        message_id=audio_id,
+        file_bytes=file_bytes,
+        filename=file.filename or file_name,
+        mime_type=meta_mime,
+        phone=lead["phone"],
+        token=line["whatsapp_token"],
+        phone_id=line["phone_number_id"],
+        line_name=line.get("name"),
+    ))
     message.pop("_id", None)
     return {
         "message": message,
-        "whatsapp_sent": bool(whatsapp_ok),
-        "whatsapp_result": send_res,
-        "media_id": media_id,
+        "whatsapp_sent": True,  # queued; actual result via delivery_status polling
+        "whatsapp_result": None,
+        "media_id": None,
     }
 
 
@@ -12677,6 +13100,589 @@ async def mp_payments_search(
     }
 
 
+# ─── Mercado Pago Webhook & Real-time Payment Inbox ───────────────
+# Marketplace-style webhook: a SINGLE URL configured once in the admin's MP
+# app panel receives payment notifications for ALL connected cashiers. Each
+# notification carries the cashier's `user_id` so we can route it to the
+# right `mp_connections` doc and, from there, to the CRM user.
+#
+# Flow:
+#   1. Customer pays cashier A → MP fires POST to /api/mercadopago/webhook
+#      with {"action": "payment.updated", "data": {"id": PAYMENT_ID}, "user_id": MP_USER_ID_OF_A}
+#   2. We look up mp_connections by mp_user_id → get the CRM user_id + token.
+#   3. Fetch full payment details from /v1/payments/{id} using that token.
+#   4. Store the payment in `mp_payments_inbox` for that user (dedup by mp_payment_id).
+#   5. Cashier's browser polls /api/mercadopago/inbox every ~15s → sees the new payment
+#      → clicks "asignar" → we tie it to a lead's receipts.
+
+
+async def _mp_fetch_payment(payment_id: str, access_token: str) -> Optional[dict]:
+    """Fetch full payment info from MP."""
+    url = f"https://api.mercadopago.com/v1/payments/{payment_id}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as http:
+            r = await http.get(url, headers={"Authorization": f"Bearer {access_token}"})
+        if r.status_code == 200:
+            return r.json()
+        logger.warning(f"MP fetch payment {payment_id} failed: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        logger.error(f"MP fetch payment {payment_id} exception: {e}")
+    return None
+
+
+def _mp_simplify_payment(p: dict) -> dict:
+    """Extract only the fields we want to persist in the inbox."""
+    payer = p.get("payer") or {}
+    return {
+        "mp_payment_id": str(p.get("id")),
+        "status": p.get("status"),
+        "status_detail": p.get("status_detail"),
+        "transaction_amount": float(p.get("transaction_amount") or 0),
+        "net_received_amount": float(p.get("transaction_details", {}).get("net_received_amount") or 0),
+        "currency_id": p.get("currency_id", "ARS"),
+        "date_approved": p.get("date_approved"),
+        "date_created": p.get("date_created"),
+        "payment_method_id": p.get("payment_method_id"),
+        "payment_type_id": p.get("payment_type_id"),
+        "description": p.get("description"),
+        "external_reference": p.get("external_reference"),
+        "payer": {
+            "id": payer.get("id"),
+            "email": payer.get("email"),
+            "first_name": payer.get("first_name"),
+            "last_name": payer.get("last_name"),
+            "identification": payer.get("identification"),
+        },
+        "live_mode": p.get("live_mode", True),
+    }
+
+
+@api_router.post("/mercadopago/webhook")
+async def mp_webhook(request: Request):
+    """Receive MP payment notifications for all connected cashiers.
+
+    MP sends POST with body like:
+      {"action": "payment.updated", "api_version": "v1",
+       "data": {"id": "112233"}, "date_created": "...",
+       "id": 987, "live_mode": true, "type": "payment",
+       "user_id": "241983636"}
+
+    Returns 200 immediately (MP retries on non-2xx).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    logger.info(f"MP webhook received: {body}")
+
+    # Support both `type` and `topic` (older MP versions)
+    notification_type = body.get("type") or body.get("topic")
+    if notification_type != "payment":
+        return {"ok": True, "ignored": "not_payment"}
+
+    data = body.get("data") or {}
+    payment_id = str(data.get("id") or "")
+    mp_user_id = body.get("user_id")
+
+    if not payment_id or not mp_user_id:
+        return {"ok": True, "ignored": "missing_ids"}
+
+    # Find which of our cashiers owns this MP account
+    conn = await db.mp_connections.find_one({"mp_user_id": int(mp_user_id) if str(mp_user_id).isdigit() else mp_user_id})
+    if not conn:
+        logger.warning(f"MP webhook: no connection for mp_user_id={mp_user_id}")
+        return {"ok": True, "ignored": "unknown_user"}
+
+    # Refresh token if needed and fetch full payment
+    conn = await _mp_get_valid_token(conn["user_id"])
+    payment = await _mp_fetch_payment(payment_id, conn["access_token"])
+    if not payment:
+        return {"ok": True, "ignored": "payment_fetch_failed"}
+
+    simplified = _mp_simplify_payment(payment)
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Upsert in inbox (dedup by mp_payment_id + user_id)
+    await db.mp_payments_inbox.update_one(
+        {"user_id": conn["user_id"], "mp_payment_id": simplified["mp_payment_id"]},
+        {
+            "$set": {
+                **simplified,
+                "user_id": conn["user_id"],
+                "mp_user_id": conn.get("mp_user_id"),
+                "updated_at": now,
+            },
+            "$setOnInsert": {
+                "received_at": now,
+                "assigned_lead_id": None,
+                "assigned_at": None,
+                "assigned_by": None,
+                "seen_at": None,
+            },
+        },
+        upsert=True,
+    )
+
+    # Reverse auto-match: if we already have a receipt from a customer in
+    # the last 24h with the same amount, auto-assign the payment to that
+    # lead — customers often send the receipt BEFORE MP fires the webhook.
+    try:
+        import asyncio as _asyncio
+        _asyncio.create_task(_try_reverse_match(conn["user_id"], simplified["mp_payment_id"]))
+    except Exception as e:
+        logger.warning(f"Reverse match schedule failed: {e}")
+
+    return {"ok": True, "payment_id": payment_id, "user_id": conn["user_id"]}
+
+
+@api_router.get("/mercadopago/inbox")
+async def mp_inbox_list(
+    include_assigned: bool = Query(False),
+    limit: int = Query(50, ge=1, le=200),
+    current_user=Depends(get_current_user),
+):
+    """Return the current cashier's recent MP payments (pending + assigned)."""
+    query: dict = {"user_id": current_user["id"]}
+    if not include_assigned:
+        query["assigned_lead_id"] = None
+    payments = await db.mp_payments_inbox.find(
+        query, {"_id": 0}
+    ).sort("date_approved", -1).limit(limit).to_list(limit)
+
+    unread = await db.mp_payments_inbox.count_documents({
+        "user_id": current_user["id"],
+        "assigned_lead_id": None,
+        "seen_at": None,
+    })
+    total_pending = await db.mp_payments_inbox.count_documents({
+        "user_id": current_user["id"],
+        "assigned_lead_id": None,
+    })
+    return {
+        "payments": payments,
+        "unread": unread,
+        "total_pending": total_pending,
+    }
+
+
+@api_router.post("/mercadopago/inbox/mark-seen")
+async def mp_inbox_mark_seen(current_user=Depends(get_current_user)):
+    """Mark all pending payments of the user as 'seen' (silences the toast)."""
+    now = datetime.now(timezone.utc).isoformat()
+    res = await db.mp_payments_inbox.update_many(
+        {"user_id": current_user["id"], "assigned_lead_id": None, "seen_at": None},
+        {"$set": {"seen_at": now}},
+    )
+    return {"marked": res.modified_count}
+
+
+class MPAssignBody(BaseModel):
+    lead_id: str
+
+
+@api_router.post("/mercadopago/inbox/{mp_payment_id}/assign")
+async def mp_inbox_assign(
+    mp_payment_id: str,
+    payload: MPAssignBody,
+    current_user=Depends(get_current_user),
+):
+    """Attach an MP payment to a lead as a validated receipt."""
+    pay = await db.mp_payments_inbox.find_one({
+        "user_id": current_user["id"],
+        "mp_payment_id": mp_payment_id,
+    })
+    if not pay:
+        raise HTTPException(status_code=404, detail="Pago no encontrado en tu inbox")
+
+    lead = await db.crm_leads.find_one({"id": payload.lead_id}, {"_id": 0, "id": 1, "line_id": 1, "phone": 1})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead no encontrado")
+    if not _user_can_use_line(current_user, lead.get("line_id")):
+        raise HTTPException(status_code=403, detail="Sin acceso a este lead")
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Attach to the inbox doc
+    await db.mp_payments_inbox.update_one(
+        {"user_id": current_user["id"], "mp_payment_id": mp_payment_id},
+        {"$set": {"assigned_lead_id": payload.lead_id, "assigned_at": now, "assigned_by": current_user["email"], "seen_at": now}},
+    )
+
+    # Also create a validated receipt entry so it appears in the lead's history
+    receipt = {
+        "id": str(uuid.uuid4()),
+        "lead_id": payload.lead_id,
+        "amount": pay.get("transaction_amount"),
+        "currency": pay.get("currency_id", "ARS"),
+        "status": "approved",
+        "source": "mercadopago",
+        "mp_payment_id": mp_payment_id,
+        "payer": pay.get("payer"),
+        "description": pay.get("description") or f"MP payment {mp_payment_id}",
+        "validated_at": now,
+        "validated_by": current_user["email"],
+        "created_at": now,
+    }
+    await db.crm_receipts.insert_one(receipt)
+    receipt.pop("_id", None)
+
+    return {"ok": True, "receipt_id": receipt["id"], "mp_payment_id": mp_payment_id, "lead_id": payload.lead_id}
+
+
+@api_router.post("/mercadopago/inbox/{mp_payment_id}/unassign")
+async def mp_inbox_unassign(mp_payment_id: str, current_user=Depends(get_current_user)):
+    """Undo a previous assignment (useful if the cashier picked the wrong lead)."""
+    pay = await db.mp_payments_inbox.find_one({
+        "user_id": current_user["id"],
+        "mp_payment_id": mp_payment_id,
+    })
+    if not pay or not pay.get("assigned_lead_id"):
+        raise HTTPException(status_code=404, detail="Ese pago no está asignado")
+
+    # Remove receipt entry
+    await db.crm_receipts.delete_many({"lead_id": pay["assigned_lead_id"], "mp_payment_id": mp_payment_id})
+    await db.mp_payments_inbox.update_one(
+        {"user_id": current_user["id"], "mp_payment_id": mp_payment_id},
+        {"$set": {"assigned_lead_id": None, "assigned_at": None, "assigned_by": None}},
+    )
+    return {"ok": True}
+
+
+# ─── Receipt OCR (Claude Vision) + bidirectional auto-match ───────
+# When a customer sends a receipt image on WhatsApp, we ask Claude to
+# extract the amount, sender name and bank. Then we search the cashier's
+# MP inbox for an amount match within the last 24h. When it matches, the
+# payment is auto-assigned to that lead and a "🤖 Comprobante validado
+# por Claude" system message is inserted.
+#
+# The reverse direction is also covered: when an MP payment arrives via
+# webhook, we scan recent receipts for the same cashier's leads and
+# auto-assign if there's a match.
+
+MP_MATCH_WINDOW_HOURS = 24
+MP_MATCH_AMOUNT_TOLERANCE = 1.0  # ARS
+
+
+def _receipt_extract_prompt() -> str:
+    return (
+        "You are a bank/wallet receipt reader. The image is a transfer receipt "
+        "(Mercado Pago, bank app, MODO, Ualá, etc.), commonly from Argentina, "
+        "sent by a customer to prove they paid. Extract STRICT JSON with these "
+        "keys and NO extra text:\n"
+        "{\n"
+        '  "is_receipt": boolean (true only if the image is clearly a payment/transfer receipt),\n'
+        '  "amount": number (the money amount in ARS, no currency symbols, e.g. 5000.50). null if not readable,\n'
+        '  "sender_name": string (person or account that sent the money — the PAYER). null if not readable,\n'
+        '  "recipient_name": string (person or account that received the money). null if not readable,\n'
+        '  "bank": string (bank or wallet name: "Mercado Pago", "Banco Nación", "Ualá", etc.). null if not readable,\n'
+        '  "reference": string (operation/reference/comprobante number). null if not readable,\n'
+        '  "date_str": string (date of the transfer as shown, ISO if possible). null if not readable,\n'
+        '  "confidence": number 0..1 (your confidence in amount and sender_name)\n'
+        "}\n"
+        "Rules: (1) Only return valid JSON, no prose. (2) If it's not a receipt, "
+        "set is_receipt=false and all other fields to null (except confidence=0). "
+        "(3) Amount must be a number, NOT a string. Strip thousand separators."
+    )
+
+
+async def _download_wa_media(media_id: str, token: str) -> Optional[tuple[bytes, str]]:
+    """Download a WhatsApp media file. Returns (bytes, mime) or None on failure."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as http:
+            r1 = await http.get(
+                f"https://graph.facebook.com/v20.0/{media_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if r1.status_code != 200:
+                logger.warning(f"WA media lookup failed for {media_id}: {r1.status_code}")
+                return None
+            info = r1.json()
+            url = info.get("url")
+            mime = info.get("mime_type", "image/jpeg")
+            if not url:
+                return None
+            r2 = await http.get(url, headers={"Authorization": f"Bearer {token}"})
+            if r2.status_code != 200:
+                logger.warning(f"WA media download failed for {media_id}: {r2.status_code}")
+                return None
+            return r2.content, mime
+    except Exception as e:
+        logger.error(f"WA media download exception for {media_id}: {e}")
+        return None
+
+
+async def _claude_extract_receipt(image_bytes: bytes, mime: str) -> Optional[dict]:
+    """Send an image to Claude Vision and get the extracted JSON."""
+    if not CLAUDE_API_KEY:
+        return None
+    try:
+        import anthropic
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        client_ai = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        # Run in threadpool since anthropic client is sync
+        import asyncio as _asyncio
+        loop = _asyncio.get_event_loop()
+
+        def _call():
+            return client_ai.messages.create(
+                model="claude-sonnet-4-5-20250929",
+                max_tokens=600,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
+                            {"type": "text", "text": _receipt_extract_prompt()},
+                        ],
+                    }
+                ],
+            )
+        resp = await loop.run_in_executor(None, _call)
+        text = "".join(part.text for part in resp.content if getattr(part, "type", None) == "text").strip()
+        # Claude may wrap the JSON in ```json ... ``` — strip.
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+            text = text.strip()
+        parsed = json.loads(text)
+        # Coerce amount to float if it's a string
+        amt = parsed.get("amount")
+        if isinstance(amt, str):
+            try:
+                parsed["amount"] = float(amt.replace(",", "").replace(".", "").replace(" ", ""))
+                # If original had a decimal, prefer float(amt)
+                if "." in amt and amt.count(".") == 1 and len(amt.split(".")[-1]) <= 2:
+                    parsed["amount"] = float(amt.replace(",", ""))
+            except Exception:
+                parsed["amount"] = None
+        # Coerce string-only fields to strings (or None) — Claude occasionally
+        # returns nested objects here which then blow up the React renderer
+        # ("Objects are not valid as a React child") and blank the whole chat.
+        def _to_str(v):
+            if v is None:
+                return None
+            if isinstance(v, str):
+                s = v.strip()
+                return s or None
+            if isinstance(v, (int, float)):
+                return str(v)
+            try:
+                return json.dumps(v, ensure_ascii=False)
+            except Exception:
+                return None
+        for k in ("sender_name", "recipient_name", "bank", "reference", "date_str"):
+            if k in parsed:
+                parsed[k] = _to_str(parsed[k])
+        # is_receipt must be a real bool
+        parsed["is_receipt"] = bool(parsed.get("is_receipt"))
+        # confidence must be a real float 0..1 (or None)
+        c = parsed.get("confidence")
+        if isinstance(c, (int, float)):
+            try:
+                parsed["confidence"] = max(0.0, min(1.0, float(c)))
+            except Exception:
+                parsed["confidence"] = None
+        else:
+            parsed["confidence"] = None
+        return parsed
+    except Exception as e:
+        logger.error(f"Claude receipt extraction failed: {e}")
+        return None
+
+
+async def _match_receipt_to_mp_payment(lead: dict, line: dict, receipt: dict) -> Optional[dict]:
+    """Given a parsed receipt from a lead, look for an unassigned MP payment
+    on any cashier that operates the lead's line. Returns the payment doc if
+    matched, None otherwise. Only matches by exact amount within 24h."""
+    amount = receipt.get("amount")
+    if not amount:
+        return None
+    try:
+        amount_f = float(amount)
+    except Exception:
+        return None
+    if amount_f <= 0:
+        return None
+
+    # Find cashiers assigned to this line (users with line_id in their line_ids)
+    line_id = lead.get("line_id")
+    if not line_id:
+        return None
+    users = await db.users.find(
+        {"line_ids": line_id},
+        {"_id": 0, "id": 1},
+    ).to_list(50)
+    if not users:
+        return None
+    user_ids = [u["id"] for u in users]
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=MP_MATCH_WINDOW_HOURS)).isoformat()
+
+    # Find payments with matching amount for any of those cashiers
+    payments = await db.mp_payments_inbox.find(
+        {
+            "user_id": {"$in": user_ids},
+            "assigned_lead_id": None,
+            "transaction_amount": {"$gte": amount_f - MP_MATCH_AMOUNT_TOLERANCE, "$lte": amount_f + MP_MATCH_AMOUNT_TOLERANCE},
+            "$or": [
+                {"date_approved": {"$gte": cutoff}},
+                {"date_created": {"$gte": cutoff}},
+                {"received_at": {"$gte": cutoff}},
+            ],
+        },
+        {"_id": 0},
+    ).sort("received_at", -1).to_list(10)
+
+    if not payments:
+        return None
+
+    # Prefer approved payments; fall back to first
+    approved = [p for p in payments if p.get("status") == "approved"]
+    return (approved or payments)[0]
+
+
+async def _auto_assign_and_notify(payment: dict, lead: dict, source: str = "receipt_ocr"):
+    """Attach an MP payment to a lead, create a receipt entry, and post a
+    system message in the chat. `source` is either 'receipt_ocr' (customer
+    sent a receipt image → we matched it) or 'mp_webhook' (MP payment came
+    in → we found a receipt in the chat that matched)."""
+    now = datetime.now(timezone.utc).isoformat()
+    mp_payment_id = payment["mp_payment_id"]
+    user_id = payment["user_id"]
+
+    # Attach payment
+    await db.mp_payments_inbox.update_one(
+        {"user_id": user_id, "mp_payment_id": mp_payment_id},
+        {"$set": {
+            "assigned_lead_id": lead["id"],
+            "assigned_at": now,
+            "assigned_by": f"auto_{source}",
+            "seen_at": now,
+        }},
+    )
+    # Create validated receipt
+    receipt = {
+        "id": str(uuid.uuid4()),
+        "lead_id": lead["id"],
+        "amount": payment.get("transaction_amount"),
+        "currency": payment.get("currency_id", "ARS"),
+        "status": "approved",
+        "source": "mercadopago",
+        "auto_match_source": source,
+        "mp_payment_id": mp_payment_id,
+        "payer": payment.get("payer"),
+        "description": payment.get("description") or f"MP payment {mp_payment_id}",
+        "validated_at": now,
+        "validated_by": f"auto_{source}",
+        "created_at": now,
+    }
+    await db.crm_receipts.insert_one(receipt)
+
+    # Insert a system message in the chat so the cashier sees it
+    amount_txt = f"${float(payment.get('transaction_amount', 0)):,.0f}".replace(",", ".")
+    payer = payment.get("payer") or {}
+    payer_name = " ".join([p for p in [payer.get("first_name"), payer.get("last_name")] if p]).strip() or (payer.get("email") or "Cliente")
+    sys_msg = {
+        "id": str(uuid.uuid4()),
+        "lead_id": lead["id"],
+        "content": f"🤖 Comprobante validado automáticamente ✅\nPago de {amount_txt} de {payer_name} (MP #{mp_payment_id})",
+        "sender": "system",
+        "created_at": now,
+        "auto_match": {
+            "source": source,
+            "mp_payment_id": mp_payment_id,
+            "amount": payment.get("transaction_amount"),
+        },
+    }
+    await db.crm_messages.insert_one(sys_msg)
+    logger.info(f"AUTO-MATCH ({source}): payment {mp_payment_id} → lead {lead['id']} (${payment.get('transaction_amount')})")
+
+
+async def _try_reverse_match(user_id: str, mp_payment_id: str):
+    """When an MP payment lands, check if any recent receipt (last 24h) on
+    any of this cashier's leads matches by amount. If yes, auto-assign."""
+    try:
+        pay = await db.mp_payments_inbox.find_one(
+            {"user_id": user_id, "mp_payment_id": mp_payment_id, "assigned_lead_id": None},
+            {"_id": 0},
+        )
+        if not pay:
+            return
+        amount = pay.get("transaction_amount")
+        if not amount:
+            return
+        amount_f = float(amount)
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=MP_MATCH_WINDOW_HOURS)).isoformat()
+
+        # Cashier's assigned lines → leads → candidate receipts
+        user = await db.users.find_one({"id": user_id}, {"_id": 0, "line_ids": 1})
+        line_ids = (user or {}).get("line_ids") or []
+        if not line_ids:
+            return
+
+        # crm_messages with a parsed receipt matching the amount, recent
+        candidates = await db.crm_messages.find(
+            {
+                "created_at": {"$gte": cutoff},
+                "receipt_data.is_receipt": True,
+                "receipt_data.amount": {"$gte": amount_f - MP_MATCH_AMOUNT_TOLERANCE, "$lte": amount_f + MP_MATCH_AMOUNT_TOLERANCE},
+            },
+            {"_id": 0, "id": 1, "lead_id": 1, "receipt_data": 1, "created_at": 1},
+        ).sort("created_at", -1).to_list(20)
+
+        # Filter down to leads that belong to one of this cashier's lines
+        for c in candidates:
+            lead = await db.crm_leads.find_one({"id": c["lead_id"], "line_id": {"$in": line_ids}}, {"_id": 0})
+            if not lead:
+                continue
+            # Skip if the lead already has a validated receipt for THIS mp payment
+            existing = await db.crm_receipts.count_documents({"lead_id": lead["id"], "mp_payment_id": mp_payment_id})
+            if existing:
+                return
+            await _auto_assign_and_notify(pay, lead, source="mp_webhook")
+            return
+    except Exception as e:
+        logger.error(f"Reverse match failed for payment {mp_payment_id}: {e}")
+
+
+async def _process_receipt_ocr(message_id: str, lead_id: str, media_id: str, mime_type: str, line: dict):
+    """Background task: download → Claude Vision → store → match against MP inbox."""
+    try:
+        token = line.get("whatsapp_token")
+        if not token:
+            return
+        media = await _download_wa_media(media_id, token)
+        if not media:
+            return
+        image_bytes, mime = media
+        receipt = await _claude_extract_receipt(image_bytes, mime or mime_type)
+        if not receipt:
+            return
+
+        # Persist the parsed receipt on the message
+        await db.crm_messages.update_one(
+            {"id": message_id},
+            {"$set": {
+                "receipt_data": receipt,
+                "receipt_parsed_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+
+        if not receipt.get("is_receipt") or not receipt.get("amount"):
+            return
+
+        # Look for MP payment match
+        lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
+        if not lead:
+            return
+        payment = await _match_receipt_to_mp_payment(lead, line, receipt)
+        if payment:
+            await _auto_assign_and_notify(payment, lead, source="receipt_ocr")
+    except Exception as e:
+        logger.error(f"Receipt OCR process failed for msg {message_id}: {e}")
+
+
 # ─── Router registration (MUST be after all @api_router decorators) ──
 app.include_router(api_router)
 
@@ -12684,3 +13690,9 @@ app.include_router(api_router)
 @app.on_event("shutdown")
 async def shutdown():
     client.close()
+    global _META_HTTP_CLIENT
+    if _META_HTTP_CLIENT is not None and not _META_HTTP_CLIENT.is_closed:
+        try:
+            await _META_HTTP_CLIENT.aclose()
+        except Exception:
+            pass
