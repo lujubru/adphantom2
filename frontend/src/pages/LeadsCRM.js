@@ -23,6 +23,7 @@ import { ChatListItem } from './leads-crm/ChatListItem';
 import { TagsManagerModal, TagChipList } from './leads-crm/LeadTags';
 import { SidebarNav } from './leads-crm/SidebarNav';
 import { LeadAvatar } from './leads-crm/LeadAvatar';
+import { MPInboxModal, useMPInbox } from './leads-crm/MPInbox';
 
 // ─── Funnel (admin only) ───────────────────────────────────────────
 
@@ -853,6 +854,50 @@ const LineNotesField = ({ line, onSaved }) => {
 };
 
 
+const ReceiptOCRToggle = ({ line, onSaved }) => {
+  const [enabled, setEnabled] = React.useState(!!line.receipt_ocr_enabled);
+  const [saving, setSaving] = React.useState(false);
+  React.useEffect(() => { setEnabled(!!line.receipt_ocr_enabled); }, [line.receipt_ocr_enabled]);
+
+  const toggle = async () => {
+    const next = !enabled;
+    setEnabled(next);
+    setSaving(true);
+    try {
+      await api.put(`/crm/lines/${line.id}`, { receipt_ocr_enabled: next });
+      toast.success(next ? 'OCR de comprobantes activado 🤖' : 'OCR desactivado');
+      onSaved?.();
+    } catch (err) {
+      setEnabled(!next);
+      toast.error(err?.response?.data?.detail || 'Error guardando');
+    } finally { setSaving(false); }
+  };
+
+  return (
+    <div className="mt-2.5" data-testid={`line-ocr-${line.id}`}>
+      <label className="flex items-start gap-2 cursor-pointer group">
+        <input
+          type="checkbox"
+          checked={enabled}
+          disabled={saving}
+          onChange={toggle}
+          className="mt-0.5 accent-emerald-500"
+          data-testid={`line-ocr-toggle-${line.id}`}
+        />
+        <span className="text-[11px] leading-tight">
+          <span className={`font-semibold ${enabled ? 'text-emerald-300' : 'text-slate-300'}`}>
+            🤖 OCR de comprobantes {enabled && '(activo)'}
+          </span>
+          <span className="block text-[10px] text-slate-500">
+            Claude lee las imágenes que envían los clientes y las cruza con MP
+          </span>
+        </span>
+      </label>
+    </div>
+  );
+};
+
+
 const AdminLinesPanel = ({ lines, leads, onSelectLine, onRefresh, onBroadcast }) => {
   const [showLinesManager, setShowLinesManager] = useState(false);
   // Computamos stats por línea sobre los leads ya cargados (los mismos que
@@ -966,6 +1011,7 @@ const AdminLinesPanel = ({ lines, leads, onSelectLine, onRefresh, onBroadcast })
                     Ver como cajero →
                   </Button>
 
+                  <ReceiptOCRToggle line={line} onSaved={onRefresh} />
                   <LineNotesField line={line} onSaved={onRefresh} />
                 </div>
               );
@@ -1019,6 +1065,10 @@ export default function LeadsCRM() {
   const [tagsModalOpen, setTagsModalOpen] = useState(false);
   const [tagFilter, setTagFilter] = useState('all'); // tag_id or 'all'
   const [tagFilterOptions, setTagFilterOptions] = useState([]);
+
+  // ── Mercado Pago inbox ────────────────────────────────────────
+  const [mpInboxOpen, setMpInboxOpen] = useState(false);
+  const mpInbox = useMPInbox({ enabled: !!currentUser });
 
   useEffect(() => {
     if ('serviceWorker' in navigator) {
@@ -1604,6 +1654,9 @@ export default function LeadsCRM() {
             onInstall={installPWA}
             onBroadcast={() => setBroadcastOpen(true)}
             onTagsOpen={() => setTagsModalOpen(true)}
+            onMPInboxOpen={() => setMpInboxOpen(true)}
+            mpInboxUnread={mpInbox.data?.unread || 0}
+            mpInboxTotalPending={mpInbox.data?.total_pending || 0}
             onRefresh={loadLeads}
             onContactsExport={isAdmin ? () => setExportModalOpen(true) : undefined}
             unreadCount={leads.filter(l => (l.unread_count > 0 || l.has_unread_messages) && selectedLead?.id !== l.id).length}
@@ -1946,6 +1999,12 @@ export default function LeadsCRM() {
           }
           defaultLineId={selectedLineId || adminViewAsLineId}
         />
+        <MPInboxModal
+          open={mpInboxOpen}
+          onClose={() => setMpInboxOpen(false)}
+          currentLead={selectedLead}
+          onAssigned={() => { mpInbox.refresh(); }}
+        />
         </div>
       </div>
     );
@@ -2078,6 +2137,12 @@ export default function LeadsCRM() {
         onClose={() => setTagsModalOpen(false)}
         lines={lines}
         defaultLineId={selectedLineId || adminViewAsLineId}
+      />
+      <MPInboxModal
+        open={mpInboxOpen}
+        onClose={() => setMpInboxOpen(false)}
+        currentLead={selectedLead}
+        onAssigned={() => { mpInbox.refresh(); }}
       />
     </div>
   );

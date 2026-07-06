@@ -12,6 +12,7 @@ import api from '@/utils/api';
 import { STATUS_CONFIG } from './constants';
 import { StatusSelector } from './StatusSelector';
 import { ChatMessage } from './ChatMessage';
+import { ChatMessageBoundary } from './ChatMessageBoundary';
 import { AdPreviewCard } from './AdPreviewCard';
 import { LeadTagsBar } from './LeadTags';
 import { LeadAvatar } from './LeadAvatar';
@@ -176,18 +177,40 @@ export const ChatPanel = ({
     }
   }, [messages, lead.id, scrollToBottom]);
 
-  const sendMessage = async (sender = 'admin') => {
+  const sendMessage = async (sender = 'admin', options = {}) => {
     if (!newMessage.trim()) return;
     setSending(true);
     try {
-      await api.post(`/crm/leads/${lead.id}/messages`, { content: newMessage, sender });
+      await api.post(`/crm/leads/${lead.id}/messages`, {
+        content: newMessage,
+        sender,
+        force: !!options.force,
+      });
       setNewMessage('');
       // Force scroll-to-bottom: if the cajero just sent something, they
       // expect to see it land at the bottom even if they were scrolled up.
       isNearBottomRef.current = true;
       setIsNearBottom(true);
       loadMessages();
-    } catch { toast.error('Error enviando mensaje'); }
+    } catch (err) {
+      const status = err?.response?.status;
+      const detail = err?.response?.data?.detail;
+      // 24hr window closed → clear actionable warning
+      if (status === 409 && detail && typeof detail === 'object' && detail.code === 'outside_24h_window') {
+        toast.error(
+          `⚠️ ${detail.message}`,
+          {
+            duration: 12000,
+            action: {
+              label: 'Forzar envío',
+              onClick: () => sendMessage(sender, { force: true }),
+            },
+          }
+        );
+      } else {
+        toast.error(typeof detail === 'string' ? detail : 'Error enviando mensaje');
+      }
+    }
     finally {
       setSending(false);
       // Refocus the textarea AFTER the disabled flag is cleared so the
@@ -260,7 +283,7 @@ export const ChatPanel = ({
     imgs.reduce((p, f) => p.then(() => sendImage(f)), Promise.resolve());
   };
 
-  const sendImage = async (file) => {
+  const sendImage = async (file, opts = {}) => {
     if (!file) return;
     if (file.size > 10 * 1024 * 1024) {
       toast.error('La imagen supera los 10 MB');
@@ -270,6 +293,7 @@ export const ChatPanel = ({
     const form = new FormData();
     form.append('file', file);
     if (newMessage.trim()) form.append('caption', newMessage.trim());
+    if (opts.force) form.append('force', 'true');
     try {
       await api.post(`/crm/leads/${lead.id}/messages/image`, form, {
         headers: { 'Content-Type': 'multipart/form-data' }
@@ -278,8 +302,23 @@ export const ChatPanel = ({
       toast.success('Imagen enviada');
       loadMessages();
     } catch (err) {
-      const detail = err?.response?.data?.detail || 'Error enviando imagen';
-      toast.error(typeof detail === 'string' ? detail : 'Error enviando imagen');
+      const status = err?.response?.status;
+      const detail = err?.response?.data?.detail;
+      // 24hr window closed → clear actionable warning (same as text)
+      if (status === 409 && detail && typeof detail === 'object' && detail.code === 'outside_24h_window') {
+        toast.error(
+          `⚠️ ${detail.message}`,
+          {
+            duration: 12000,
+            action: {
+              label: 'Forzar envío',
+              onClick: () => sendImage(file, { force: true }),
+            },
+          }
+        );
+      } else {
+        toast.error(typeof detail === 'string' ? detail : 'Error enviando imagen');
+      }
     } finally {
       setSending(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -313,15 +352,14 @@ export const ChatPanel = ({
     const form = new FormData();
     form.append('file', file);
     try {
-      const { data } = await api.post(`/crm/leads/${lead.id}/messages/audio`, form, {
+      // Audio send is now async on the backend (same pattern as text/image):
+      // it inserts the message with delivery_status='sending' and returns
+      // right away. Actual WhatsApp send happens in a background task and
+      // polling updates the delivery_status pill.
+      await api.post(`/crm/leads/${lead.id}/messages/audio`, form, {
         headers: { 'Content-Type': 'multipart/form-data' }
       });
-      if (data && data.whatsapp_sent === false) {
-        const waErr = data.whatsapp_result?.error?.message || JSON.stringify(data.whatsapp_result || {});
-        toast.error(`Audio guardado, pero WhatsApp lo rechazó: ${waErr}`);
-      } else {
-        toast.success('Audio enviado');
-      }
+      toast.success('Audio enviado');
       loadMessages();
     } catch (err) {
       const detail = err?.response?.data?.detail || 'Error enviando audio';
@@ -832,7 +870,11 @@ Le envio nuestros datos de cuenta 👇`;
               <MessageCircle className="w-8 h-8 mb-2 opacity-20" />
               <p className="text-xs">Sin mensajes aún</p>
             </div>
-          ) : messages.map(msg => <ChatMessage key={msg.id} message={msg} />)}
+          ) : messages.map(msg => (
+            <ChatMessageBoundary key={msg.id} messageId={msg.id}>
+              <ChatMessage message={msg} />
+            </ChatMessageBoundary>
+          ))}
           <div ref={messagesEndRef} />
         </div>
 

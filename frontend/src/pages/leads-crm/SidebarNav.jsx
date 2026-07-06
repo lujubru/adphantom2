@@ -2,7 +2,7 @@ import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   BarChart3, RefreshCw, Radio, LogOut, Download, Bell, BellOff,
-  Volume2, VolumeX, Tag as TagIcon, Home, Sun, Moon, DownloadCloud,
+  Volume2, VolumeX, Tag as TagIcon, Home, Sun, Moon, DownloadCloud, DollarSign,
 } from 'lucide-react';
 
 /**
@@ -58,6 +58,9 @@ export const SidebarNav = ({
   onInstall,
   onBroadcast,
   onTagsOpen,
+  onMPInboxOpen,
+  mpInboxUnread = 0,
+  mpInboxTotalPending = 0,
   onRefresh,
   onContactsExport,
   unreadCount = 0,
@@ -115,6 +118,24 @@ export const SidebarNav = ({
           label="Gestionar etiquetas"
           onClick={onTagsOpen}
           testId="sidebar-tags"
+          accent
+        />
+      )}
+
+      {onMPInboxOpen && (
+        <IconButton
+          icon={DollarSign}
+          label={
+            mpInboxUnread > 0
+              ? `${mpInboxUnread} pago${mpInboxUnread === 1 ? '' : 's'} nuevo${mpInboxUnread === 1 ? '' : 's'} de Mercado Pago`
+              : mpInboxTotalPending > 0
+                ? `${mpInboxTotalPending} pago${mpInboxTotalPending === 1 ? '' : 's'} sin asignar`
+                : 'Pagos Mercado Pago'
+          }
+          onClick={onMPInboxOpen}
+          testId="sidebar-mp-inbox"
+          badge={mpInboxUnread || mpInboxTotalPending}
+          active={mpInboxUnread > 0}
           accent
         />
       )}

@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { RefreshCw } from 'lucide-react';
+import { RefreshCw, AlertTriangle, Sparkles, CheckCircle2 } from 'lucide-react';
 import api from '@/utils/api';
 import { BACKEND_URL } from './constants';
 import { formatTime } from './utils';
 import { ImageLightbox } from './ImageLightbox';
 
 export const ChatMessage = ({ message }) => {
+  const isSystem = message.sender === 'system';
   const isAdmin = message.sender === 'admin';
   const [imgSrc, setImgSrc] = useState(null);
   const [loadingImg, setLoadingImg] = useState(false);
@@ -81,6 +82,17 @@ export const ChatMessage = ({ message }) => {
       {lightboxOpen && imgSrc && (
         <ImageLightbox src={imgSrc} onClose={() => setLightboxOpen(false)} />
       )}
+      {isSystem ? (
+        <div className="flex justify-center my-2" data-testid={`msg-system-${message.id}`}>
+          <div className="max-w-[85%] px-3 py-2 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-200 text-xs">
+            <div className="flex items-start gap-2">
+              <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5 text-emerald-400" />
+              <div className="whitespace-pre-wrap break-words">{displayContent}</div>
+            </div>
+            <p className="text-[9px] text-emerald-500/60 mt-1">{formatTime(message.created_at)}</p>
+          </div>
+        </div>
+      ) : (
       <div className={`flex ${isAdmin ? 'justify-end' : 'justify-start'}`}>
         <div className={`max-w-[75%] px-3 py-2 rounded-2xl text-sm shadow-sm ${isAdmin ? 'bg-emerald-600 text-white rounded-br-sm' : 'bg-slate-700 text-slate-100 rounded-bl-sm'}`}>
           {message.message_type === 'image' ? (
@@ -138,9 +150,70 @@ export const ChatMessage = ({ message }) => {
           <p className={`text-[10px] mt-1 ${isAdmin ? 'text-emerald-200/60 text-right' : 'text-slate-400'}`}>
             {message.sender_name && <span>{message.sender_name} · </span>}
             {formatTime(message.created_at)}
+            {isAdmin && message.delivery_status === 'failed' && (
+              <span
+                className="ml-1 inline-flex items-center gap-0.5 text-red-300 font-semibold"
+                title={`No entregado${message.delivery_error_title ? ': ' + message.delivery_error_title : ''}${message.delivery_error_code ? ' (code ' + message.delivery_error_code + ')' : ''}`}
+                data-testid={`msg-failed-${message.id}`}
+              >
+                <AlertTriangle className="w-2.5 h-2.5" /> no entregado
+              </span>
+            )}
+            {isAdmin && message.delivery_status === 'sending' && (
+              <span className="ml-1 opacity-60" title="Enviando…">⏳</span>
+            )}
+            {isAdmin && message.delivery_status === 'sent' && !message.delivery_status_seen && (
+              <span className="ml-1 opacity-70" title="Enviado">✓</span>
+            )}
+            {isAdmin && message.delivery_status === 'read' && <span className="ml-1 text-sky-300" title="Leído">✓✓</span>}
+            {isAdmin && message.delivery_status === 'delivered' && <span className="ml-1" title="Entregado">✓✓</span>}
           </p>
+          {/* Claude OCR extracted receipt data (only on inbound images) */}
+          {!isAdmin && message.receipt_data && message.receipt_data.is_receipt && (() => {
+            // Defensive: Claude Vision occasionally returns nested objects for
+            // sender_name/bank/etc. Rendering an object directly crashes React
+            // ("Objects are not valid as a React child") and blanks the whole
+            // chat. Coerce every rendered field to a plain string.
+            const rd = message.receipt_data || {};
+            const asText = (v) => {
+              if (v == null) return '';
+              if (typeof v === 'string' || typeof v === 'number') return String(v);
+              try { return JSON.stringify(v); } catch { return ''; }
+            };
+            const amountNum = Number(rd.amount);
+            const amountValid = rd.amount != null && Number.isFinite(amountNum);
+            const senderName = asText(rd.sender_name);
+            const bankName = asText(rd.bank);
+            const confidencePct = typeof rd.confidence === 'number' && Number.isFinite(rd.confidence)
+              ? Math.round(rd.confidence * 100)
+              : null;
+            return (
+              <div
+                className="mt-1.5 flex items-start gap-1.5 rounded-md bg-black/25 px-2 py-1.5"
+                data-testid={`receipt-ocr-${message.id}`}
+              >
+                <Sparkles className="w-3 h-3 shrink-0 mt-0.5 text-amber-300" />
+                <div className="text-[10px] leading-tight">
+                  <div className="font-semibold text-amber-200">
+                    🤖 Claude leyó el comprobante
+                    {confidencePct != null && (
+                      <span className="ml-1 opacity-60">{confidencePct}%</span>
+                    )}
+                  </div>
+                  <div className="text-slate-200/90 space-y-0.5">
+                    {amountValid && (
+                      <div>💰 <strong>${amountNum.toLocaleString('es-AR')}</strong></div>
+                    )}
+                    {senderName && <div>👤 {senderName}</div>}
+                    {bankName && <div>🏦 {bankName}</div>}
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
         </div>
       </div>
+      )}
     </>
   );
 };
