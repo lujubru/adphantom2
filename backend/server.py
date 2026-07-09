@@ -8,7 +8,7 @@ import logging
 import asyncio
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone, timedelta
 from passlib.context import CryptContext
@@ -371,6 +371,8 @@ async def get_me(current_user=Depends(get_current_user)):
         "derivation_numbers": current_user.get("derivation_numbers", []),
         "cbu_list": current_user.get("cbu_list", []),
         "broadcast_monthly_quota": int(current_user.get("broadcast_monthly_quota", 0) or 0),
+        "quick_templates": current_user.get("quick_templates", {}) or {},
+        "ai_config": _merged_ai_config_for_response(current_user),
     }
 
 
@@ -401,6 +403,11 @@ class MyMessagesUpdate(BaseModel):
     derivation_message: Optional[str] = None
     derivation_numbers: Optional[List[str]] = None
     cbu_list: Optional[List[Dict]] = None
+    quick_templates: Optional[Dict[str, str]] = None
+    # Per-cashier AI-assistant config. See ai_agent.DEFAULT_AI_CONFIG for the
+    # allowed keys and defaults. When enabled=true the AI classifies every
+    # inbound message and auto-responds according to the intent flow.
+    ai_config: Optional[Dict[str, Any]] = None
 
 
 @api_router.put("/auth/me/messages")
@@ -417,6 +424,65 @@ async def update_my_messages(payload: MyMessagesUpdate, current_user=Depends(get
             update_data[k] = _sanitize_cbu_list(v)
         elif k == "auto_welcome_enabled":
             update_data[k] = bool(v) if v is not None else True
+        elif k == "quick_templates" and v is not None:
+            # Sanitize: keep only string keys → string values. Trim strings.
+            # Silently ignore anything else so a bad client can't corrupt the doc.
+            cleaned = {}
+            if isinstance(v, dict):
+                for tk, tv in v.items():
+                    if isinstance(tk, str) and isinstance(tv, str):
+                        cleaned[tk.strip()] = tv.strip()
+            update_data[k] = cleaned
+        elif k == "ai_config" and v is not None:
+            # Sanitize AI config: only allow keys from DEFAULT_AI_CONFIG,
+            # coerce types, and clamp numeric ranges. Anything unknown is
+            # dropped so the cashier can't inject arbitrary fields.
+            import ai_agent as _ai
+            cleaned_ai: dict = {}
+            if isinstance(v, dict):
+                for ck, cv in v.items():
+                    if ck not in _ai.DEFAULT_AI_CONFIG:
+                        continue
+                    default_type = type(_ai.DEFAULT_AI_CONFIG[ck])
+                    try:
+                        if default_type is bool:
+                            cleaned_ai[ck] = bool(cv)
+                        elif default_type is float:
+                            cleaned_ai[ck] = float(cv)
+                        elif default_type is int:
+                            cleaned_ai[ck] = int(cv)
+                        elif default_type is str:
+                            cleaned_ai[ck] = str(cv)[:2000]
+                        else:
+                            cleaned_ai[ck] = cv
+                    except Exception:
+                        cleaned_ai[ck] = _ai.DEFAULT_AI_CONFIG[ck]
+                # Clamp
+                for fld in ("min_deposit", "max_deposit", "min_withdrawal", "max_withdrawal"):
+                    if fld in cleaned_ai:
+                        cleaned_ai[fld] = max(0.0, float(cleaned_ai[fld]))
+                if "context_msgs" in cleaned_ai:
+                    cleaned_ai["context_msgs"] = max(3, min(40, int(cleaned_ai["context_msgs"])))
+                if "confidence_threshold" in cleaned_ai:
+                    cleaned_ai["confidence_threshold"] = max(0.0, min(1.0, float(cleaned_ai["confidence_threshold"])))
+                # platforms: coerce to list[str]. Accept either a list (one
+                # per line) or a comma-separated string. Split any item that
+                # still contains commas so a single "foo,bar,baz" line becomes
+                # three separate platforms. Max 20 items, 60 chars each.
+                if "platforms" in cleaned_ai:
+                    raw = cleaned_ai["platforms"]
+                    if isinstance(raw, str):
+                        raw = [raw]
+                    if not isinstance(raw, list):
+                        raw = []
+                    _out: list = []
+                    for item in raw:
+                        for piece in str(item).split(","):
+                            piece = piece.strip()[:60]
+                            if piece:
+                                _out.append(piece)
+                    cleaned_ai["platforms"] = _out[:20]
+            update_data[k] = cleaned_ai
         elif v is not None:
             update_data[k] = v
     if update_data:
@@ -431,6 +497,8 @@ async def update_my_messages(payload: MyMessagesUpdate, current_user=Depends(get
         "derivation_message": refreshed.get("derivation_message", ""),
         "derivation_numbers": refreshed.get("derivation_numbers", []),
         "cbu_list": refreshed.get("cbu_list", []),
+        "quick_templates": refreshed.get("quick_templates", {}) or {},
+        "ai_config": _merged_ai_config_for_response(refreshed),
     }
 
 
@@ -2954,6 +3022,19 @@ async def wa_webhook_receive(request: Request):
                     if not crm_lead:
                         # Create new lead in CRM (one per line)
                         lead_id = str(uuid.uuid4())
+                        # Resolve the "webhook" auto-tag to a real crm_tags UUID
+                        # for this line (auto-creating on first hit). Storing
+                        # raw strings here used to break the tag editor with
+                        # "Etiquetas inexistentes: [...]" the moment a cashier
+                        # tried to add another tag.
+                        webhook_tag_ids: List[str] = []
+                        if target_line_id:
+                            try:
+                                _wt = await _resolve_or_create_tag("webhook", target_line_id)
+                                if _wt and _wt.get("id"):
+                                    webhook_tag_ids.append(_wt["id"])
+                            except Exception as _e:
+                                logger.warning(f"tags: could not auto-create 'webhook' tag: {_e}")
                         crm_lead = {
                             "id": lead_id,
                             "name": sender_name or f"Lead {from_phone[-4:]}",
@@ -2969,7 +3050,7 @@ async def wa_webhook_receive(request: Request):
                                 "display_phone": display_phone,
                             },
                             "notes": "",
-                            "tags": ["webhook"],
+                            "tags": webhook_tag_ids,
                             "created_at": now,
                             "updated_at": now,
                             "last_interaction": now,
@@ -5479,6 +5560,68 @@ class CRMLeadTagsUpdate(BaseModel):
     tag_ids: List[str]
 
 
+# Deterministic UUID regex to distinguish a real tag UUID from a legacy name.
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+async def _resolve_or_create_tag(name_or_id: str, line_id: str) -> Optional[dict]:
+    """Look up (or auto-create) a `crm_tags` doc for a given identifier.
+
+    The lead-tagging system stores tag UUIDs in `crm_leads.tags`. However,
+    for legacy reasons the WhatsApp webhook code has been (and is being)
+    writing raw string names like ``["webhook", "<line-name>"]`` into that
+    field on new leads. Also, external integrations / imports may push
+    names instead of UUIDs. To make the system self-healing and to
+    honour the user's mental model ("tags are internal CRM data"), we
+    accept BOTH shapes on any endpoint that receives tag ids:
+
+    * If the value is a UUID → we look it up as-is.
+    * If the value is a name → we look up (line_id, name) and CREATE the
+      canonical `crm_tags` doc if it doesn't exist yet.
+
+    Returns the tag document (with 'id' field), or None if input is empty.
+    """
+    if not name_or_id:
+        return None
+    raw = name_or_id.strip()
+    if not raw:
+        return None
+
+    # 1) UUID path — look up by id.
+    if _UUID_RE.match(raw):
+        return await db.crm_tags.find_one({"id": raw}, {"_id": 0})
+
+    # 2) Name path — look up by (line_id, name) then create.
+    if not line_id:
+        return None
+    existing = await db.crm_tags.find_one({"line_id": line_id, "name": raw}, {"_id": 0})
+    if existing:
+        return existing
+
+    now = datetime.now(timezone.utc).isoformat()
+    # Pick a stable color deterministically from the name so re-imports
+    # produce the same colour instead of a random one each time.
+    color = TAG_DEFAULT_COLORS[abs(hash(raw)) % len(TAG_DEFAULT_COLORS)]
+    new_tag = {
+        "id": str(uuid.uuid4()),
+        "line_id": line_id,
+        "name": raw[:40],  # respect existing name length cap
+        "color": color,
+        "created_at": now,
+        "updated_at": now,
+        "auto_created": True,  # marker so we know this came from legacy migration
+    }
+    try:
+        await db.crm_tags.insert_one(new_tag)
+    except Exception:
+        # In case of a race with another concurrent insert, fetch what's there
+        existing = await db.crm_tags.find_one({"line_id": line_id, "name": raw}, {"_id": 0})
+        if existing:
+            return existing
+        raise
+    return new_tag
+
+
 @api_router.get("/crm/tags")
 async def crm_list_tags(
     line_id: Optional[str] = None,
@@ -5599,9 +5742,14 @@ async def crm_set_lead_tags(
 ):
     """Set the list of tags assigned to a lead (replaces existing).
 
+    Accepts BOTH UUIDs (existing tags) and plain names (auto-creates a
+    canonical `crm_tags` doc for that line). This makes the endpoint
+    resilient to legacy data (webhook code used to push raw strings) and
+    to future imports that might not know the tag UUIDs.
+
     Validations:
       - Max TAG_MAX_PER_LEAD tag IDs.
-      - Every tag_id must exist and belong to the same line as the lead.
+      - Every resolved tag must belong to the same line as the lead.
       - Cajero must have access to the lead's line.
     """
     lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
@@ -5610,35 +5758,76 @@ async def crm_set_lead_tags(
     if not _user_can_use_line(current_user, lead.get("line_id")):
         raise HTTPException(status_code=403, detail="Sin acceso a este lead")
 
-    # Deduplicate while preserving order
+    line_id = lead.get("line_id")
+
+    # Deduplicate raw inputs (names/ids) while preserving order.
     seen = set()
-    tag_ids: List[str] = []
+    raw_inputs: List[str] = []
     for tid in (data.tag_ids or []):
-        if tid and tid not in seen:
-            seen.add(tid)
-            tag_ids.append(tid)
+        if not tid:
+            continue
+        key = str(tid).strip()
+        if key and key not in seen:
+            seen.add(key)
+            raw_inputs.append(key)
 
-    if len(tag_ids) > TAG_MAX_PER_LEAD:
+    # Resolve each input to a real tag doc (auto-creating name-based ones).
+    resolved_ids: List[str] = []
+    for raw in raw_inputs:
+        tag = await _resolve_or_create_tag(raw, line_id)
+        if not tag:
+            # UUID that doesn't exist (was deleted?) → skip silently instead
+            # of crashing the whole request. Alternatively raise 400 here.
+            logger.info(f"tags: dropping unknown tag reference {raw!r} on lead {lead_id}")
+            continue
+        if tag.get("line_id") != line_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"La etiqueta '{tag.get('name')}' pertenece a otra línea",
+            )
+        if tag["id"] not in resolved_ids:
+            resolved_ids.append(tag["id"])
+
+    if len(resolved_ids) > TAG_MAX_PER_LEAD:
         raise HTTPException(status_code=400, detail=f"Máximo {TAG_MAX_PER_LEAD} etiquetas por lead")
-
-    if tag_ids:
-        line_id = lead.get("line_id")
-        found = await db.crm_tags.find({"id": {"$in": tag_ids}}, {"_id": 0, "id": 1, "line_id": 1}).to_list(len(tag_ids))
-        found_ids = {t["id"] for t in found}
-        missing = [t for t in tag_ids if t not in found_ids]
-        if missing:
-            raise HTTPException(status_code=400, detail=f"Etiquetas inexistentes: {missing}")
-        bad_line = [t["id"] for t in found if t.get("line_id") != line_id]
-        if bad_line:
-            raise HTTPException(status_code=400, detail="Alguna etiqueta no pertenece a la línea del lead")
 
     now = datetime.now(timezone.utc).isoformat()
     await db.crm_leads.update_one(
         {"id": lead_id},
-        {"$set": {"tags": tag_ids, "tags_updated_at": now, "updated_at": now}},
+        {"$set": {"tags": resolved_ids, "tags_updated_at": now, "updated_at": now}},
     )
     updated = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
-    return {"lead_id": lead_id, "tags": tag_ids, "lead": updated}
+    return {"lead_id": lead_id, "tags": resolved_ids, "lead": updated}
+
+
+class CRMLeadAIPauseUpdate(BaseModel):
+    paused: bool
+
+
+@api_router.patch("/crm/leads/{lead_id}/ai-pause")
+async def crm_toggle_ai_pause(
+    lead_id: str,
+    data: CRMLeadAIPauseUpdate,
+    current_user=Depends(get_current_user),
+):
+    """Pause (or resume) the AI auto-responder for a specific lead.
+
+    Useful when the cajero wants to jump into the conversation manually
+    without the AI stepping on their toes. The AI still runs the
+    classifier and updates tags on inbound messages, but stops sending
+    outbound auto-replies until the cajero un-pauses.
+    """
+    lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead no encontrado")
+    if not _user_can_use_line(current_user, lead.get("line_id")):
+        raise HTTPException(status_code=403, detail="Sin acceso a este lead")
+    now = datetime.now(timezone.utc).isoformat()
+    await db.crm_leads.update_one(
+        {"id": lead_id},
+        {"$set": {"ai_paused": bool(data.paused), "ai_paused_updated_at": now, "updated_at": now}},
+    )
+    return {"lead_id": lead_id, "ai_paused": bool(data.paused)}
 
 
 # ─── CRM Line-specific Webhook ─────────────────────────────────────
@@ -5990,6 +6179,19 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                     if not crm_lead:
                         # Create new lead
                         lead_id = str(uuid.uuid4())
+                        # Auto-resolve "webhook" + line name to real crm_tags UUIDs
+                        # so the tag editor works right away for cajeros. See
+                        # _resolve_or_create_tag docstring for the "why".
+                        _wh_tag_ids: List[str] = []
+                        try:
+                            _wt = await _resolve_or_create_tag("webhook", line_id)
+                            if _wt and _wt.get("id"):
+                                _wh_tag_ids.append(_wt["id"])
+                            _ln_tag = await _resolve_or_create_tag(line.get("name") or "", line_id)
+                            if _ln_tag and _ln_tag.get("id") and _ln_tag["id"] not in _wh_tag_ids:
+                                _wh_tag_ids.append(_ln_tag["id"])
+                        except Exception as _e:
+                            logger.warning(f"tags: could not auto-create webhook tags: {_e}")
                         crm_lead = {
                             "id": lead_id,
                             "name": sender_name or f"Lead {from_phone[-4:]}",
@@ -6011,7 +6213,7 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                                 "display_phone": display_phone,
                             },
                             "notes": "",
-                            "tags": ["webhook", line["name"]],
+                            "tags": _wh_tag_ids,
                             "created_at": now,
                             "updated_at": now,
                             "last_interaction": now,
@@ -6132,6 +6334,17 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                             mime_type=mime_type or "image/jpeg",
                             line=line,
                         ))
+
+                    # ── AI Agent auto-responder ──────────────────────
+                    # Runs per-cajero when they've enabled AI in Mi Config.
+                    # Classifies intent, tags the lead, and replies with
+                    # scripted+rotated messages. See ai_agent.py.
+                    try:
+                        _asyncio.create_task(_run_ai_agent_on_inbound(
+                            lead_id=lead_id, line=line, newest_message=crm_message
+                        ))
+                    except Exception as _ai_e:
+                        logger.warning(f"AI agent kick-off failed: {_ai_e}")
 
     except Exception as e:
         logger.error(f"CRM Line webhook error: {e}")
@@ -7526,6 +7739,124 @@ async def crm_send_message(
         "contact_event_sent": meta_result is not None,
         "meta_result": meta_result
         }
+
+
+# ─── CRM Send Quick Template (rotating pre-authored responses) ────
+
+@api_router.post("/crm/leads/{lead_id}/messages/quick/{template_key}")
+async def crm_send_quick_template(
+    lead_id: str,
+    template_key: str,
+    force: bool = False,
+    current_user=Depends(get_current_user),
+):
+    """Send a rotated variant of a pre-authored template as an admin text.
+
+    The cashier configures up to N variants per template key (e.g. "cargado")
+    from Mi Configuración, separated by lines containing only '---'. On
+    each button press we pick a random variant using `_pick_welcome_variation`
+    so Meta does NOT see the same byte-for-byte content going out to many
+    contacts (which is one of the top signals that flags "principal" lines
+    and gets them rate-limited or restricted).
+
+    The message is inserted with delivery_status='sending' and the actual
+    WhatsApp send happens in the same background task as manual text
+    messages — identical delivery guarantees + retry semantics.
+    """
+    lead = await db.crm_leads.find_one({"id": lead_id})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead no encontrado")
+
+    templates = (current_user.get("quick_templates") or {})
+    raw = (templates.get(template_key) or "").strip()
+    if not raw:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No tenés variantes configuradas para '{template_key}'. "
+                f"Andá a Mi Configuración → Respuestas rápidas y armá al menos una."
+            ),
+        )
+
+    picked = _pick_welcome_variation(raw)
+    if not picked or not picked.strip():
+        raise HTTPException(status_code=400, detail="La variante seleccionada quedó vacía")
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    # 24h window check — same rules as regular text send.
+    if not force:
+        last_inbound = await db.crm_messages.find_one(
+            {"lead_id": lead_id, "sender": "lead"},
+            {"_id": 0, "created_at": 1},
+            sort=[("created_at", -1)],
+        )
+        if last_inbound and last_inbound.get("created_at"):
+            try:
+                last_ts = datetime.fromisoformat(last_inbound["created_at"].replace("Z", "+00:00"))
+                hours_since = (datetime.now(timezone.utc) - last_ts).total_seconds() / 3600.0
+                if hours_since >= 23.5:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "outside_24h_window",
+                            "message": (
+                                f"Ventana de 24hs cerrada (última respuesta del cliente hace "
+                                f"{round(hours_since, 1)}h). WhatsApp NO entrega este mensaje."
+                            ),
+                            "hours_since_last_inbound": round(hours_since, 1),
+                            "last_inbound_at": last_inbound["created_at"],
+                        },
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning(f"24h window check parse error (quick): {e}")
+
+    message_id = str(uuid.uuid4())
+    message = {
+        "id": message_id,
+        "lead_id": lead_id,
+        "content": picked,
+        "sender": "admin",
+        "created_at": now,
+        "wa_result": None,
+        "wa_message_id": None,
+        "delivery_status": "sending",
+        "quick_template_key": template_key,  # for analytics: which template was used
+    }
+    await db.crm_messages.insert_one(message)
+
+    if lead.get("line_id") and lead.get("phone"):
+        line = await db.crm_lines.find_one({"id": lead["line_id"]}, {"_id": 0})
+        if line and line.get("whatsapp_token") and line.get("phone_number_id"):
+            _spawn_bg(_send_crm_message_to_wa_async(
+                message_id=message_id,
+                phone=lead["phone"],
+                content=picked,
+                token=line["whatsapp_token"],
+                phone_id=line["phone_number_id"],
+                line_name=line.get("name"),
+            ))
+        else:
+            await db.crm_messages.update_one(
+                {"id": message_id},
+                {"$set": {"delivery_status": "error", "delivery_error_title": "Línea sin token/phone_number_id"}},
+            )
+    else:
+        await db.crm_messages.update_one(
+            {"id": message_id},
+            {"$set": {"delivery_status": "error", "delivery_error_title": "Lead sin línea o teléfono"}},
+        )
+
+    await db.crm_leads.update_one(
+        {"id": lead_id},
+        {"$set": {"last_interaction": now, "updated_at": now}, "$inc": {"messages_count": 1}},
+    )
+
+    message.pop("_id", None)
+    return {"message": message, "picked_variant": picked}
+
 
 # ─── CRM Send Image Message ────────────────────────────────────────
 
@@ -13363,24 +13694,312 @@ MP_MATCH_WINDOW_HOURS = 24
 MP_MATCH_AMOUNT_TOLERANCE = 1.0  # ARS
 
 
+# ── AI Agent glue ────────────────────────────────────────────────
+try:
+    import ai_agent  # noqa: E402
+except Exception as _e:
+    ai_agent = None
+    logger.warning(f"ai_agent module not available: {_e}")
+
+
+def _merged_ai_config_for_response(user_doc: Optional[dict]) -> dict:
+    """Merge stored ai_config over defaults so /auth/me always returns a
+    complete, well-typed object even for cajeros who haven't opened the
+    config screen yet."""
+    if ai_agent is None:
+        return {}
+    try:
+        return ai_agent.merged_ai_config(user_doc or {})
+    except Exception:
+        return {}
+
+
+async def _find_user_for_line(line_id: str) -> Optional[dict]:
+    """Return the FIRST user (cajero) that owns/uses a given line id.
+    Used to look up the AI config for an inbound message. If no user has
+    the line explicitly, fall back to the admin. AI stays off if the
+    matched user did not enable it."""
+    if not line_id:
+        return None
+    u = await db.users.find_one({"line_ids": line_id}, {"_id": 0, "hashed_password": 0})
+    if u:
+        return u
+    return await db.users.find_one({"role": "admin"}, {"_id": 0, "hashed_password": 0})
+
+
+async def _add_tag_names_to_lead(lead_id: str, line_id: str, tag_names: list):
+    """Attach the given tag names to the lead's `tags` array (auto-creating
+    each in crm_tags if missing). Respects the TAG_MAX_PER_LEAD cap.
+    """
+    if not tag_names:
+        return
+    try:
+        lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0, "tags": 1})
+        if not lead:
+            return
+        current = list(lead.get("tags") or [])
+        for name in tag_names:
+            tag = await _resolve_or_create_tag(name, line_id)
+            if tag and tag.get("id") and tag["id"] not in current:
+                current.append(tag["id"])
+        current = current[:TAG_MAX_PER_LEAD]
+        now = datetime.now(timezone.utc).isoformat()
+        await db.crm_leads.update_one(
+            {"id": lead_id},
+            {"$set": {"tags": current, "tags_updated_at": now, "updated_at": now}},
+        )
+    except Exception as e:
+        logger.warning(f"_add_tag_names_to_lead failed for {lead_id}: {e}")
+
+
+async def _run_ai_agent_on_inbound(lead_id: str, line: dict, newest_message: dict):
+    """Background task: run intent classifier + auto-response for the newest
+    inbound message on a lead, IF the receiving cashier has AI enabled and
+    the lead is not manually paused.
+
+    This is fire-and-forget from the webhook path so message ingestion is
+    never blocked by Claude latency.
+    """
+    logger.info(f"AI: kicked off for lead={lead_id} line={line.get('name')!r}")
+    if ai_agent is None:
+        logger.warning("AI: ai_agent module is None — nothing will run")
+        return
+    try:
+        lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
+        if not lead:
+            logger.info(f"AI: lead {lead_id} not found — skipping")
+            return
+        if lead.get("ai_paused"):
+            logger.info(f"AI: lead {lead_id} is manually paused — skipping")
+            return
+        # Find the cashier that owns this line, load their AI config
+        user_doc = await _find_user_for_line(line.get("id") or lead.get("line_id"))
+        if not user_doc:
+            logger.info(f"AI: no user_doc found for line {line.get('id')} — skipping")
+            return
+        cfg = ai_agent.merged_ai_config(user_doc)
+        if not cfg.get("enabled"):
+            logger.info(
+                f"AI: cajero {user_doc.get('email')!r} does NOT have ai_config.enabled — skipping. "
+                f"cfg.enabled={cfg.get('enabled')!r}"
+            )
+            return
+        logger.info(
+            f"AI: proceeding — cajero={user_doc.get('email')!r} brand={cfg.get('brand_name')!r} "
+            f"cbu_list_len={len(user_doc.get('cbu_list') or [])}"
+        )
+
+        # Only auto-respond within opening hours; otherwise send the
+        # off-hours notice ONCE per lead per day.
+        try:
+            import zoneinfo
+            now_ar = datetime.now(zoneinfo.ZoneInfo("America/Argentina/Buenos_Aires"))
+        except Exception:
+            now_ar = datetime.now(timezone.utc)
+        if not ai_agent.within_opening_hours(cfg, now_ar):
+            state = lead.get("ai_state") or {}
+            today = now_ar.date().isoformat()
+            if state.get("off_hours_notice_sent_on") != today:
+                off_msg = cfg.get("off_hours_message", "").format(
+                    opening=cfg.get("opening_time", "09:00"),
+                    closing=cfg.get("closing_time", "01:00"),
+                )
+                if off_msg:
+                    await _persist_and_send_ai_reply(lead, line, off_msg)
+                new_state = {**state, "off_hours_notice_sent_on": today}
+                await db.crm_leads.update_one({"id": lead_id}, {"$set": {"ai_state": new_state}})
+            return
+
+        # ── Anthropic client ────────────────────────────────────
+        try:
+            import anthropic  # local import — same pattern used by _claude_extract_receipt
+            api_key = user_doc.get("claude_api_key") or CLAUDE_API_KEY
+            if not api_key:
+                logger.warning(
+                    f"AI: no CLAUDE_API_KEY present in env AND user_doc.claude_api_key empty "
+                    f"(env_key_len={len(CLAUDE_API_KEY or '')}, user_key_len={len(user_doc.get('claude_api_key') or '')})"
+                )
+            logger.info(
+                f"AI: initializing anthropic client (api_key_source={'user_doc' if user_doc.get('claude_api_key') else 'env'}, "
+                f"api_key_len={len(api_key or '')}, api_key_prefix={(api_key or '')[:12]!r})"
+            )
+            client_ai = anthropic.Anthropic(api_key=api_key) if api_key else None
+        except Exception as _e:
+            logger.error(f"AI: anthropic client init FAILED with exception: {type(_e).__name__}: {_e}", exc_info=True)
+            client_ai = None
+        if client_ai is None:
+            logger.warning(f"AI: no anthropic client available (CLAUDE_API_KEY missing?); skipping lead {lead_id}")
+            return
+        # emergentintegrations client uses async methods (create); the plain
+        # anthropic SDK uses sync — wrap accordingly.
+        class _AsyncAnthropicShim:
+            def __init__(self, c): self._c = c
+            @property
+            def messages(self): return self
+            async def create(self, **kw):
+                import asyncio as _a
+                return await _a.get_event_loop().run_in_executor(None, lambda: self._c.messages.create(**kw))
+        ac = _AsyncAnthropicShim(client_ai)
+
+        # ── Load context history (last N inbound+outbound, chronological) ──
+        related = await db.crm_leads.find(
+            {"phone": lead.get("phone"), "line_id": lead.get("line_id")},
+            {"id": 1, "_id": 0}
+        ).to_list(50)
+        rel_ids = [r["id"] for r in related] or [lead_id]
+        n = cfg.get("context_msgs", 15)
+        history_cursor = db.crm_messages.find(
+            {"lead_id": {"$in": rel_ids}, "id": {"$ne": newest_message.get("id")}},
+            {"_id": 0, "sender": 1, "content": 1, "message_type": 1, "created_at": 1}
+        ).sort("created_at", -1).limit(n)
+        history = await history_cursor.to_list(n)
+        history.reverse()
+
+        prev_intent = (lead.get("ai_state") or {}).get("active_intent")
+
+        # ── Classify ─────────────────────────────────────────────
+        cls = await ai_agent.classify_intent(ac, history, newest_message, prev_intent)
+        intent = cls.get("intent")
+        conf = float(cls.get("confidence") or 0.0)
+        logger.info(f"AI classifier for {lead_id}: intent={intent} conf={conf:.2f} reason={cls.get('reason')}")
+
+        # If Claude says "continue same intent" and we have one → keep it.
+        if intent == "intent_same":
+            intent = prev_intent or "otro"
+
+        # Low confidence → escalate to human
+        if conf < cfg.get("confidence_threshold", 0.55):
+            await _add_tag_names_to_lead(lead_id, lead.get("line_id"), [ai_agent.TAG_KEY_REVISAR])
+            return
+
+        # ── Decide reply ─────────────────────────────────────────
+        result = await ai_agent.next_reply(
+            ac, lead, user_doc, intent, newest_message, history
+        )
+        if not result:
+            return
+        reply = result.get("reply")
+        new_state = result.get("new_state") or {}
+        tag_keys = result.get("tag_keys_to_add") or []
+
+        if tag_keys:
+            await _add_tag_names_to_lead(lead_id, lead.get("line_id"), tag_keys)
+
+        # If handoff → also pause AI so it stops replying automatically
+        if result.get("handoff"):
+            new_state["handoff_at"] = datetime.now(timezone.utc).isoformat()
+            new_state["reason"] = cls.get("reason", "")
+
+        # Persist AI state on lead
+        await db.crm_leads.update_one(
+            {"id": lead_id},
+            {"$set": {"ai_state": {**(lead.get("ai_state") or {}), **new_state,
+                                    "last_intent_confidence": conf,
+                                    "last_intent_reason": cls.get("reason", ""),
+                                    "last_ai_reply_at": datetime.now(timezone.utc).isoformat()}}},
+        )
+
+        # Send reply via WhatsApp (through the standard admin send pipeline).
+        # `reply` may be a single string OR a list of strings — the AI flow can
+        # decide to split into multiple messages (e.g. CBU on its own so it's
+        # easy to copy-paste). We send them sequentially with a small delay
+        # so WhatsApp preserves the order.
+        if reply:
+            if isinstance(reply, list):
+                for i, part in enumerate(reply):
+                    if not part or not str(part).strip():
+                        continue
+                    await _persist_and_send_ai_reply(lead, line, str(part))
+                    if i < len(reply) - 1:
+                        await asyncio.sleep(1.2)
+            else:
+                await _persist_and_send_ai_reply(lead, line, str(reply))
+    except Exception as e:
+        logger.error(f"AI agent processing failed for lead {lead_id}: {e}", exc_info=True)
+
+
+async def _persist_and_send_ai_reply(lead: dict, line: dict, reply_text: str):
+    """Store the AI reply as an admin message + fire the WA background send.
+
+    The reply is marked with `sent_by='ai'` and `ai_generated=True` for
+    analytics and to differentiate from the cashier's own manual sends.
+    """
+    if not reply_text or not lead or not line:
+        return
+    msg_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    msg = {
+        "id": msg_id,
+        "lead_id": lead["id"],
+        "content": reply_text,
+        "sender": "admin",
+        "sent_by": "ai",
+        "ai_generated": True,
+        "created_at": now,
+        "wa_result": None,
+        "wa_message_id": None,
+        "delivery_status": "sending",
+    }
+    await db.crm_messages.insert_one(msg)
+    await db.crm_leads.update_one(
+        {"id": lead["id"]},
+        {"$set": {"last_interaction": now, "updated_at": now},
+         "$inc": {"messages_count": 1}}
+    )
+    if line.get("whatsapp_token") and line.get("phone_number_id") and lead.get("phone"):
+        _spawn_bg(_send_crm_message_to_wa_async(
+            message_id=msg_id,
+            phone=lead["phone"],
+            content=reply_text,
+            token=line["whatsapp_token"],
+            phone_id=line["phone_number_id"],
+            line_name=line.get("name"),
+        ))
+
+
 def _receipt_extract_prompt() -> str:
     return (
-        "You are a bank/wallet receipt reader. The image is a transfer receipt "
-        "(Mercado Pago, bank app, MODO, Ualá, etc.), commonly from Argentina, "
-        "sent by a customer to prove they paid. Extract STRICT JSON with these "
-        "keys and NO extra text:\n"
+        "You are a bank/wallet receipt reader AND a forensic fraud analyst. "
+        "The image is supposedly a transfer receipt (Mercado Pago, bank app, "
+        "MODO, Ualá, Naranja X, etc.), commonly from Argentina, sent by a "
+        "customer to prove they paid. Customers sometimes EDIT these receipts "
+        "with Paint / Photoshop / phone editors to fake amounts or names. "
+        "You MUST detect these edits.\n\n"
+        "Return STRICT JSON with these keys and NO extra text:\n"
         "{\n"
         '  "is_receipt": boolean (true only if the image is clearly a payment/transfer receipt),\n'
         '  "amount": number (the money amount in ARS, no currency symbols, e.g. 5000.50). null if not readable,\n'
         '  "sender_name": string (person or account that sent the money — the PAYER). null if not readable,\n'
         '  "recipient_name": string (person or account that received the money). null if not readable,\n'
+        '  "recipient_cbu": string (the RECIPIENT\'s CBU/CVU — 22-digit number, or alias like "juan.mp"). null if not readable,\n'
         '  "bank": string (bank or wallet name: "Mercado Pago", "Banco Nación", "Ualá", etc.). null if not readable,\n'
         '  "reference": string (operation/reference/comprobante number). null if not readable,\n'
         '  "date_str": string (date of the transfer as shown, ISO if possible). null if not readable,\n'
-        '  "confidence": number 0..1 (your confidence in amount and sender_name)\n'
-        "}\n"
+        '  "confidence": number 0..1 (your confidence in the extracted data. Drop this to ≤0.5 if you spot any tampering signal),\n'
+        '  "is_likely_edited": boolean (true if you detect visual evidence of digital editing on the receipt),\n'
+        '  "tampering_confidence": number 0..1 (your confidence that the image was EDITED. 0 = definitely genuine, 1 = definitely tampered),\n'
+        '  "tampering_signals": array of short Spanish strings describing SPECIFIC visual anomalies you spotted (empty array if none)\n'
+        "}\n\n"
+        "🔍 TAMPERING SIGNALS TO LOOK FOR (this is critical):\n"
+        "  • Amount digits with DIFFERENT font, size, weight, or antialiasing than the rest of the text\n"
+        "  • Amount digits misaligned vertically or horizontally vs the surrounding label\n"
+        "  • Slightly off colours/shades on the amount area (Paint's default black/white vs the app's grey)\n"
+        "  • Sharp pixelated edges around a specific number or name — a hallmark of Paint/MS-Paint edits\n"
+        "  • JPEG compression artifacts (blockiness, halos) around just ONE region while the rest is clean\n"
+        "  • Background pattern breaks or discontinuities under the amount / recipient\n"
+        "  • Copy-paste patterns: the SAME digit repeated with identical pixel-level artifacts\n"
+        "  • Font rendering that looks like a system font (Arial, Calibri) on an app that uses SF/Roboto/San-Francisco\n"
+        "  • Inconsistent shadow, kerning, or baseline between overlaid characters\n"
+        "  • Rounded numbers ($100.000, $50.000, $200.000) with suspicious rendering — favourite targets of editors\n"
+        "  • Missing UI elements you'd expect (status bar, share button, official app chrome)\n"
+        "  • Photograph of a screen instead of a screenshot when a screenshot would be trivial\n"
+        "\n"
+        "Be paranoid but not accusatory. Report each concrete signal you observe.\n"
+        "If nothing looks tampered, set is_likely_edited=false, tampering_confidence≤0.15, tampering_signals=[].\n"
+        "If you spot ANY of the above, list them.\n\n"
         "Rules: (1) Only return valid JSON, no prose. (2) If it's not a receipt, "
-        "set is_receipt=false and all other fields to null (except confidence=0). "
+        "set is_receipt=false, all other data fields to null, is_likely_edited=false, "
+        "tampering_confidence=0, tampering_signals=[]. "
         "(3) Amount must be a number, NOT a string. Strip thousand separators."
     )
 
@@ -13471,7 +14090,7 @@ async def _claude_extract_receipt(image_bytes: bytes, mime: str) -> Optional[dic
                 return json.dumps(v, ensure_ascii=False)
             except Exception:
                 return None
-        for k in ("sender_name", "recipient_name", "bank", "reference", "date_str"):
+        for k in ("sender_name", "recipient_name", "recipient_cbu", "bank", "reference", "date_str"):
             if k in parsed:
                 parsed[k] = _to_str(parsed[k])
         # is_receipt must be a real bool
@@ -13485,6 +14104,24 @@ async def _claude_extract_receipt(image_bytes: bytes, mime: str) -> Optional[dic
                 parsed["confidence"] = None
         else:
             parsed["confidence"] = None
+        # ── Tampering fields (from the new prompt) ─────────────────
+        parsed["is_likely_edited"] = bool(parsed.get("is_likely_edited"))
+        tc = parsed.get("tampering_confidence")
+        if isinstance(tc, (int, float)):
+            try:
+                parsed["tampering_confidence"] = max(0.0, min(1.0, float(tc)))
+            except Exception:
+                parsed["tampering_confidence"] = 0.0
+        else:
+            parsed["tampering_confidence"] = 0.0
+        # tampering_signals must be a list[str]
+        sig = parsed.get("tampering_signals")
+        if isinstance(sig, list):
+            parsed["tampering_signals"] = [
+                _to_str(x) for x in sig if _to_str(x)
+            ]
+        else:
+            parsed["tampering_signals"] = []
         return parsed
     except Exception as e:
         logger.error(f"Claude receipt extraction failed: {e}")
@@ -13646,8 +14283,119 @@ async def _try_reverse_match(user_id: str, mp_payment_id: str):
         logger.error(f"Reverse match failed for payment {mp_payment_id}: {e}")
 
 
+async def _cross_check_receipt_recipient(receipt: dict, user_doc: Optional[dict]) -> dict:
+    """Compare the receipt's recipient against the cashier's configured CBUs.
+
+    Returns a dict with two fields (also merged into `receipt`):
+      - recipient_match: bool
+      - recipient_match_reason: one of
+          "cbu_exact"     → recipient_cbu appears verbatim in cbu_list
+          "cbu_partial"   → 12+ contiguous digits of the CBU match
+          "alias_exact"   → alias/case-insensitive equality
+          "name_fuzzy"    → recipient_name fuzzy-matches a cbu_list[].name
+          "no_recipient"  → Claude did not extract any recipient info
+          "no_config"     → cashier has empty cbu_list
+          "no_match"      → nothing matched
+
+    This does NOT need bank APIs — works for every bank/wallet because
+    it just compares what Claude saw on the receipt against what the
+    cashier declared as their receiving accounts. It's the cheapest,
+    most universal anti-fraud layer we have.
+    """
+    def _norm_digits(s: str) -> str:
+        return re.sub(r"\D", "", s or "")
+
+    def _norm_alias(s: str) -> str:
+        return re.sub(r"[\s\.\-_@]", "", (s or "").lower())
+
+    def _norm_name(s: str) -> str:
+        # Strip accents for a fuzzier compare.
+        import unicodedata
+        s2 = unicodedata.normalize("NFKD", (s or "").lower())
+        s2 = "".join(c for c in s2 if not unicodedata.combining(c))
+        return re.sub(r"\s+", " ", s2).strip()
+
+    result = {"recipient_match": False, "recipient_match_reason": "no_match"}
+
+    rcbu = (receipt.get("recipient_cbu") or "").strip()
+    rname = (receipt.get("recipient_name") or "").strip()
+
+    if not rcbu and not rname:
+        result["recipient_match_reason"] = "no_recipient"
+        return result
+
+    cbu_list = ((user_doc or {}).get("cbu_list") or []) if user_doc else []
+    # Also fall back to the LINE's cbu_list in case the cashier put it there
+    # instead of on the user profile (some legacy configs did that).
+    if not cbu_list:
+        result["recipient_match_reason"] = "no_config"
+        return result
+
+    rcbu_digits = _norm_digits(rcbu)
+    rcbu_alias = _norm_alias(rcbu)
+    rname_norm = _norm_name(rname)
+
+    for entry in cbu_list:
+        conf_cbu = (entry.get("cbu") or "").strip()
+        conf_name = (entry.get("name") or "").strip()
+        conf_digits = _norm_digits(conf_cbu)
+        conf_alias = _norm_alias(conf_cbu)
+        conf_name_norm = _norm_name(conf_name)
+
+        # 1) Exact CBU digits (22-digit)
+        if rcbu_digits and conf_digits and rcbu_digits == conf_digits:
+            result["recipient_match"] = True
+            result["recipient_match_reason"] = "cbu_exact"
+            result["matched_cbu"] = conf_cbu
+            result["matched_name"] = conf_name
+            return result
+
+        # 2) Partial CBU digits (12+ contiguous). Some receipts blur the middle.
+        if rcbu_digits and conf_digits and len(rcbu_digits) >= 12 and rcbu_digits in conf_digits:
+            result["recipient_match"] = True
+            result["recipient_match_reason"] = "cbu_partial"
+            result["matched_cbu"] = conf_cbu
+            result["matched_name"] = conf_name
+            return result
+
+        # 3) Alias exact (case-insensitive, dots/dashes/underscores stripped)
+        if rcbu_alias and conf_alias and rcbu_alias == conf_alias and len(rcbu_alias) >= 4:
+            result["recipient_match"] = True
+            result["recipient_match_reason"] = "alias_exact"
+            result["matched_cbu"] = conf_cbu
+            result["matched_name"] = conf_name
+            return result
+
+        # 4) Name fuzzy — recipient name contains OR is contained by conf name.
+        # Skip if the configured name is too short (<5 chars) to avoid false
+        # positives on generic surnames like "García".
+        if rname_norm and conf_name_norm and len(conf_name_norm) >= 5:
+            if conf_name_norm in rname_norm or rname_norm in conf_name_norm:
+                result["recipient_match"] = True
+                result["recipient_match_reason"] = "name_fuzzy"
+                result["matched_cbu"] = conf_cbu
+                result["matched_name"] = conf_name
+                return result
+
+    return result
+
+
 async def _process_receipt_ocr(message_id: str, lead_id: str, media_id: str, mime_type: str, line: dict):
-    """Background task: download → Claude Vision → store → match against MP inbox."""
+    """Background task: download → Claude Vision + forensic checks →
+    store → match against MP inbox.
+
+    Anti-fraud pipeline (each layer independent):
+      1. Claude Vision — extracts data AND flags visual tampering signals
+         (font mismatch, aliasing, Paint-style pixelation, etc.) via the
+         new prompt in _receipt_extract_prompt().
+      2. SHA-256 hash de-dup — the exact same image bytes have been used
+         before on this line? Reused screenshots are near-100% fraud.
+      3. EXIF forensics — receipts from banks are SCREENSHOTS, so they
+         should have no camera EXIF metadata. If EXIF says "edited with
+         Photoshop / MS Paint / GIMP" → hard flag.
+      4. (Later) CBU/alias destino cross-check with the cashier's
+         `cbu_list` to catch receipts pointing to OTHER people's accounts.
+    """
     try:
         token = line.get("whatsapp_token")
         if not token:
@@ -13656,9 +14404,85 @@ async def _process_receipt_ocr(message_id: str, lead_id: str, media_id: str, mim
         if not media:
             return
         image_bytes, mime = media
+
+        # 1) Claude Vision extraction (data + tampering signals)
         receipt = await _claude_extract_receipt(image_bytes, mime or mime_type)
         if not receipt:
             return
+
+        # 1b) Recipient cross-check — universal (bank-agnostic) anti-fraud
+        # layer. Compare Claude's recipient_name/recipient_cbu against the
+        # cashier's configured cbu_list. Works for ANY bank without needing
+        # the bank's API. See _cross_check_receipt_recipient docstring.
+        try:
+            _lead_now = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0, "line_id": 1})
+            user_for_line = await _find_user_for_line(
+                (_lead_now or {}).get("line_id") or line.get("id")
+            )
+            match_info = await _cross_check_receipt_recipient(receipt, user_for_line)
+            receipt.update(match_info)
+            # If Claude read a recipient but it didn't match, this is a strong
+            # anti-fraud signal — surface it as a tampering signal too so the
+            # UI turns red like on edited images.
+            if (match_info.get("recipient_match_reason") == "no_match"
+                    and (receipt.get("recipient_name") or receipt.get("recipient_cbu"))):
+                receipt.setdefault("tampering_signals", []).append(
+                    "⚠️ El destinatario del recibo NO coincide con tus CBUs configurados"
+                )
+        except Exception as _e:
+            logger.warning(f"recipient cross-check failed for msg {message_id}: {_e}")
+
+        # 2) SHA-256 duplicate detection (per line, last 30 days)
+        try:
+            img_hash = hashlib.sha256(image_bytes).hexdigest()
+            receipt["image_hash"] = img_hash
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+            dup = await db.crm_messages.find_one(
+                {
+                    "receipt_data.image_hash": img_hash,
+                    "id": {"$ne": message_id},
+                    "created_at": {"$gte": cutoff},
+                },
+                {"_id": 0, "id": 1, "lead_id": 1, "created_at": 1},
+            )
+            if dup:
+                receipt.setdefault("tampering_signals", []).append(
+                    f"⚠️ Imagen idéntica ya usada antes ({dup.get('created_at', '')[:10]}) por otro lead"
+                )
+                receipt["is_likely_edited"] = True
+                receipt["tampering_confidence"] = max(
+                    receipt.get("tampering_confidence") or 0.0, 0.95
+                )
+                receipt["duplicate_of_message_id"] = dup.get("id")
+                receipt["duplicate_of_lead_id"] = dup.get("lead_id")
+        except Exception as _e:
+            logger.warning(f"receipt hash dedup failed for msg {message_id}: {_e}")
+
+        # 3) EXIF forensics — cheap heuristic to catch editor signatures
+        try:
+            from PIL import Image
+            from PIL.ExifTags import TAGS
+            import io as _io
+            img = Image.open(_io.BytesIO(image_bytes))
+            exif = getattr(img, "_getexif", lambda: None)() or {}
+            software_hits = []
+            for tag_id, val in (exif.items() if isinstance(exif, dict) else []):
+                tag_name = TAGS.get(tag_id, str(tag_id))
+                if tag_name in ("Software", "ProcessingSoftware") and isinstance(val, str):
+                    lower = val.lower()
+                    for editor in ("photoshop", "gimp", "paint", "canva", "pixlr",
+                                    "photopea", "snapseed", "picsart", "lightroom"):
+                        if editor in lower:
+                            software_hits.append(f"EXIF Software: {val}")
+                            break
+            if software_hits:
+                receipt.setdefault("tampering_signals", []).extend(software_hits)
+                receipt["is_likely_edited"] = True
+                receipt["tampering_confidence"] = max(
+                    receipt.get("tampering_confidence") or 0.0, 0.85
+                )
+        except Exception:
+            pass  # PIL is optional; don't fail OCR if it isn't happy
 
         # Persist the parsed receipt on the message
         await db.crm_messages.update_one(
@@ -13669,13 +14493,97 @@ async def _process_receipt_ocr(message_id: str, lead_id: str, media_id: str, mim
             }},
         )
 
-        if not receipt.get("is_receipt") or not receipt.get("amount"):
+        # ── Reconciliation: image is NOT actually a receipt ────────────
+        # The AI agent optimistically tags any image sent during a `carga`
+        # flow as 🟢 pendiente-carga. When Claude's OCR confirms the image
+        # is unrelated (a photo, a screenshot of something else, a meme),
+        # we walk it back: strip the CARGA tag, add REVISAR, and tell the
+        # client to send the real receipt.
+        if not receipt.get("is_receipt"):
+            try:
+                lead_check = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
+                if lead_check and ai_agent is not None:
+                    _lead_tags = list(lead_check.get("tags") or [])
+                    _carga_tag = await _resolve_or_create_tag(ai_agent.TAG_KEY_CARGA, lead_check.get("line_id"))
+                    _rev_tag = await _resolve_or_create_tag(ai_agent.TAG_KEY_REVISAR, lead_check.get("line_id"))
+                    if _carga_tag and _carga_tag["id"] in _lead_tags:
+                        _new_tags = [t for t in _lead_tags if t != _carga_tag["id"]]
+                        if _rev_tag and _rev_tag["id"] not in _new_tags:
+                            _new_tags.append(_rev_tag["id"])
+                        await db.crm_leads.update_one(
+                            {"id": lead_id},
+                            {"$set": {"tags": _new_tags[:TAG_MAX_PER_LEAD],
+                                      "tags_updated_at": datetime.now(timezone.utc).isoformat()}},
+                        )
+                        logger.info(f"Receipt OCR: downgraded lead {lead_id} pendiente-carga → revisar (not a receipt)")
+                    # Ask the client for a real receipt (only once — we set a
+                    # marker on the ai_state so we don't spam if they resend
+                    # more non-receipt images).
+                    _ai_state = dict(lead_check.get("ai_state") or {})
+                    if not _ai_state.get("invalid_receipt_notified"):
+                        await db.crm_leads.update_one(
+                            {"id": lead_id},
+                            {"$set": {"ai_state.invalid_receipt_notified": True}},
+                        )
+                        _cashier = await _find_user_for_line(lead_check.get("line_id"))
+                        cfg = ai_agent.merged_ai_config(_cashier or {})
+                        if cfg.get("enabled"):
+                            _line = await db.crm_lines.find_one({"id": lead_check.get("line_id")}, {"_id": 0})
+                            if _line:
+                                await _persist_and_send_ai_reply(
+                                    lead_check, _line,
+                                    ai_agent.receipt_invalid_message(lead_id)
+                                )
+            except Exception as _e:
+                logger.warning(f"post-OCR invalid-receipt handling failed for {message_id}: {_e}")
+            return
+
+        if not receipt.get("amount"):
+            return
+
+        # Auto-match against MP inbox ONLY if the receipt looks clean.
+        # A likely-edited receipt should never auto-assign a real MP payment,
+        # otherwise a forged $150.000 amount could grab a legit $150.000
+        # payment and let the fraudster get away with it.
+        if receipt.get("is_likely_edited") or (receipt.get("tampering_confidence") or 0.0) >= 0.5:
+            logger.info(
+                f"Receipt OCR: msg {message_id} FLAGGED as likely edited "
+                f"(conf={receipt.get('tampering_confidence')}), skipping MP auto-match"
+            )
             return
 
         # Look for MP payment match
         lead = await db.crm_leads.find_one({"id": lead_id}, {"_id": 0})
         if not lead:
             return
+
+        # Post-OCR reconciliation with the AI flow: if the AI tagged this
+        # lead as 🟢 pendiente-carga but the recipient of the receipt does
+        # NOT match the cashier's CBUs, downgrade the tag to 🔴 revisar so
+        # the cashier double-checks before loading money. Works even when
+        # OCR completes AFTER the AI classifier finished tagging.
+        try:
+            if (receipt.get("recipient_match") is False
+                    and receipt.get("recipient_match_reason") == "no_match"
+                    and (receipt.get("recipient_name") or receipt.get("recipient_cbu"))):
+                # Only if there's currently a 🟢 pendiente-carga tag on this lead
+                _lead_tags = list(lead.get("tags") or [])
+                if _lead_tags and ai_agent is not None:
+                    _carga_tag = await _resolve_or_create_tag(ai_agent.TAG_KEY_CARGA, lead.get("line_id"))
+                    _rev_tag = await _resolve_or_create_tag(ai_agent.TAG_KEY_REVISAR, lead.get("line_id"))
+                    if _carga_tag and _carga_tag["id"] in _lead_tags:
+                        _new_tags = [t for t in _lead_tags if t != _carga_tag["id"]]
+                        if _rev_tag and _rev_tag["id"] not in _new_tags:
+                            _new_tags.append(_rev_tag["id"])
+                        await db.crm_leads.update_one(
+                            {"id": lead_id},
+                            {"$set": {"tags": _new_tags[:TAG_MAX_PER_LEAD],
+                                      "tags_updated_at": datetime.now(timezone.utc).isoformat()}},
+                        )
+                        logger.info(f"Receipt OCR: downgraded lead {lead_id} pendiente-carga → revisar (recipient mismatch)")
+        except Exception as _e:
+            logger.warning(f"post-OCR tag reconciliation failed for {message_id}: {_e}")
+
         payment = await _match_receipt_to_mp_payment(lead, line, receipt)
         if payment:
             await _auto_assign_and_notify(payment, lead, source="receipt_ocr")
