@@ -319,7 +319,7 @@ export default function MiConfiguracion() {
                 <input
                   value={aiConfig.brand_name || ''}
                   onChange={e => setAiConfig(prev => ({ ...prev, brand_name: e.target.value }))}
-                  placeholder="Ej: TataNET"
+                  placeholder="Ej: RED X"
                   className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm text-white"
                   data-testid="ai-brand-name-input"
                 />
