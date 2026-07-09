@@ -12,6 +12,7 @@ import api from '@/utils/api';
 import { STATUS_CONFIG } from './constants';
 import { StatusSelector } from './StatusSelector';
 import { ChatMessage } from './ChatMessage';
+import { ChatMessageBoundary } from './ChatMessageBoundary';
 import { AdPreviewCard } from './AdPreviewCard';
 import { LeadTagsBar } from './LeadTags';
 import { LeadAvatar } from './LeadAvatar';
@@ -176,18 +177,40 @@ export const ChatPanel = ({
     }
   }, [messages, lead.id, scrollToBottom]);
 
-  const sendMessage = async (sender = 'admin') => {
+  const sendMessage = async (sender = 'admin', options = {}) => {
     if (!newMessage.trim()) return;
     setSending(true);
     try {
-      await api.post(`/crm/leads/${lead.id}/messages`, { content: newMessage, sender });
+      await api.post(`/crm/leads/${lead.id}/messages`, {
+        content: newMessage,
+        sender,
+        force: !!options.force,
+      });
       setNewMessage('');
       // Force scroll-to-bottom: if the cajero just sent something, they
       // expect to see it land at the bottom even if they were scrolled up.
       isNearBottomRef.current = true;
       setIsNearBottom(true);
       loadMessages();
-    } catch { toast.error('Error enviando mensaje'); }
+    } catch (err) {
+      const status = err?.response?.status;
+      const detail = err?.response?.data?.detail;
+      // 24hr window closed → clear actionable warning
+      if (status === 409 && detail && typeof detail === 'object' && detail.code === 'outside_24h_window') {
+        toast.error(
+          `⚠️ ${detail.message}`,
+          {
+            duration: 12000,
+            action: {
+              label: 'Forzar envío',
+              onClick: () => sendMessage(sender, { force: true }),
+            },
+          }
+        );
+      } else {
+        toast.error(typeof detail === 'string' ? detail : 'Error enviando mensaje');
+      }
+    }
     finally {
       setSending(false);
       // Refocus the textarea AFTER the disabled flag is cleared so the
@@ -260,7 +283,7 @@ export const ChatPanel = ({
     imgs.reduce((p, f) => p.then(() => sendImage(f)), Promise.resolve());
   };
 
-  const sendImage = async (file) => {
+  const sendImage = async (file, opts = {}) => {
     if (!file) return;
     if (file.size > 10 * 1024 * 1024) {
       toast.error('La imagen supera los 10 MB');
@@ -270,6 +293,7 @@ export const ChatPanel = ({
     const form = new FormData();
     form.append('file', file);
     if (newMessage.trim()) form.append('caption', newMessage.trim());
+    if (opts.force) form.append('force', 'true');
     try {
       await api.post(`/crm/leads/${lead.id}/messages/image`, form, {
         headers: { 'Content-Type': 'multipart/form-data' }
@@ -278,8 +302,23 @@ export const ChatPanel = ({
       toast.success('Imagen enviada');
       loadMessages();
     } catch (err) {
-      const detail = err?.response?.data?.detail || 'Error enviando imagen';
-      toast.error(typeof detail === 'string' ? detail : 'Error enviando imagen');
+      const status = err?.response?.status;
+      const detail = err?.response?.data?.detail;
+      // 24hr window closed → clear actionable warning (same as text)
+      if (status === 409 && detail && typeof detail === 'object' && detail.code === 'outside_24h_window') {
+        toast.error(
+          `⚠️ ${detail.message}`,
+          {
+            duration: 12000,
+            action: {
+              label: 'Forzar envío',
+              onClick: () => sendImage(file, { force: true }),
+            },
+          }
+        );
+      } else {
+        toast.error(typeof detail === 'string' ? detail : 'Error enviando imagen');
+      }
     } finally {
       setSending(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -313,15 +352,14 @@ export const ChatPanel = ({
     const form = new FormData();
     form.append('file', file);
     try {
-      const { data } = await api.post(`/crm/leads/${lead.id}/messages/audio`, form, {
+      // Audio send is now async on the backend (same pattern as text/image):
+      // it inserts the message with delivery_status='sending' and returns
+      // right away. Actual WhatsApp send happens in a background task and
+      // polling updates the delivery_status pill.
+      await api.post(`/crm/leads/${lead.id}/messages/audio`, form, {
         headers: { 'Content-Type': 'multipart/form-data' }
       });
-      if (data && data.whatsapp_sent === false) {
-        const waErr = data.whatsapp_result?.error?.message || JSON.stringify(data.whatsapp_result || {});
-        toast.error(`Audio guardado, pero WhatsApp lo rechazó: ${waErr}`);
-      } else {
-        toast.success('Audio enviado');
-      }
+      toast.success('Audio enviado');
       loadMessages();
     } catch (err) {
       const detail = err?.response?.data?.detail || 'Error enviando audio';
@@ -412,6 +450,43 @@ export const ChatPanel = ({
       loadMessages();
       toast.success('Bienvenida enviada');
     } catch { toast.error('Error enviando bienvenida'); }
+  };
+
+  /**
+   * Fire a "quick template" send — server picks a random variant from the
+   * cashier's configured pool (up to 10 phrasings per key). Prevents Meta
+   * from flagging identical repeated content on main lines. See
+   * `POST /api/crm/leads/{id}/messages/quick/{key}` and
+   * `_pick_welcome_variation()` on the backend.
+   */
+  const sendQuickTemplate = async (templateKey, opts = {}) => {
+    setSending(true);
+    try {
+      await api.post(`/crm/leads/${lead.id}/messages/quick/${templateKey}${opts.force ? '?force=true' : ''}`);
+      loadMessages();
+      toast.success('Mensaje enviado');
+    } catch (err) {
+      const status = err?.response?.status;
+      const detail = err?.response?.data?.detail;
+      if (status === 409 && detail && typeof detail === 'object' && detail.code === 'outside_24h_window') {
+        toast.error(
+          `⚠️ ${detail.message}`,
+          {
+            duration: 12000,
+            action: {
+              label: 'Forzar envío',
+              onClick: () => sendQuickTemplate(templateKey, { force: true }),
+            },
+          }
+        );
+      } else if (status === 400 && typeof detail === 'string' && detail.includes('No tenés variantes')) {
+        toast.error(detail, { duration: 8000 });
+      } else {
+        toast.error(typeof detail === 'string' ? detail : 'Error enviando mensaje rápido');
+      }
+    } finally {
+      setSending(false);
+    }
   };
 
   const sendUsuario = async () => {
@@ -725,9 +800,47 @@ Le envio nuestros datos de cuenta 👇`;
       <div className="px-3 py-2 border-b border-slate-800 bg-slate-800/30 flex items-center gap-2 shrink-0">
         <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse shrink-0" />
         <span className="text-xs text-slate-400 hidden sm:inline">Chat en tiempo real</span>
+        {/* AI toggle pill: if this lead is under AI management, show pause/resume */}
+        {(lead?.ai_state?.active_intent || lead?.ai_paused) && (
+          <button
+            type="button"
+            onClick={async () => {
+              try {
+                const paused = !lead.ai_paused;
+                await api.patch(`/crm/leads/${lead.id}/ai-pause`, { paused });
+                toast.success(paused ? 'IA pausada en este chat' : 'IA reactivada');
+                if (onLeadUpdated) onLeadUpdated({ ...lead, ai_paused: paused });
+              } catch { toast.error('Error cambiando estado de IA'); }
+            }}
+            className={
+              lead?.ai_paused
+                ? 'ml-2 text-[10px] px-2 py-0.5 rounded-full bg-slate-700 text-slate-300 hover:bg-slate-600 flex items-center gap-1'
+                : 'ml-2 text-[10px] px-2 py-0.5 rounded-full bg-violet-600/80 text-white hover:bg-violet-500 flex items-center gap-1'
+            }
+            title={lead?.ai_paused ? 'La IA está pausada en este chat — clic para reactivar' : 'IA respondiendo automáticamente — clic para pausar'}
+            data-testid="ai-pause-toggle"
+          >
+            <span>🤖</span>
+            <span>{lead?.ai_paused ? 'IA pausada' : `IA · ${lead?.ai_state?.active_intent || 'activa'}`}</span>
+          </button>
+        )}
         <div className="flex items-center gap-1.5 ml-auto">
           <Button onClick={sendBienvenida} size="sm" className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-2 sm:px-3 h-7">
             👋<span className="hidden sm:inline ml-1">Bienvenida</span>
+          </Button>
+          <Button
+            onClick={() => sendQuickTemplate('cargado')}
+            disabled={sending || !(userMessages.quick_templates?.cargado || '').trim()}
+            size="sm"
+            className="bg-lime-600 hover:bg-lime-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs px-2 sm:px-3 h-7"
+            title={
+              (userMessages.quick_templates?.cargado || '').trim()
+                ? '⚡ Enviar "Cargado" — rota una de las variantes configuradas'
+                : 'Cargá al menos una variante de "Cargado" en Mi Configuración'
+            }
+            data-testid="chat-quick-cargado-btn"
+          >
+            ⚡<span className="hidden sm:inline ml-1">Cargado</span>
           </Button>
           <Button onClick={sendUsuario} size="sm" className="bg-blue-600 hover:bg-blue-500 text-white text-xs px-2 sm:px-3 h-7">
             👤<span className="hidden sm:inline ml-1">Usuario</span>
@@ -832,7 +945,11 @@ Le envio nuestros datos de cuenta 👇`;
               <MessageCircle className="w-8 h-8 mb-2 opacity-20" />
               <p className="text-xs">Sin mensajes aún</p>
             </div>
-          ) : messages.map(msg => <ChatMessage key={msg.id} message={msg} />)}
+          ) : messages.map(msg => (
+            <ChatMessageBoundary key={msg.id} messageId={msg.id}>
+              <ChatMessage message={msg} />
+            </ChatMessageBoundary>
+          ))}
           <div ref={messagesEndRef} />
         </div>
 

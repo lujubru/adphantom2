@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { RefreshCw } from 'lucide-react';
+import { RefreshCw, AlertTriangle, Sparkles, CheckCircle2 } from 'lucide-react';
 import api from '@/utils/api';
 import { BACKEND_URL } from './constants';
 import { formatTime } from './utils';
 import { ImageLightbox } from './ImageLightbox';
 
 export const ChatMessage = ({ message }) => {
+  const isSystem = message.sender === 'system';
   const isAdmin = message.sender === 'admin';
   const [imgSrc, setImgSrc] = useState(null);
   const [loadingImg, setLoadingImg] = useState(false);
@@ -81,6 +82,17 @@ export const ChatMessage = ({ message }) => {
       {lightboxOpen && imgSrc && (
         <ImageLightbox src={imgSrc} onClose={() => setLightboxOpen(false)} />
       )}
+      {isSystem ? (
+        <div className="flex justify-center my-2" data-testid={`msg-system-${message.id}`}>
+          <div className="max-w-[85%] px-3 py-2 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-200 text-xs">
+            <div className="flex items-start gap-2">
+              <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5 text-emerald-400" />
+              <div className="whitespace-pre-wrap break-words">{displayContent}</div>
+            </div>
+            <p className="text-[9px] text-emerald-500/60 mt-1">{formatTime(message.created_at)}</p>
+          </div>
+        </div>
+      ) : (
       <div className={`flex ${isAdmin ? 'justify-end' : 'justify-start'}`}>
         <div className={`max-w-[75%] px-3 py-2 rounded-2xl text-sm shadow-sm ${isAdmin ? 'bg-emerald-600 text-white rounded-br-sm' : 'bg-slate-700 text-slate-100 rounded-bl-sm'}`}>
           {message.message_type === 'image' ? (
@@ -138,9 +150,143 @@ export const ChatMessage = ({ message }) => {
           <p className={`text-[10px] mt-1 ${isAdmin ? 'text-emerald-200/60 text-right' : 'text-slate-400'}`}>
             {message.sender_name && <span>{message.sender_name} · </span>}
             {formatTime(message.created_at)}
+            {isAdmin && message.delivery_status === 'failed' && (
+              <span
+                className="ml-1 inline-flex items-center gap-0.5 text-red-300 font-semibold"
+                title={`No entregado${message.delivery_error_title ? ': ' + message.delivery_error_title : ''}${message.delivery_error_code ? ' (code ' + message.delivery_error_code + ')' : ''}`}
+                data-testid={`msg-failed-${message.id}`}
+              >
+                <AlertTriangle className="w-2.5 h-2.5" /> no entregado
+              </span>
+            )}
+            {isAdmin && message.delivery_status === 'sending' && (
+              <span className="ml-1 opacity-60" title="Enviando…">⏳</span>
+            )}
+            {isAdmin && message.delivery_status === 'sent' && !message.delivery_status_seen && (
+              <span className="ml-1 opacity-70" title="Enviado">✓</span>
+            )}
+            {isAdmin && message.delivery_status === 'read' && <span className="ml-1 text-sky-300" title="Leído">✓✓</span>}
+            {isAdmin && message.delivery_status === 'delivered' && <span className="ml-1" title="Entregado">✓✓</span>}
           </p>
+          {/* Claude OCR extracted receipt data (only on inbound images) */}
+          {!isAdmin && message.receipt_data && message.receipt_data.is_receipt && (() => {
+            // Defensive: Claude Vision occasionally returns nested objects for
+            // sender_name/bank/etc. Rendering an object directly crashes React
+            // ("Objects are not valid as a React child") and blanks the whole
+            // chat. Coerce every rendered field to a plain string.
+            const rd = message.receipt_data || {};
+            const asText = (v) => {
+              if (v == null) return '';
+              if (typeof v === 'string' || typeof v === 'number') return String(v);
+              try { return JSON.stringify(v); } catch { return ''; }
+            };
+            const amountNum = Number(rd.amount);
+            const amountValid = rd.amount != null && Number.isFinite(amountNum);
+            const senderName = asText(rd.sender_name);
+            const bankName = asText(rd.bank);
+            const confidencePct = typeof rd.confidence === 'number' && Number.isFinite(rd.confidence)
+              ? Math.round(rd.confidence * 100)
+              : null;
+            // Tampering signals (from the anti-fraud prompt + hash dedup + EXIF)
+            const tamperConf = typeof rd.tampering_confidence === 'number'
+              ? Math.max(0, Math.min(1, rd.tampering_confidence)) : 0;
+            const isEdited = !!rd.is_likely_edited || tamperConf >= 0.5;
+            const signals = Array.isArray(rd.tampering_signals)
+              ? rd.tampering_signals.map(asText).filter(Boolean) : [];
+            // Colour of the whole card shifts to red when tampered.
+            const cardClass = isEdited
+              ? 'mt-1.5 flex items-start gap-1.5 rounded-md bg-red-950/60 border border-red-500/60 px-2 py-1.5'
+              : 'mt-1.5 flex items-start gap-1.5 rounded-md bg-black/25 px-2 py-1.5';
+            return (
+              <div
+                className={cardClass}
+                data-testid={`receipt-ocr-${message.id}`}
+              >
+                <Sparkles className={`w-3 h-3 shrink-0 mt-0.5 ${isEdited ? 'text-red-300' : 'text-amber-300'}`} />
+                <div className="text-[10px] leading-tight w-full">
+                  <div className={`font-semibold ${isEdited ? 'text-red-200' : 'text-amber-200'}`}>
+                    {isEdited ? '⚠️ POSIBLE COMPROBANTE EDITADO' : '🤖 Claude leyó el comprobante'}
+                    {confidencePct != null && !isEdited && (
+                      <span className="ml-1 opacity-60">{confidencePct}%</span>
+                    )}
+                    {isEdited && (
+                      <span className="ml-1 opacity-80">{Math.round(tamperConf * 100)}% sospecha</span>
+                    )}
+                  </div>
+                  <div className={`space-y-0.5 ${isEdited ? 'text-red-100/90 line-through decoration-red-400/40' : 'text-slate-200/90'}`}>
+                    {amountValid && (
+                      <div>💰 <strong>${amountNum.toLocaleString('es-AR')}</strong></div>
+                    )}
+                    {senderName && <div>👤 {senderName}</div>}
+                    {bankName && <div>🏦 {bankName}</div>}
+                  </div>
+                  {/* Recipient CBU cross-check badge — universal anti-fraud
+                      that works for ANY bank/wallet without needing bank
+                      APIs. Green if the recipient matches one of your
+                      configured CBUs, red if it points somewhere else. */}
+                  {(() => {
+                    const mr = rd.recipient_match_reason;
+                    if (mr === "cbu_exact" || mr === "cbu_partial" ||
+                        mr === "alias_exact" || mr === "name_fuzzy") {
+                      const labelMap = {
+                        cbu_exact: 'CBU exacto',
+                        cbu_partial: 'CBU parcial (dígitos coinciden)',
+                        alias_exact: 'Alias exacto',
+                        name_fuzzy: 'Nombre del titular',
+                      };
+                      const mn = asText(rd.matched_name) || asText(rd.matched_cbu);
+                      return (
+                        <div
+                          className="mt-1 flex items-center gap-1 text-emerald-300 text-[10px] font-semibold"
+                          data-testid={`receipt-recipient-match-${message.id}`}
+                        >
+                          🛡 Va a tu cuenta ({labelMap[mr]}
+                          {mn ? ` · ${mn}` : ''})
+                        </div>
+                      );
+                    }
+                    if (mr === "no_match" && (rd.recipient_name || rd.recipient_cbu)) {
+                      const goingTo = asText(rd.recipient_name) || asText(rd.recipient_cbu);
+                      return (
+                        <div
+                          className="mt-1 flex items-center gap-1 text-red-300 text-[10px] font-semibold"
+                          data-testid={`receipt-recipient-nomatch-${message.id}`}
+                          title="El destinatario no coincide con ninguno de tus CBUs configurados"
+                        >
+                          ⚠️ NO va a tu cuenta{goingTo ? ` · destinatario: ${goingTo}` : ''}
+                        </div>
+                      );
+                    }
+                    if (mr === "no_config") {
+                      return (
+                        <div className="mt-1 text-slate-400 text-[10px]">
+                          ℹ️ Cargá tus CBUs en Mi Configuración para validar automáticamente
+                        </div>
+                      );
+                    }
+                    return null;
+                  })()}
+                  {isEdited && signals.length > 0 && (
+                    <div
+                      className="mt-1 pt-1 border-t border-red-500/30 space-y-0.5"
+                      data-testid={`receipt-tampering-signals-${message.id}`}
+                    >
+                      <div className="text-red-300 font-semibold">Señales detectadas:</div>
+                      {signals.slice(0, 5).map((s, i) => (
+                        <div key={i} className="text-red-200/90 pl-2">• {s}</div>
+                      ))}
+                      <div className="text-red-300/80 mt-1 font-semibold">
+                        🛑 NO cargar hasta verificar manualmente
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
         </div>
       </div>
+      )}
     </>
   );
 };
