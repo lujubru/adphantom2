@@ -187,26 +187,99 @@ export const ChatMessage = ({ message }) => {
             const confidencePct = typeof rd.confidence === 'number' && Number.isFinite(rd.confidence)
               ? Math.round(rd.confidence * 100)
               : null;
+            // Tampering signals (from the anti-fraud prompt + hash dedup + EXIF)
+            const tamperConf = typeof rd.tampering_confidence === 'number'
+              ? Math.max(0, Math.min(1, rd.tampering_confidence)) : 0;
+            const isEdited = !!rd.is_likely_edited || tamperConf >= 0.5;
+            const signals = Array.isArray(rd.tampering_signals)
+              ? rd.tampering_signals.map(asText).filter(Boolean) : [];
+            // Colour of the whole card shifts to red when tampered.
+            const cardClass = isEdited
+              ? 'mt-1.5 flex items-start gap-1.5 rounded-md bg-red-950/60 border border-red-500/60 px-2 py-1.5'
+              : 'mt-1.5 flex items-start gap-1.5 rounded-md bg-black/25 px-2 py-1.5';
             return (
               <div
-                className="mt-1.5 flex items-start gap-1.5 rounded-md bg-black/25 px-2 py-1.5"
+                className={cardClass}
                 data-testid={`receipt-ocr-${message.id}`}
               >
-                <Sparkles className="w-3 h-3 shrink-0 mt-0.5 text-amber-300" />
-                <div className="text-[10px] leading-tight">
-                  <div className="font-semibold text-amber-200">
-                    🤖 Claude leyó el comprobante
-                    {confidencePct != null && (
+                <Sparkles className={`w-3 h-3 shrink-0 mt-0.5 ${isEdited ? 'text-red-300' : 'text-amber-300'}`} />
+                <div className="text-[10px] leading-tight w-full">
+                  <div className={`font-semibold ${isEdited ? 'text-red-200' : 'text-amber-200'}`}>
+                    {isEdited ? '⚠️ POSIBLE COMPROBANTE EDITADO' : '🤖 Claude leyó el comprobante'}
+                    {confidencePct != null && !isEdited && (
                       <span className="ml-1 opacity-60">{confidencePct}%</span>
                     )}
+                    {isEdited && (
+                      <span className="ml-1 opacity-80">{Math.round(tamperConf * 100)}% sospecha</span>
+                    )}
                   </div>
-                  <div className="text-slate-200/90 space-y-0.5">
+                  <div className={`space-y-0.5 ${isEdited ? 'text-red-100/90 line-through decoration-red-400/40' : 'text-slate-200/90'}`}>
                     {amountValid && (
                       <div>💰 <strong>${amountNum.toLocaleString('es-AR')}</strong></div>
                     )}
                     {senderName && <div>👤 {senderName}</div>}
                     {bankName && <div>🏦 {bankName}</div>}
                   </div>
+                  {/* Recipient CBU cross-check badge — universal anti-fraud
+                      that works for ANY bank/wallet without needing bank
+                      APIs. Green if the recipient matches one of your
+                      configured CBUs, red if it points somewhere else. */}
+                  {(() => {
+                    const mr = rd.recipient_match_reason;
+                    if (mr === "cbu_exact" || mr === "cbu_partial" ||
+                        mr === "alias_exact" || mr === "name_fuzzy") {
+                      const labelMap = {
+                        cbu_exact: 'CBU exacto',
+                        cbu_partial: 'CBU parcial (dígitos coinciden)',
+                        alias_exact: 'Alias exacto',
+                        name_fuzzy: 'Nombre del titular',
+                      };
+                      const mn = asText(rd.matched_name) || asText(rd.matched_cbu);
+                      return (
+                        <div
+                          className="mt-1 flex items-center gap-1 text-emerald-300 text-[10px] font-semibold"
+                          data-testid={`receipt-recipient-match-${message.id}`}
+                        >
+                          🛡 Va a tu cuenta ({labelMap[mr]}
+                          {mn ? ` · ${mn}` : ''})
+                        </div>
+                      );
+                    }
+                    if (mr === "no_match" && (rd.recipient_name || rd.recipient_cbu)) {
+                      const goingTo = asText(rd.recipient_name) || asText(rd.recipient_cbu);
+                      return (
+                        <div
+                          className="mt-1 flex items-center gap-1 text-red-300 text-[10px] font-semibold"
+                          data-testid={`receipt-recipient-nomatch-${message.id}`}
+                          title="El destinatario no coincide con ninguno de tus CBUs configurados"
+                        >
+                          ⚠️ NO va a tu cuenta{goingTo ? ` · destinatario: ${goingTo}` : ''}
+                        </div>
+                      );
+                    }
+                    if (mr === "no_config") {
+                      return (
+                        <div className="mt-1 text-slate-400 text-[10px]">
+                          ℹ️ Cargá tus CBUs en Mi Configuración para validar automáticamente
+                        </div>
+                      );
+                    }
+                    return null;
+                  })()}
+                  {isEdited && signals.length > 0 && (
+                    <div
+                      className="mt-1 pt-1 border-t border-red-500/30 space-y-0.5"
+                      data-testid={`receipt-tampering-signals-${message.id}`}
+                    >
+                      <div className="text-red-300 font-semibold">Señales detectadas:</div>
+                      {signals.slice(0, 5).map((s, i) => (
+                        <div key={i} className="text-red-200/90 pl-2">• {s}</div>
+                      ))}
+                      <div className="text-red-300/80 mt-1 font-semibold">
+                        🛑 NO cargar hasta verificar manualmente
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             );

@@ -28,6 +28,18 @@ export default function MiConfiguracion() {
   const [cbuList, setCbuList] = useState([]); // [{cbu, name}]
   const [derivationMessage, setDerivationMessage] = useState('');
   const [derivationNumbers, setDerivationNumbers] = useState([]);
+  // Quick-templates: object { cargado: "variante 1\n---\nvariante 2..." }
+  const [quickTemplates, setQuickTemplates] = useState({});
+  // Per-cashier AI-agent config
+  const [aiConfig, setAiConfig] = useState({
+    enabled: false, brand_name: '', brand_tone: 'casual',
+    opening_time: '09:00', closing_time: '01:00',
+    off_hours_message: '¡Hola! Nuestro horario de atención es de {opening} a {closing}. En breve un cajero te va a responder. 🙌',
+    min_deposit: 1000, max_deposit: 500000,
+    min_withdrawal: 1000, max_withdrawal: 500000,
+    context_msgs: 15, confidence_threshold: 0.55, signature: '',
+    platforms: [],
+  });
 
   // ── Mercado Pago OAuth ───────────────────────────────────────
   const [mpStatus, setMpStatus] = useState({ configured: false, connected: false, connection: null });
@@ -103,6 +115,8 @@ export default function MiConfiguracion() {
       setCbuList(Array.isArray(data.cbu_list) ? data.cbu_list : []);
       setDerivationMessage(data.derivation_message || '');
       setDerivationNumbers(Array.isArray(data.derivation_numbers) ? data.derivation_numbers : []);
+      setQuickTemplates(data.quick_templates && typeof data.quick_templates === 'object' ? data.quick_templates : {});
+      if (data.ai_config && typeof data.ai_config === 'object') setAiConfig(prev => ({ ...prev, ...data.ai_config }));
     } catch {
       toast.error('No pude cargar tu configuración');
     } finally {
@@ -124,6 +138,24 @@ export default function MiConfiguracion() {
         cbu_list: cbuList
           .map(item => ({ cbu: (item.cbu || '').trim(), name: (item.name || '').trim() }))
           .filter(item => item.cbu),
+        // Only send keys that have non-empty content — keeps the doc clean.
+        quick_templates: Object.fromEntries(
+          Object.entries(quickTemplates).map(([k, v]) => [k, (v || '').trim()]).filter(([, v]) => v)
+        ),
+        ai_config: {
+          ...aiConfig,
+          // Strip empty/whitespace platform entries only at save time so the
+          // textarea can render blank lines while the user is typing. Also
+          // split any line that contains commas (e.g. "a,b,c") into separate
+          // entries, so the AI shows them as distinct bullets.
+          platforms: Array.isArray(aiConfig.platforms)
+            ? aiConfig.platforms
+                .flatMap(p => (p || '').split(','))
+                .map(p => p.trim())
+                .filter(Boolean)
+                .slice(0, 20)
+            : [],
+        },
       };
       await api.put('/auth/me/messages', payload);
       toast.success('Configuración guardada');
@@ -215,6 +247,191 @@ export default function MiConfiguracion() {
               <Info className="w-3 h-3 shrink-0 mt-0.5" />
               Mensaje que se envía con el botón "Usuario" del chat al confirmar la creación del usuario del cliente.
             </p>
+          </section>
+
+          {/* ⚡ Cargado — Respuestas rápidas rotativas */}
+          <section className="rounded-lg border border-slate-800 bg-slate-900/40 p-4" data-testid="section-quick-cargado">
+            <div className="flex items-center justify-between gap-2 mb-3">
+              <div className="flex items-center gap-2">
+                <span className="text-lime-400 text-lg leading-none">⚡</span>
+                <h2 className="text-sm font-semibold">Cargado — respuestas rotativas</h2>
+              </div>
+              <span className="text-[10px] text-slate-500 uppercase tracking-wide">
+                {((quickTemplates.cargado || '').split(/\n\s*-{3,}\s*\n/).map(s => s.trim()).filter(Boolean).length)} variantes
+              </span>
+            </div>
+            <Textarea
+              value={quickTemplates.cargado || ''}
+              onChange={e => setQuickTemplates(prev => ({ ...prev, cargado: e.target.value }))}
+              placeholder={`Escribí una variante por bloque separado por --- en línea propia. Ej:\n¡Cargado! ✅\n---\nListo, papu 🎉\n---\nSe cargó ya ⚡`}
+              className="bg-slate-800 border-slate-700 text-white text-sm min-h-[220px] font-mono leading-relaxed"
+              data-testid="quick-cargado-textarea"
+            />
+            <div className="mt-2 space-y-1.5 text-[11px] text-slate-500">
+              <p className="flex gap-1.5">
+                <Info className="w-3 h-3 shrink-0 mt-0.5" />
+                <span>
+                  Cada vez que el cajero presione el botón <span className="text-lime-400">⚡ Cargado</span> del chat,
+                  el sistema elige aleatoriamente una de las variantes. Meta detecta el mismo mensaje repetido a
+                  muchos clientes como <em>bot</em> — rotarlo previene la caída de las líneas principales.
+                </span>
+              </p>
+              <p className="pl-4 text-slate-600">
+                💡 Separador: tres o más guiones <code className="text-slate-400">---</code> en una línea propia entre variantes.
+                Recomendado: 8-10 variantes.
+              </p>
+            </div>
+          </section>
+
+          {/* 🤖 Asistente IA — auto-respuesta por intent */}
+          <section className="rounded-lg border border-violet-800/50 bg-violet-950/20 p-4" data-testid="section-ai-agent">
+            <div className="flex items-center justify-between gap-2 mb-3">
+              <div className="flex items-center gap-2">
+                <span className="text-violet-300 text-lg leading-none">🤖</span>
+                <h2 className="text-sm font-semibold">Asistente IA (Claude Sonnet)</h2>
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300">
+                  ~$0.007/msg
+                </span>
+              </div>
+              <label className="flex items-center gap-2 cursor-pointer" data-testid="ai-enabled-toggle">
+                <input
+                  type="checkbox"
+                  checked={!!aiConfig.enabled}
+                  onChange={e => setAiConfig(prev => ({ ...prev, enabled: e.target.checked }))}
+                  className="w-4 h-4 accent-violet-500"
+                />
+                <span className={`text-xs font-semibold ${aiConfig.enabled ? 'text-emerald-300' : 'text-slate-500'}`}>
+                  {aiConfig.enabled ? 'ACTIVO' : 'Desactivado'}
+                </span>
+              </label>
+            </div>
+
+            <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
+              Cuando el cliente escribe, la IA clasifica su intención (carga / retiro / nuevo usuario / revisar) y
+              responde automáticamente siguiendo un flujo. Ta&shy;guea el lead para que solo tengas que ejecutar la
+              operación. <strong className="text-amber-300">Costo estimado</strong>: ~$0.007 USD por mensaje procesado
+              (~$20 al día por cada línea con 1000 msgs/día).
+            </p>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+              <div>
+                <label className="text-[11px] text-slate-400 block mb-1">Nombre de marca</label>
+                <input
+                  value={aiConfig.brand_name || ''}
+                  onChange={e => setAiConfig(prev => ({ ...prev, brand_name: e.target.value }))}
+                  placeholder="Ej: TataNET"
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm text-white"
+                  data-testid="ai-brand-name-input"
+                />
+              </div>
+              <div>
+                <label className="text-[11px] text-slate-400 block mb-1">Tono</label>
+                <select
+                  value={aiConfig.brand_tone || 'casual'}
+                  onChange={e => setAiConfig(prev => ({ ...prev, brand_tone: e.target.value }))}
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm text-white"
+                  data-testid="ai-brand-tone-select"
+                >
+                  <option value="formal">Formal (usted)</option>
+                  <option value="casual">Casual (vos, tuteo)</option>
+                  <option value="amistoso">Amistoso (con emojis, apodos)</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-[11px] text-slate-400 block mb-1">Horario apertura (AR)</label>
+                <input
+                  type="time"
+                  value={aiConfig.opening_time || '09:00'}
+                  onChange={e => setAiConfig(prev => ({ ...prev, opening_time: e.target.value }))}
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm text-white"
+                />
+              </div>
+              <div>
+                <label className="text-[11px] text-slate-400 block mb-1">Horario cierre (AR)</label>
+                <input
+                  type="time"
+                  value={aiConfig.closing_time || '01:00'}
+                  onChange={e => setAiConfig(prev => ({ ...prev, closing_time: e.target.value }))}
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm text-white"
+                />
+              </div>
+              <div>
+                <label className="text-[11px] text-slate-400 block mb-1">Carga mínima ($)</label>
+                <input
+                  type="number" min="0"
+                  value={aiConfig.min_deposit ?? 1000}
+                  onChange={e => setAiConfig(prev => ({ ...prev, min_deposit: Number(e.target.value) }))}
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm text-white"
+                />
+              </div>
+              <div>
+                <label className="text-[11px] text-slate-400 block mb-1">Carga máxima ($)</label>
+                <input
+                  type="number" min="0"
+                  value={aiConfig.max_deposit ?? 500000}
+                  onChange={e => setAiConfig(prev => ({ ...prev, max_deposit: Number(e.target.value) }))}
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm text-white"
+                />
+              </div>
+              <div>
+                <label className="text-[11px] text-slate-400 block mb-1">Retiro mínimo ($)</label>
+                <input
+                  type="number" min="0"
+                  value={aiConfig.min_withdrawal ?? 1000}
+                  onChange={e => setAiConfig(prev => ({ ...prev, min_withdrawal: Number(e.target.value) }))}
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm text-white"
+                />
+              </div>
+              <div>
+                <label className="text-[11px] text-slate-400 block mb-1">Retiro máximo ($)</label>
+                <input
+                  type="number" min="0"
+                  value={aiConfig.max_withdrawal ?? 500000}
+                  onChange={e => setAiConfig(prev => ({ ...prev, max_withdrawal: Number(e.target.value) }))}
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm text-white"
+                />
+              </div>
+            </div>
+
+            <div className="mb-3">
+              <label className="text-[11px] text-slate-400 block mb-1">
+                🎰 Plataformas disponibles (una por línea)
+              </label>
+              <Textarea
+                value={(aiConfig.platforms || []).join('\n')}
+                onChange={e => setAiConfig(prev => ({
+                  ...prev,
+                  // Preserve empty lines while typing (Enter must work). We
+                  // filter/trim only at save time in `save()` below.
+                  platforms: e.target.value.split('\n').slice(0, 20)
+                }))}
+                placeholder={"Ej:\nNueva Vegas\n1xBet\nBetsson"}
+                className="bg-slate-800 border-slate-700 text-white text-xs min-h-[80px] font-mono"
+                data-testid="ai-platforms-input"
+              />
+              <p className="text-[10px] text-slate-500 mt-1">
+                La IA le va a mostrar estas opciones al cliente cuando quiera crearse un usuario nuevo.
+              </p>
+            </div>
+
+            <div className="mb-3">
+              <label className="text-[11px] text-slate-400 block mb-1">Mensaje fuera de horario</label>
+              <Textarea
+                value={aiConfig.off_hours_message || ''}
+                onChange={e => setAiConfig(prev => ({ ...prev, off_hours_message: e.target.value }))}
+                placeholder="Usá {opening} y {closing} como placeholders"
+                className="bg-slate-800 border-slate-700 text-white text-xs min-h-[60px]"
+              />
+            </div>
+
+            <div className="p-3 rounded bg-slate-900/60 border border-slate-800 space-y-1.5 text-[11px]">
+              <div className="text-violet-300 font-semibold">🎯 Etiquetas que la IA aplica automáticamente:</div>
+              <div>🟢 <strong>pendiente-carga</strong> — cliente mandó comprobante o pidió CBU</div>
+              <div>🟡 <strong>pendiente-retiro</strong> — cliente completó el pedido de retiro</div>
+              <div>🔵 <strong>nuevo-usuario</strong> — cliente pasó todos los datos para alta</div>
+              <div>🔴 <strong>revisar</strong> — la IA no está segura o el cliente pidió humano</div>
+              <div className="pt-1 text-slate-500">Cuando terminás la operación, quitá el tag desde el chat.</div>
+            </div>
           </section>
 
           {/* CBUs */}
