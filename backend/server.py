@@ -22,6 +22,7 @@ import base64
 import json
 import httpx
 import bcrypt
+import zoneinfo
 
 # Meta CAPI Parameter Builder (official Facebook SDK)
 # Enhances fbc/fbp with server-side appendix (+~0.7 EMQ points, removes
@@ -14068,7 +14069,24 @@ async def _persist_and_send_ai_reply(lead: dict, line: dict, reply_text: str):
 
 
 def _receipt_extract_prompt() -> str:
+    # Anchor the model with Argentina's current wall-clock date so it never
+    # flags a receipt as "future-dated" just because the server (Railway /
+    # Vercel / any cloud) runs in UTC and the payer's day rolled over at
+    # 21:00 ARS (=00:00 UTC).
+    try:
+        _tz = zoneinfo.ZoneInfo("America/Argentina/Buenos_Aires")
+        _now_ar = datetime.now(_tz)
+        _now_ar_str = _now_ar.strftime("%Y-%m-%d %H:%M:%S %Z")
+        _today_ar_str = _now_ar.strftime("%Y-%m-%d")
+    except Exception:
+        _now_ar_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        _today_ar_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return (
+        f"🕒 Reference time (source of truth): {_now_ar_str} — "
+        f"Argentina wall-clock time. Any receipt date you parse must be "
+        f"interpreted in that timezone. Today in Argentina is "
+        f"{_today_ar_str}. A receipt dated 'today' MUST match {_today_ar_str} "
+        f"even if the server timezone (UTC) already crossed midnight.\n\n"
         "You are a bank/wallet receipt reader AND a forensic fraud analyst. "
         "The image is supposedly a transfer receipt (Mercado Pago, bank app, "
         "MODO, Ualá, Naranja X, etc.), commonly from Argentina, sent by a "
@@ -14084,12 +14102,17 @@ def _receipt_extract_prompt() -> str:
         '  "recipient_cbu": string (the RECIPIENT\'s CBU/CVU — 22-digit number, or alias like "juan.mp"). null if not readable,\n'
         '  "bank": string (bank or wallet name: "Mercado Pago", "Banco Nación", "Ualá", etc.). null if not readable,\n'
         '  "reference": string (operation/reference/comprobante number). null if not readable,\n'
-        '  "date_str": string (date of the transfer as shown, ISO if possible). null if not readable,\n'
+        '  "date_str": string (date of the transfer as shown on the receipt, ISO if possible — in Argentina timezone). null if not readable,\n'
         '  "confidence": number 0..1 (your confidence in the extracted data. Drop this to ≤0.5 if you spot any tampering signal),\n'
         '  "is_likely_edited": boolean (true if you detect visual evidence of digital editing on the receipt),\n'
         '  "tampering_confidence": number 0..1 (your confidence that the image was EDITED. 0 = definitely genuine, 1 = definitely tampered),\n'
         '  "tampering_signals": array of short Spanish strings describing SPECIFIC visual anomalies you spotted (empty array if none)\n'
         "}\n\n"
+        "⏰ DATE VALIDATION RULES:\n"
+        f"  • Argentina's current date/time is {_now_ar_str}.\n"
+        "  • NEVER flag a receipt as tampered just because its timestamp is 'in the future' — first verify against the Argentina reference above.\n"
+        "  • If the receipt date is within ±24h of the reference, treat it as valid same-day/adjacent-day.\n"
+        "  • Only flag as suspicious if the date is clearly IMPOSSIBLE (e.g. year 2099, month 13).\n\n"
         "🔍 TAMPERING SIGNALS TO LOOK FOR (this is critical):\n"
         "  • Amount digits with DIFFERENT font, size, weight, or antialiasing than the rest of the text\n"
         "  • Amount digits misaligned vertically or horizontally vs the surrounding label\n"
@@ -14104,6 +14127,9 @@ def _receipt_extract_prompt() -> str:
         "  • Missing UI elements you'd expect (status bar, share button, official app chrome)\n"
         "  • Photograph of a screen instead of a screenshot when a screenshot would be trivial\n"
         "\n"
+        "IMPORTANT: mild JPEG compression artifacts around amounts on Mercado Pago / bank app screenshots are NORMAL — "
+        "modern messaging apps re-compress every image. Do NOT flag as tampered unless multiple signals coincide. "
+        "Focus on Paint-style pixelated overlays, misaligned fonts, and background discontinuities — those are the real red flags.\n\n"
         "Be paranoid but not accusatory. Report each concrete signal you observe.\n"
         "If nothing looks tampered, set is_likely_edited=false, tampering_confidence≤0.15, tampering_signals=[].\n"
         "If you spot ANY of the above, list them.\n\n"
