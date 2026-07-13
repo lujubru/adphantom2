@@ -3020,21 +3020,12 @@ async def wa_webhook_receive(request: Request):
                         crm_lead = await db.crm_leads.find_one({"phone": from_phone})
                     
                     if not crm_lead:
-                        # Create new lead in CRM (one per line)
+                        # Create new lead in CRM (one per line). We intentionally
+                        # do NOT auto-create "webhook" or line-name tags anymore
+                        # — those pollute the cashier's tag list. Only the AI
+                        # agent adds tags (pendiente-carga / pendiente-retiro /
+                        # nuevo-usuario / revisar) when it classifies intent.
                         lead_id = str(uuid.uuid4())
-                        # Resolve the "webhook" auto-tag to a real crm_tags UUID
-                        # for this line (auto-creating on first hit). Storing
-                        # raw strings here used to break the tag editor with
-                        # "Etiquetas inexistentes: [...]" the moment a cashier
-                        # tried to add another tag.
-                        webhook_tag_ids: List[str] = []
-                        if target_line_id:
-                            try:
-                                _wt = await _resolve_or_create_tag("webhook", target_line_id)
-                                if _wt and _wt.get("id"):
-                                    webhook_tag_ids.append(_wt["id"])
-                            except Exception as _e:
-                                logger.warning(f"tags: could not auto-create 'webhook' tag: {_e}")
                         crm_lead = {
                             "id": lead_id,
                             "name": sender_name or f"Lead {from_phone[-4:]}",
@@ -3050,7 +3041,7 @@ async def wa_webhook_receive(request: Request):
                                 "display_phone": display_phone,
                             },
                             "notes": "",
-                            "tags": webhook_tag_ids,
+                            "tags": [],
                             "created_at": now,
                             "updated_at": now,
                             "last_interaction": now,
@@ -5734,6 +5725,54 @@ async def crm_delete_tag(tag_id: str, current_user=Depends(get_current_user)):
     return {"message": "Etiqueta eliminada", "tag_id": tag_id}
 
 
+@api_router.post("/crm/tags/cleanup-auto-created")
+async def crm_cleanup_auto_created_tags(current_user=Depends(get_current_user)):
+    """Admin-only maintenance: delete legacy auto-created tags that the old
+    webhook code used to spawn (name='webhook' and one per line-name). Only
+    removes docs with `auto_created=True` so cashier-made tags with the same
+    name are preserved. AI tags (🟢/🟡/🔵/🔴) are always kept.
+
+    Safe to run multiple times.
+    """
+    if current_user.get("role") not in ("admin", "superadmin"):
+        raise HTTPException(status_code=403, detail="Solo admins")
+
+    # Build the set of line names we know about — those are the ones legacy
+    # code auto-tagged onto new leads.
+    line_names = set()
+    async for _ln in db.crm_lines.find({}, {"_id": 0, "name": 1}):
+        nm = (_ln.get("name") or "").strip()
+        if nm:
+            line_names.add(nm)
+
+    ai_prefixes = ("🟢", "🟡", "🔵", "🔴")
+
+    to_delete: list = []
+    async for tag in db.crm_tags.find({"auto_created": True}, {"_id": 0, "id": 1, "name": 1}):
+        name = (tag.get("name") or "").strip()
+        if not name:
+            continue
+        if any(name.startswith(p) for p in ai_prefixes):
+            continue  # never remove AI tags
+        if name == "webhook" or name in line_names:
+            to_delete.append(tag["id"])
+
+    if not to_delete:
+        return {"message": "Nada para limpiar", "deleted_tags": 0, "leads_updated": 0}
+
+    _r_tags = await db.crm_tags.delete_many({"id": {"$in": to_delete}})
+    _r_leads = await db.crm_leads.update_many(
+        {"tags": {"$in": to_delete}},
+        {"$pull": {"tags": {"$in": to_delete}}},
+    )
+    return {
+        "message": "Etiquetas basura eliminadas",
+        "deleted_tags": int(_r_tags.deleted_count),
+        "leads_updated": int(_r_leads.modified_count),
+        "sample": to_delete[:10],
+    }
+
+
 @api_router.patch("/crm/leads/{lead_id}/tags")
 async def crm_set_lead_tags(
     lead_id: str,
@@ -6177,21 +6216,12 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                             await db.crm_leads.update_one({"id": crm_lead["id"]}, {"$set": fb_update})
                     
                     if not crm_lead:
-                        # Create new lead
+                        # Create new lead. We intentionally do NOT auto-create
+                        # "webhook" or line-name tags anymore — those pollute
+                        # the cashier's tag list. Only the AI agent adds tags
+                        # (pendiente-carga / pendiente-retiro / nuevo-usuario /
+                        # revisar) when it classifies the intent.
                         lead_id = str(uuid.uuid4())
-                        # Auto-resolve "webhook" + line name to real crm_tags UUIDs
-                        # so the tag editor works right away for cajeros. See
-                        # _resolve_or_create_tag docstring for the "why".
-                        _wh_tag_ids: List[str] = []
-                        try:
-                            _wt = await _resolve_or_create_tag("webhook", line_id)
-                            if _wt and _wt.get("id"):
-                                _wh_tag_ids.append(_wt["id"])
-                            _ln_tag = await _resolve_or_create_tag(line.get("name") or "", line_id)
-                            if _ln_tag and _ln_tag.get("id") and _ln_tag["id"] not in _wh_tag_ids:
-                                _wh_tag_ids.append(_ln_tag["id"])
-                        except Exception as _e:
-                            logger.warning(f"tags: could not auto-create webhook tags: {_e}")
                         crm_lead = {
                             "id": lead_id,
                             "name": sender_name or f"Lead {from_phone[-4:]}",
@@ -6213,7 +6243,7 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                                 "display_phone": display_phone,
                             },
                             "notes": "",
-                            "tags": _wh_tag_ids,
+                            "tags": [],
                             "created_at": now,
                             "updated_at": now,
                             "last_interaction": now,
@@ -12501,21 +12531,21 @@ async def startup():
         logger.error(f"MongoDB connection FAILED: {e}")
         return
     # Create admin user if not exists
-    existing = await db.users.find_one({"email": "admin@maxi.com"})
-    if not existing:
-        hashed = pwd_context.hash("admin123")
-        await db.users.insert_one({
-            "id": str(uuid.uuid4()),
-            "email": "admin@maxi.com",
-            "hashed_password": hashed,
-            "role": "admin",
-            "is_active": True,
-            "welcome_message": "",
-            "user_message": "",
-            "line_ids": [],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        })
-        logger.info("Admin user created: admin@maxi.com")
+    # existing = await db.users.find_one({"email": "admin@maxi.com"})
+    # if not existing:
+    #     hashed = pwd_context.hash("admin123")
+    #     await db.users.insert_one({
+    #         "id": str(uuid.uuid4()),
+    #         "email": "admin@maxi.com",
+    #         "hashed_password": hashed,
+    #         "role": "admin",
+    #         "is_active": True,
+    #         "welcome_message": "",
+    #         "user_message": "",
+    #         "line_ids": [],
+    #         "created_at": datetime.now(timezone.utc).isoformat(),
+    #     })
+    #     logger.info("Admin user created: admin@maxi.com")
     # Create cajero user if not exists 
 #    existing_cajero = await db.users.find_one({"email": "cajero@blackguardian.com"})
 #    if not existing_cajero:
