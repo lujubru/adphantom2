@@ -3016,8 +3016,11 @@ async def wa_webhook_receive(request: Request):
                                 crm_lead["line_id"] = target_line_id
                             # If lead exists on a DIFFERENT line, crm_lead stays None → new lead created below
                     else:
-                        # No line matched — find any lead with this phone
-                        crm_lead = await db.crm_leads.find_one({"phone": from_phone})
+                        # No line matched — only reuse leads that are ALSO
+                        # unassigned. NEVER attach messages to a lead that
+                        # belongs to a real line, that would leak the
+                        # message into another cajero's chat.
+                        crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": None})
                     
                     if not crm_lead:
                         # Create new lead in CRM (one per line). We intentionally
@@ -3107,19 +3110,26 @@ async def wa_webhook_receive(request: Request):
                     }
                     
                     if crm_lead:
-                        crm_message["lead_id"] = crm_lead.get("id") or (await db.crm_leads.find_one({"phone": from_phone}))["id"]
+                        # SECURITY: mensaje se asocia al lead ESPECÍFICO que
+                        # resolvimos arriba (mismo phone + line_id). NUNCA
+                        # hacer fallback a "primer lead con ese phone" — eso
+                        # cruza chats entre cajeros de líneas distintas.
+                        crm_message["lead_id"] = crm_lead["id"]
                         await db.crm_messages.insert_one(crm_message)
-                        
-                        # Update message count
+
+                        # Update message count on the CORRECT lead (by id,
+                        # not by phone — a phone can exist across multiple
+                        # lines / cajeros and Mongo update_one would
+                        # otherwise pick an arbitrary one).
                         await db.crm_leads.update_one(
-                            {"phone": from_phone},
+                            {"id": crm_lead["id"]},
                             {"$inc": {"messages_count": 1, "unread_count": 1}}
                         )
 
                         # Fire web push notification to every cajero assigned to this line
                         if crm_line:
                             import asyncio as _asyncio
-                            fresh_lead = await db.crm_leads.find_one({"phone": from_phone}, {"_id": 0}) or crm_lead
+                            fresh_lead = await db.crm_leads.find_one({"id": crm_lead["id"]}, {"_id": 0}) or crm_lead
                             preview_text = text if msg_type == "text" else f"[{msg_type}]"
                             _asyncio.create_task(notify_line_cajeros_of_new_message(fresh_lead, crm_line, preview_text))
                     
@@ -3150,18 +3160,22 @@ async def wa_webhook_receive(request: Request):
                                     "utm_campaign": click_data.get("utm_campaign", ""),
                                 }}
                             )
-                            # Also propagate fbc/fbp/click_id to crm_lead so Purchase events can use them
-                            await db.crm_leads.update_one(
-                                {"phone": from_phone},
-                                {"$set": {
-                                    "click_id": click_id,
-                                    "landing_code": click_data.get("landing_code", ""),
-                                    "fbp": click_data.get("fbp", ""),
-                                    "fbc": click_data.get("fbc", ""),
-                                    "ip_address": click_data.get("ip", ""),
-                                    "user_agent": click_data.get("user_agent", ""),
-                                }}
-                            )
+                            # Also propagate fbc/fbp/click_id to the SPECIFIC
+                            # crm_lead we resolved for this line (not "any
+                            # lead with this phone" — that would leak data
+                            # into the wrong cajero's lead).
+                            if crm_lead:
+                                await db.crm_leads.update_one(
+                                    {"id": crm_lead["id"]},
+                                    {"$set": {
+                                        "click_id": click_id,
+                                        "landing_code": click_data.get("landing_code", ""),
+                                        "fbp": click_data.get("fbp", ""),
+                                        "fbc": click_data.get("fbc", ""),
+                                        "ip_address": click_data.get("ip", ""),
+                                        "user_agent": click_data.get("user_agent", ""),
+                                    }}
+                                )
 
                     # ═══ Meta Click-to-WhatsApp Ads referral capture ═══
                     # When user comes from a CTWA Ad, msg.referral contains:
@@ -3198,10 +3212,13 @@ async def wa_webhook_receive(request: Request):
                         if referral_data:
                             lead_fb_update["referral"] = referral_data
                         if lead_fb_update:
-                            await db.crm_leads.update_one(
-                                {"phone": from_phone},
-                                {"$set": lead_fb_update}
-                            )
+                            # Scope by lead id — same-phone leads on other
+                            # lines belong to other cajeros.
+                            if crm_lead:
+                                await db.crm_leads.update_one(
+                                    {"id": crm_lead["id"]},
+                                    {"$set": lead_fb_update}
+                                )
                             await db.wa_contacts.update_one(
                                 {"phone": from_phone},
                                 {"$set": lead_fb_update}
@@ -3334,7 +3351,7 @@ async def wa_classify_contact(phone: str, data: WAClassify, current_user=Depends
         }
         new_status = status_map.get(data.classification, "nuevo")
         
-        await db.crm_leads.update_one(
+        await db.crm_leads.update_many(
             {"phone": phone},
             {"$set": {
                 "status": new_status,
@@ -5773,6 +5790,66 @@ async def crm_cleanup_auto_created_tags(current_user=Depends(get_current_user)):
     }
 
 
+@api_router.get("/crm/diagnostics/cross-line-chats")
+async def crm_diag_cross_line_chats(current_user=Depends(get_current_user)):
+    """Admin-only: report phones that have leads on more than one line
+    AND messages whose `lead_id` points to a lead whose (phone,line_id)
+    contradicts the message's expected line. Useful after fixing the
+    webhook bug that used to update the wrong lead when a phone existed
+    across lines.
+
+    Response:
+      {
+        "phones_on_multiple_lines": int,
+        "sample_phones": [{"phone": "...", "leads": [{lead_id, line_id, line_name, messages_count}]}]
+      }
+    """
+    if current_user.get("role") not in ("admin", "superadmin"):
+        raise HTTPException(status_code=403, detail="Solo admins")
+
+    # Aggregate: group crm_leads by phone, keep only those with >=2 distinct lines
+    pipeline = [
+        {"$match": {"deleted_at": {"$in": [None, ""]}}},
+        {"$group": {
+            "_id": "$phone",
+            "leads": {"$push": {"id": "$id", "line_id": "$line_id",
+                                 "messages_count": "$messages_count",
+                                 "name": "$name"}},
+            "line_count": {"$addToSet": "$line_id"},
+        }},
+        {"$match": {"$expr": {"$gt": [{"$size": "$line_count"}, 1]}}},
+        {"$limit": 200},
+    ]
+    dupes: List[Dict] = []
+    async for row in db.crm_leads.aggregate(pipeline):
+        dupes.append(row)
+
+    # Enrich with line names (batch)
+    line_ids = {l["line_id"] for d in dupes for l in d["leads"] if l.get("line_id")}
+    line_names: Dict[str, str] = {}
+    if line_ids:
+        async for ln in db.crm_lines.find({"id": {"$in": list(line_ids)}}, {"_id": 0, "id": 1, "name": 1}):
+            line_names[ln["id"]] = ln.get("name", "")
+
+    sample = []
+    for d in dupes[:30]:
+        sample.append({
+            "phone": d["_id"],
+            "leads": [{
+                "lead_id": l["id"],
+                "line_id": l.get("line_id"),
+                "line_name": line_names.get(l.get("line_id"), "(sin línea)"),
+                "messages_count": l.get("messages_count", 0),
+                "name": l.get("name"),
+            } for l in d["leads"]],
+        })
+
+    return {
+        "phones_on_multiple_lines": len(dupes),
+        "sample": sample,
+    }
+
+
 @api_router.patch("/crm/leads/{lead_id}/tags")
 async def crm_set_lead_tags(
     lead_id: str,
@@ -6310,7 +6387,10 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                     
                     # Add message to CRM lead chat
                     # Add message to CRM lead chat (with deduplication)
-                    lead_id = crm_lead.get("id") or (await db.crm_leads.find_one({"phone": from_phone}))["id"]
+                    # SECURITY: never fall back to "any lead with this phone"
+                    # — a phone can exist on multiple lines belonging to
+                    # different cajeros and that would cross-post the msg.
+                    lead_id = crm_lead["id"]
                     
                     # Check if message already exists (deduplication)
                     existing_msg = await db.crm_messages.find_one({"wa_message_id": msg_id})
