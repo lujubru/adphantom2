@@ -2142,6 +2142,81 @@ async def _send_crm_image_to_wa_async(
             pass
 
 
+async def _send_crm_video_to_wa_async(
+    message_id: str,
+    file_bytes: bytes,
+    filename: str,
+    mime_type: str,
+    phone: str,
+    caption: str,
+    token: str,
+    phone_id: str,
+    line_name: Optional[str] = None,
+):
+    """Background task: upload a video to Meta + send it to the lead.
+    Mirrors _send_crm_image_to_wa_async — endpoint returns fast, delivery
+    status is updated later via wa_message_id from the webhook.
+    """
+    try:
+        upload_res = await wa_upload_media(
+            file_bytes=file_bytes,
+            filename=filename,
+            mime_type=mime_type,
+            token=token,
+            phone_id=phone_id,
+        )
+        media_id = upload_res.get("id") if isinstance(upload_res, dict) else None
+        if not media_id:
+            logger.error(f"CRM: WA video upload FAILED for msg {message_id}: {upload_res}")
+            err = (upload_res or {}).get("error") or {}
+            await db.crm_messages.update_one(
+                {"id": message_id},
+                {"$set": {
+                    "delivery_status": "failed",
+                    "wa_result": upload_res,
+                    "delivery_error_title": (err.get("message") if isinstance(err, dict) else None) or "upload_failed",
+                    "delivery_error_code": err.get("code") if isinstance(err, dict) else None,
+                }},
+            )
+            return
+
+        send_res = await wa_send_video(
+            phone=phone,
+            media_id=media_id,
+            caption=caption or "",
+            token=token,
+            phone_id=phone_id,
+        )
+        logger.info(f"CRM: Sent WA video to {phone} via line {line_name}: {send_res}")
+        wamid = None
+        if isinstance(send_res, dict):
+            try:
+                wamid = (send_res.get("messages") or [{}])[0].get("id")
+            except Exception:
+                wamid = None
+        update = {
+            "wa_result": send_res,
+            "wa_message_id": wamid,
+            "media_id": media_id,
+            "delivery_status": "sent" if wamid else "failed",
+        }
+        if not wamid and isinstance(send_res, dict):
+            err = send_res.get("error") or {}
+            if isinstance(err, dict):
+                update["delivery_error_code"] = err.get("code")
+                update["delivery_error_title"] = err.get("message") or err.get("title")
+        await db.crm_messages.update_one({"id": message_id}, {"$set": update})
+    except Exception as e:
+        logger.error(f"CRM: Background WA video send FAILED for msg {message_id}: {e}")
+        try:
+            await db.crm_messages.update_one(
+                {"id": message_id},
+                {"$set": {"delivery_status": "failed", "delivery_error_title": str(e)[:200]}},
+            )
+        except Exception:
+            pass
+
+
 async def _send_crm_audio_to_wa_async(
     message_id: str,
     file_bytes: bytes,
@@ -2330,6 +2405,29 @@ async def wa_send_image(phone: str, media_id: str, caption: str = "", token: str
             return resp.json()
     except Exception as e:
         logger.error(f"WA send image error: {e}")
+        return {"error": str(e)}
+
+
+async def wa_send_video(phone: str, media_id: str, caption: str = "", token: str = None, phone_id: str = None):
+    """Send a WhatsApp video by media_id via Cloud API. Supports optional caption."""
+    if not token or not phone_id:
+        return {"error": "WhatsApp no configurado"}
+    url = f"{WA_GRAPH_URL}/{phone_id}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "video",
+        "video": {"id": media_id},
+    }
+    if caption:
+        payload["video"]["caption"] = caption
+    try:
+        async with httpx.AsyncClient(timeout=60) as c:
+            resp = await c.post(url, json=payload, headers=headers)
+            return resp.json()
+    except Exception as e:
+        logger.error(f"WA send video error: {e}")
         return {"error": str(e)}
 
 
@@ -5793,18 +5891,7 @@ async def crm_cleanup_auto_created_tags(current_user=Depends(get_current_user)):
 
 @api_router.get("/crm/diagnostics/cross-line-chats")
 async def crm_diag_cross_line_chats(current_user=Depends(get_current_user)):
-    """Admin-only: report phones that have leads on more than one line
-    AND messages whose `lead_id` points to a lead whose (phone,line_id)
-    contradicts the message's expected line. Useful after fixing the
-    webhook bug that used to update the wrong lead when a phone existed
-    across lines.
-
-    Response:
-      {
-        "phones_on_multiple_lines": int,
-        "sample_phones": [{"phone": "...", "leads": [{lead_id, line_id, line_name, messages_count}]}]
-      }
-    """
+    """Admin-only: report phones that have leads on more than one line."""
     if current_user.get("role") not in ("admin", "superadmin"):
         raise HTTPException(status_code=403, detail="Solo admins")
 
@@ -7688,6 +7775,51 @@ async def crm_get_message_audio(message_id: str, current_user=Depends(get_curren
         return {"audio_base64": audio_base64, "mime_type": mime}
 
 
+@api_router.get("/crm/messages/{message_id}/video")
+async def crm_get_message_video(message_id: str, current_user=Depends(get_current_user)):
+    """Download an inbound video from WhatsApp media and return it as base64.
+
+    Mirrors the audio endpoint. Only used for videos SENT BY THE LEAD —
+    videos we send ourselves are served locally via /crm/chat-video/{file}.
+    """
+    msg = await db.crm_messages.find_one({"id": message_id}, {"_id": 0})
+    if not msg:
+        raise HTTPException(status_code=404, detail="Mensaje no encontrado")
+    if msg.get("message_type") != "video" or not msg.get("media_id"):
+        raise HTTPException(status_code=400, detail="El mensaje no es un video")
+
+    lead = await db.crm_leads.find_one({"id": msg["lead_id"]}, {"_id": 0})
+    if not lead or not lead.get("line_id"):
+        raise HTTPException(status_code=400, detail="Lead sin línea asignada")
+
+    line = await db.crm_lines.find_one({"id": lead["line_id"]}, {"_id": 0})
+    if not line or not line.get("whatsapp_token"):
+        raise HTTPException(status_code=400, detail="Línea sin token de WhatsApp")
+
+    token = line["whatsapp_token"]
+    media_id = msg["media_id"]
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        url_resp = await client.get(
+            f"https://graph.facebook.com/v18.0/{media_id}",
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        if url_resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Error obteniendo URL del video")
+        media_url = url_resp.json().get("url")
+
+        video_resp = await client.get(
+            media_url,
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        if video_resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Error descargando video")
+
+        video_base64 = base64.b64encode(video_resp.content).decode("utf-8")
+        mime = msg.get("mime_type", "video/mp4")
+        return {"video_base64": video_base64, "mime_type": mime}
+
+
 @api_router.post("/crm/leads/{lead_id}/messages")
 async def crm_send_message(
     lead_id: str,
@@ -8119,6 +8251,148 @@ async def crm_get_chat_image(filename: str):
         raise HTTPException(status_code=404, detail="Imagen no encontrada")
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "jpg"
     mime = {"png": "image/png", "webp": "image/webp", "gif": "image/gif", "jpg": "image/jpeg", "jpeg": "image/jpeg"}.get(ext, "image/jpeg")
+    return FileResponse(file_path, media_type=mime)
+
+
+@api_router.post("/crm/leads/{lead_id}/messages/video")
+async def crm_send_video_message(
+    lead_id: str,
+    file: UploadFile = File(...),
+    caption: str = Form(""),
+    force: bool = Form(False),
+    current_user=Depends(get_current_user)
+):
+    """Upload a video and send it via WhatsApp to the lead.
+
+    Same async flow as the image endpoint: insert crm_messages doc with
+    delivery_status='sending' → return fast → background task uploads to
+    Meta and updates the doc with wa_message_id when done.
+
+    Meta Cloud API accepts:
+      - video/mp4
+      - video/3gp (video/3gpp)
+    Hard limit: 16 MB per Meta docs. Larger videos are silently dropped
+    or rejected, so we cap on the server side too.
+    """
+    lead = await db.crm_leads.find_one({"id": lead_id})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead no encontrado")
+
+    # Accept common browser MIME types. Some browsers report `video/quicktime`
+    # for iOS `.mov` files; Meta rejects those, so we require mp4/3gp.
+    ctype = (file.content_type or "").lower().split(";")[0].strip()
+    allowed_types = ("video/mp4", "video/3gpp", "video/3gp")
+    if ctype not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Formato no permitido ({file.content_type}). Solo mp4 o 3gp."
+        )
+
+    if not lead.get("line_id") or not lead.get("phone"):
+        raise HTTPException(status_code=400, detail="Lead sin línea o teléfono configurado")
+
+    line = await db.crm_lines.find_one({"id": lead["line_id"]}, {"_id": 0})
+    if not line or not line.get("whatsapp_token") or not line.get("phone_number_id"):
+        raise HTTPException(status_code=400, detail="Línea sin credenciales de WhatsApp")
+
+    # ── 24h window check (same as text / image) ─────────────────
+    if not force:
+        last_inbound = await db.crm_messages.find_one(
+            {"lead_id": lead_id, "sender": "lead"},
+            {"_id": 0, "created_at": 1},
+            sort=[("created_at", -1)],
+        )
+        if last_inbound and last_inbound.get("created_at"):
+            try:
+                last_ts = datetime.fromisoformat(last_inbound["created_at"].replace("Z", "+00:00"))
+                hours_since = (datetime.now(timezone.utc) - last_ts).total_seconds() / 3600.0
+                if hours_since >= 23.5:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "outside_24h_window",
+                            "message": (
+                                f"Ventana de 24hs cerrada (última respuesta del cliente hace "
+                                f"{round(hours_since, 1)}h). WhatsApp NO entrega este mensaje "
+                                f"aunque parezca enviado."
+                            ),
+                            "hours_since_last_inbound": round(hours_since, 1),
+                            "last_inbound_at": last_inbound["created_at"],
+                        },
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning(f"24h window check parse error (video): {e}")
+
+    file_bytes = await file.read()
+    if len(file_bytes) > 16 * 1024 * 1024:  # Meta hard limit for video
+        raise HTTPException(status_code=400, detail="Video muy grande (máx 16MB)")
+
+    # Save locally for chat history preview
+    os.makedirs("/app/backend/uploads/chat", exist_ok=True)
+    file_ext = "mp4" if ctype == "video/mp4" else "3gp"
+    video_id = str(uuid.uuid4())
+    file_name = f"{video_id}.{file_ext}"
+    file_path = f"/app/backend/uploads/chat/{file_name}"
+    with open(file_path, "wb") as f:
+        f.write(file_bytes)
+
+    now = datetime.now(timezone.utc).isoformat()
+    message = {
+        "id": video_id,
+        "lead_id": lead_id,
+        "content": caption or "[Video]",
+        "sender": "admin",
+        "message_type": "video",
+        "video_path": file_name,
+        "caption": caption or "",
+        "created_at": now,
+        "wa_result": None,
+        "wa_message_id": None,
+        "delivery_status": "sending",
+    }
+    await db.crm_messages.insert_one(message)
+    await db.crm_leads.update_one(
+        {"id": lead_id},
+        {
+            "$set": {"last_interaction": now, "updated_at": now},
+            "$inc": {"messages_count": 1}
+        }
+    )
+
+    _spawn_bg(_send_crm_video_to_wa_async(
+        message_id=video_id,
+        file_bytes=file_bytes,
+        filename=file.filename or file_name,
+        mime_type=ctype,
+        phone=lead["phone"],
+        caption=caption or "",
+        token=line["whatsapp_token"],
+        phone_id=line["phone_number_id"],
+        line_name=line.get("name"),
+    ))
+
+    message.pop("_id", None)
+    return {
+        "message": message,
+        "whatsapp_sent": True,
+        "whatsapp_result": None,
+        "media_id": None,
+    }
+
+
+@api_router.get("/crm/chat-video/{filename}")
+async def crm_get_chat_video(filename: str):
+    """Serve a chat video uploaded by admin (public — UUID filename)."""
+    from fastapi.responses import FileResponse
+    if "/" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Filename inválido")
+    file_path = f"/app/backend/uploads/chat/{filename}"
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Video no encontrado")
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "mp4"
+    mime = {"mp4": "video/mp4", "3gp": "video/3gpp"}.get(ext, "video/mp4")
     return FileResponse(file_path, media_type=mime)
 
 
