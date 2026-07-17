@@ -15,9 +15,14 @@ export const ChatMessage = ({ message }) => {
   const [loadingDoc, setLoadingDoc] = useState(false);
   const [audioSrc, setAudioSrc] = useState(null);
   const [loadingAudio, setLoadingAudio] = useState(false);
+  const [videoSrc, setVideoSrc] = useState(null);
+  const [loadingVideo, setLoadingVideo] = useState(false);
 
   const adminImgUrl = message.image_path
     ? `${BACKEND_URL}/api/crm/chat-image/${message.image_path}`
+    : null;
+  const adminVideoUrl = message.video_path
+    ? `${BACKEND_URL}/api/crm/chat-video/${message.video_path}`
     : null;
 
   const loadImage = useCallback(async () => {
@@ -59,10 +64,28 @@ export const ChatMessage = ({ message }) => {
     finally { setLoadingAudio(false); }
   }, [message.id, audioSrc, loadingAudio, message.audio_path]);
 
+  const loadVideo = useCallback(async () => {
+    if (videoSrc || loadingVideo) return;
+    // Outbound admin-sent video → served directly by our /chat-video/{file}
+    // endpoint. Inbound (from lead) → fetch via the same base64 API used
+    // for image/audio downloads.
+    if (adminVideoUrl) {
+      setVideoSrc(adminVideoUrl);
+      return;
+    }
+    setLoadingVideo(true);
+    try {
+      const { data } = await api.get(`/crm/messages/${message.id}/video`);
+      setVideoSrc(`data:${data.mime_type};base64,${data.video_base64}`);
+    } catch { /* silent — the endpoint may not exist yet for inbound */ }
+    finally { setLoadingVideo(false); }
+  }, [message.id, videoSrc, loadingVideo, adminVideoUrl]);
+
   useEffect(() => {
     if (message.message_type === 'image' && (message.media_id || message.image_path)) loadImage();
     if (message.message_type === 'document' && message.media_id) loadDocument();
     if (message.message_type === 'audio' && (message.media_id || message.audio_path)) loadAudio();
+    if (message.message_type === 'video' && (message.media_id || message.video_path)) loadVideo();
   }, [message.id]); // eslint-disable-line
 
   const handleDocDownload = () => {
@@ -142,6 +165,28 @@ export const ChatMessage = ({ message }) => {
             ) : (
               <div className="flex items-center gap-2 text-xs opacity-60">
                 <span>🎤</span> Audio no disponible
+              </div>
+            )
+          ) : message.message_type === 'video' ? (
+            loadingVideo ? (
+              <div className="flex items-center gap-2 text-xs opacity-70"><RefreshCw className="w-3 h-3 animate-spin" />Cargando video...</div>
+            ) : videoSrc ? (
+              <div className="relative">
+                <video
+                  controls
+                  preload="metadata"
+                  className="max-w-[260px] rounded-lg"
+                  src={videoSrc}
+                >
+                  Tu navegador no soporta video
+                </video>
+                {message.caption && (
+                  <p className="text-xs mt-1.5 whitespace-pre-wrap break-words opacity-90">{message.caption}</p>
+                )}
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 text-xs opacity-60">
+                <span>🎬</span> Video no disponible
               </div>
             )
           ) : (
