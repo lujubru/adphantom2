@@ -12886,21 +12886,21 @@ async def startup():
         logger.error(f"MongoDB connection FAILED: {e}")
         return
     # Create admin user if not exists
-    # existing = await db.users.find_one({"email": "admin@maxi.com"})
-    # if not existing:
-    #     hashed = pwd_context.hash("admin123")
-    #     await db.users.insert_one({
-    #         "id": str(uuid.uuid4()),
-    #         "email": "admin@maxi.com",
-    #         "hashed_password": hashed,
-    #         "role": "admin",
-    #         "is_active": True,
-    #         "welcome_message": "",
-    #         "user_message": "",
-    #         "line_ids": [],
-    #         "created_at": datetime.now(timezone.utc).isoformat(),
-    #     })
-    #     logger.info("Admin user created: admin@maxi.com")
+    existing = await db.users.find_one({"email": "admin@maxi.com"})
+    if not existing:
+        hashed = pwd_context.hash("admin123")
+        await db.users.insert_one({
+            "id": str(uuid.uuid4()),
+            "email": "admin@maxi.com",
+            "hashed_password": hashed,
+            "role": "admin",
+            "is_active": True,
+            "welcome_message": "",
+            "user_message": "",
+            "line_ids": [],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.info("Admin user created: admin@maxi.com")
     # Create cajero user if not exists 
 #    existing_cajero = await db.users.find_one({"email": "cajero@blackguardian.com"})
 #    if not existing_cajero:
