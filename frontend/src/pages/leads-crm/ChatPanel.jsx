@@ -256,31 +256,33 @@ export const ChatPanel = ({
     setIsDragging(false);
     const files = Array.from(e.dataTransfer?.files || []);
     if (files.length === 0) return;
-    // Solo procesamos imágenes; ignoramos PDFs/zips/etc. (Meta Cloud API
-    // exige endpoints distintos para otros tipos y para acá el caso de uso
-    // es comprobantes/screenshots).
-    const images = files.filter(f => f.type.startsWith('image/'));
-    if (images.length === 0) {
-      toast.error('Solo se permiten imágenes. Para otros archivos usá el botón adjuntar.');
+    // Aceptamos imágenes y videos. Otros archivos se descartan porque
+    // Meta Cloud API exige un endpoint específico por tipo y no soportamos
+    // documentos genéricos por ahora.
+    const media = files.filter(f => f.type.startsWith('image/') || f.type.startsWith('video/'));
+    if (media.length === 0) {
+      toast.error('Solo se permiten imágenes o videos. Para otros archivos usá el botón adjuntar.');
       return;
     }
-    if (images.length > 1) {
-      toast.info(`Enviando ${images.length} imagen${images.length === 1 ? '' : 'es'}…`);
+    if (media.length > 1) {
+      toast.info(`Enviando ${media.length} archivo${media.length === 1 ? '' : 's'}…`);
     }
-    // Mandamos una por una respetando el orden del drop
-    images.reduce((p, f) => p.then(() => sendImage(f)), Promise.resolve());
+    // Mandamos uno por uno respetando el orden del drop
+    media.reduce((p, f) => p.then(() => sendMedia(f)), Promise.resolve());
   };
 
-  // Paste de imágenes desde el portapapeles (Ctrl+V con un screenshot)
+  // Paste de imágenes/videos desde el portapapeles (Ctrl+V con un screenshot
+  // o video copiado). Se ignoran otros tipos para no romper el paste normal
+  // de texto.
   const handlePaste = (e) => {
     const items = Array.from(e.clipboardData?.items || []);
-    const imgs = items
-      .filter(it => it.type.startsWith('image/'))
+    const media = items
+      .filter(it => it.type.startsWith('image/') || it.type.startsWith('video/'))
       .map(it => it.getAsFile())
       .filter(Boolean);
-    if (imgs.length === 0) return; // dejar que el paste normal de texto siga
+    if (media.length === 0) return; // dejar que el paste normal de texto siga
     e.preventDefault();
-    imgs.reduce((p, f) => p.then(() => sendImage(f)), Promise.resolve());
+    media.reduce((p, f) => p.then(() => sendMedia(f)), Promise.resolve());
   };
 
   const sendImage = async (file, opts = {}) => {
@@ -323,6 +325,58 @@ export const ChatPanel = ({
       setSending(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
+  };
+
+  const sendVideo = async (file, opts = {}) => {
+    if (!file) return;
+    if (file.size > 16 * 1024 * 1024) {
+      toast.error('El video supera los 16 MB (límite de WhatsApp)');
+      return;
+    }
+    // Meta only accepts mp4 / 3gp. Some browsers report video/quicktime for
+    // iOS .mov files — reject those with a clear message.
+    const ctype = (file.type || '').toLowerCase();
+    const okTypes = ['video/mp4', 'video/3gpp', 'video/3gp'];
+    if (!okTypes.includes(ctype)) {
+      toast.error(`Solo mp4 o 3gp (recibido: ${file.type || 'desconocido'}). Convertí el video primero.`);
+      return;
+    }
+    setSending(true);
+    const form = new FormData();
+    form.append('file', file);
+    if (newMessage.trim()) form.append('caption', newMessage.trim());
+    if (opts.force) form.append('force', 'true');
+    try {
+      await api.post(`/crm/leads/${lead.id}/messages/video`, form, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+      });
+      setNewMessage('');
+      toast.success('Video enviado');
+      loadMessages();
+    } catch (err) {
+      const status = err?.response?.status;
+      const detail = err?.response?.data?.detail;
+      if (status === 409 && detail && typeof detail === 'object' && detail.code === 'outside_24h_window') {
+        toast.error(`⚠️ ${detail.message}`, {
+          duration: 12000,
+          action: { label: 'Forzar envío', onClick: () => sendVideo(file, { force: true }) },
+        });
+      } else {
+        toast.error(typeof detail === 'string' ? detail : 'Error enviando video');
+      }
+    } finally {
+      setSending(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  // Dispatcher: decide qué endpoint usar según el MIME type del archivo.
+  // Los inputs, drag/drop y paste llaman siempre esta función.
+  const sendMedia = (file, opts = {}) => {
+    if (!file) return;
+    const t = (file.type || '').toLowerCase();
+    if (t.startsWith('video/')) return sendVideo(file, opts);
+    return sendImage(file, opts);
   };
 
   // ── Audio recording (voice note, WhatsApp style) ──────────────
@@ -983,10 +1037,10 @@ Le envio nuestros datos de cuenta 👇`;
         <input
           ref={fileInputRef}
           type="file"
-          accept="image/jpeg,image/jpg,image/png,image/webp,image/gif"
+          accept="image/jpeg,image/jpg,image/png,image/webp,image/gif,video/mp4,video/3gpp"
           className="hidden"
           data-testid="chat-image-input"
-          onChange={e => sendImage(e.target.files?.[0])}
+          onChange={e => sendMedia(e.target.files?.[0])}
         />
         {recording ? (
           <div className="flex items-center gap-2" data-testid="chat-recording-bar">
