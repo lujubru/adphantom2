@@ -18,7 +18,7 @@ const DATE_PRESETS = [
   { key: 'ultimos_10', label: 'Últimos 10', preset: 'ultimos_10' },
   { key: '7', label: '7 días', days: 7 },
   { key: '30', label: '30 días', days: 30 },
-  { key: '90', label: '90 días', days: 90 },
+  { key: 'custom', label: 'Fecha específica', custom: true },
 ];
 
 const Dashboard = () => {
@@ -27,6 +27,8 @@ const Dashboard = () => {
   const [periodKey, setPeriodKey] = useState('30');
   const [days, setDays] = useState(30);
   const [preset, setPreset] = useState(null);
+  const [startDate, setStartDate] = useState(new Date().toLocaleDateString('sv'));
+  const [endDate, setEndDate] = useState(new Date().toLocaleDateString('sv'));
 
   const [overview, setOverview] = useState(null);
   const [ads, setAds] = useState([]);
@@ -41,14 +43,17 @@ const Dashboard = () => {
 
   const params = useCallback(() => {
     const p = {};
-    if (preset) {
+    if (periodKey === 'custom') {
+      if (startDate) p.start_date = startDate;
+      if (endDate) p.end_date = endDate;
+    } else if (preset) {
       p.preset = preset;
     } else {
       p.days = days;
     }
     if (selectedLineId) p.line_id = selectedLineId;
     return p;
-  }, [days, preset, selectedLineId]);
+  }, [days, preset, selectedLineId, periodKey, startDate, endDate]);
 
   const loadAll = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -98,7 +103,10 @@ const Dashboard = () => {
     setPeriodKey(key);
     const found = DATE_PRESETS.find(p => p.key === key);
     if (!found) return;
-    if (found.preset) {
+    if (found.custom) {
+      setPreset(null);
+      setDays(0);
+    } else if (found.preset) {
       setPreset(found.preset);
       setDays(0);
     } else {
@@ -150,6 +158,24 @@ const Dashboard = () => {
                 </button>
               ))}
             </div>
+
+            {periodKey === 'custom' && (
+              <div className="flex items-center gap-1.5" data-testid="custom-date-inputs">
+                <input
+                  type="date"
+                  value={startDate}
+                  onChange={e => setStartDate(e.target.value)}
+                  className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-xs text-white focus:outline-none focus:border-slate-500 cursor-pointer"
+                />
+                <span className="text-slate-500 text-xs">a</span>
+                <input
+                  type="date"
+                  value={endDate}
+                  onChange={e => setEndDate(e.target.value)}
+                  className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-xs text-white focus:outline-none focus:border-slate-500 cursor-pointer"
+                />
+              </div>
+            )}
 
             <Button
               onClick={() => loadAll(false)}
