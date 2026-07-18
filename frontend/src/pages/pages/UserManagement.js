@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { UserPlus, Edit2, Trash2, X, Check, Plus, Phone, Landmark, Megaphone, Zap, GitMerge, RefreshCw, ArrowRight } from 'lucide-react';
+import { UserPlus, Edit2, Trash2, X, Check, Plus, Phone, Landmark, Megaphone, Zap, GitMerge, RefreshCw, ArrowRight, Globe } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import api from '@/utils/api';
 import { toast } from 'sonner';
@@ -43,6 +43,8 @@ Le envio nuestros datos de cuenta 👇`,
     auto_welcome_enabled: true,
     derivation_message: 'Genial! Para realizar la carga te pido que envíes comprobante y usuario al siguiente número:',
     derivation_numbers: [],
+    derivation_web_message: 'Genial! Ingresá a nuestra web desde el siguiente link:',
+    derivation_webs: [],
     cbu_list: [],
     broadcast_monthly_quota: 0,
   });
@@ -132,6 +134,8 @@ Le envio nuestros datos de cuenta 👇`,
       auto_welcome_enabled: user.auto_welcome_enabled !== false,
       derivation_message: user.derivation_message || 'Genial! Para realizar la carga te pido que envíes comprobante y usuario al siguiente número:',
       derivation_numbers: Array.isArray(user.derivation_numbers) ? user.derivation_numbers : [],
+      derivation_web_message: user.derivation_web_message || 'Genial! Ingresá a nuestra web desde el siguiente link:',
+      derivation_webs: Array.isArray(user.derivation_webs) ? user.derivation_webs : [],
       cbu_list: Array.isArray(user.cbu_list) ? user.cbu_list : [],
       broadcast_monthly_quota: Number(user.broadcast_monthly_quota || 0),
     });
@@ -162,6 +166,8 @@ Le envio nuestros datos de cuenta 👇`,
       auto_welcome_enabled: true,
       derivation_message: 'Genial! Para realizar la carga te pido que envíes comprobante y usuario al siguiente número:',
       derivation_numbers: [],
+      derivation_web_message: 'Genial! Ingresá a nuestra web desde el siguiente link:',
+      derivation_webs: [],
       cbu_list: [],
       broadcast_monthly_quota: 0,
     });
@@ -523,6 +529,74 @@ Le envio nuestros datos de cuenta 👇`,
                   <p className={`text-[11px] ${textSecondary} mt-1.5 leading-snug`}>
                     💡 Cargá los números sin el <code className="px-1 bg-slate-800 text-amber-300 rounded">+</code>, en formato internacional. El cajero va a poder elegir cualquiera desde un desplegable en el chat.
                   </p>
+
+                  {/* Derivation Web config (only for cajero) */}
+                  <div className="mt-4">
+                    <label className={`block text-sm font-medium mb-2 ${textSecondary}`}>
+                      Mensaje de Derivación Web <span className="text-xs text-cyan-400">(se envía + la web elegida)</span>
+                    </label>
+                    <textarea
+                      value={formData.derivation_web_message}
+                      onChange={e => setFormData(prev => ({ ...prev, derivation_web_message: e.target.value }))}
+                      className={`w-full px-4 py-2 rounded-lg border ${inputBg} h-20 font-mono text-sm`}
+                      data-testid="user-derivation-web-message"
+                      placeholder="Genial! Ingresá a nuestra web desde el siguiente link:"
+                    />
+
+                    <div className="mt-3 flex items-center justify-between">
+                      <label className={`block text-sm font-medium ${textSecondary}`}>
+                        Webs de Derivación <span className="text-xs text-slate-500 font-normal">({(formData.derivation_webs || []).length})</span>
+                      </label>
+                      <Button
+                        type="button"
+                        size="sm"
+                        onClick={() => setFormData(prev => ({ ...prev, derivation_webs: [...(prev.derivation_webs || []), ''] }))}
+                        className="bg-cyan-600 hover:bg-cyan-500 text-white text-xs h-7 px-2"
+                        data-testid="derivation-add-web-btn"
+                      >
+                        <Plus className="w-3.5 h-3.5 mr-1" /> Agregar web
+                      </Button>
+                    </div>
+
+                    <div className="mt-2 max-h-72 overflow-y-auto pr-1 space-y-2 border border-slate-700/50 rounded-lg p-2 bg-slate-900/40" data-testid="derivation-webs-list">
+                      {(formData.derivation_webs || []).length === 0 ? (
+                        <p className="text-xs text-slate-500 text-center py-3">
+                          Sin webs todavía. Tocá "Agregar web" para empezar.
+                        </p>
+                      ) : formData.derivation_webs.map((web, idx) => (
+                        <div key={idx} className="flex items-center gap-2" data-testid={`derivation-web-row-${idx}`}>
+                          <span className="text-xs text-slate-500 font-mono w-6 shrink-0 text-right">{idx + 1}.</span>
+                          <Globe className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                          <input
+                            type="text"
+                            value={web}
+                            onChange={e => {
+                              const v = e.target.value;
+                              setFormData(prev => ({
+                                ...prev,
+                                derivation_webs: prev.derivation_webs.map((w, i) => i === idx ? v : w)
+                              }));
+                            }}
+                            placeholder="ej: ganamos.com"
+                            className={`flex-1 px-3 py-1.5 rounded-md border ${inputBg} text-sm`}
+                            data-testid={`derivation-web-input-${idx}`}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setFormData(prev => ({
+                              ...prev,
+                              derivation_webs: prev.derivation_webs.filter((_, i) => i !== idx)
+                            }))}
+                            className="p-1.5 text-slate-400 hover:text-red-400 hover:bg-red-500/10 rounded shrink-0"
+                            data-testid={`derivation-web-remove-${idx}`}
+                            title="Eliminar web"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 </div>
               )}
 

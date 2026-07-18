@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   MessageCircle, RefreshCw, Send, X, Image as ImageIcon, Mic, DollarSign,
   User, Users, ArrowLeft, ArrowDown, Share2, Phone, Landmark, Pencil, Check as CheckIcon,
-  Trash2,
+  Trash2, Globe,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -39,6 +39,8 @@ export const ChatPanel = ({
   const derivarRef = useRef(null);
   const [showCbuMenu, setShowCbuMenu] = useState(false);
   const cbuRef = useRef(null);
+  const [showWebMenu, setShowWebMenu] = useState(false);
+  const webRef = useRef(null);
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState('');
   const [savingName, setSavingName] = useState(false);
@@ -580,6 +582,22 @@ Le envio nuestros datos de cuenta 👇`;
     } catch { toast.error('Error enviando derivación'); }
   };
 
+  const sendDerivarWeb = async (url) => {
+    const baseMsg = (userMessages.derivation_web_message || '').trim()
+      || 'Genial! Ingresá a nuestra web desde el siguiente link:';
+    let formattedUrl = url.trim();
+    if (formattedUrl && !/^https?:\/\//i.test(formattedUrl)) {
+      formattedUrl = `https://${formattedUrl}`;
+    }
+    const mensaje = `${baseMsg}\n${formattedUrl}`;
+    setShowWebMenu(false);
+    try {
+      await api.post(`/crm/leads/${lead.id}/messages`, { content: mensaje, sender: 'admin' });
+      loadMessages();
+      toast.success(`Derivado a la web: ${formattedUrl}`);
+    } catch { toast.error('Error enviando derivación a web'); }
+  };
+
   const sendCbu = async (item) => {
     setShowCbuMenu(false);
     const cbu = (item?.cbu || '').trim();
@@ -649,9 +667,9 @@ Le envio nuestros datos de cuenta 👇`;
     }
   };
 
-  // Close derivar/cbu dropdowns on outside click
+  // Close derivar/cbu/web dropdowns on outside click
   useEffect(() => {
-    if (!showDerivarMenu && !showCbuMenu) return;
+    if (!showDerivarMenu && !showCbuMenu && !showWebMenu) return;
     const onClick = (e) => {
       if (showDerivarMenu && derivarRef.current && !derivarRef.current.contains(e.target)) {
         setShowDerivarMenu(false);
@@ -659,10 +677,13 @@ Le envio nuestros datos de cuenta 👇`;
       if (showCbuMenu && cbuRef.current && !cbuRef.current.contains(e.target)) {
         setShowCbuMenu(false);
       }
+      if (showWebMenu && webRef.current && !webRef.current.contains(e.target)) {
+        setShowWebMenu(false);
+      }
     };
     document.addEventListener('mousedown', onClick);
     return () => document.removeEventListener('mousedown', onClick);
-  }, [showDerivarMenu, showCbuMenu]);
+  }, [showDerivarMenu, showCbuMenu, showWebMenu]);
 
   const dotColor = STATUS_CONFIG[lead.status]?.dot || 'bg-blue-400';
 
@@ -882,20 +903,45 @@ Le envio nuestros datos de cuenta 👇`;
           <Button onClick={sendBienvenida} size="sm" className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-2 sm:px-3 h-7">
             👋<span className="hidden sm:inline ml-1">Bienvenida</span>
           </Button>
-          <Button
-            onClick={() => sendQuickTemplate('cargado')}
-            disabled={sending || !(userMessages.quick_templates?.cargado || '').trim()}
-            size="sm"
-            className="bg-lime-600 hover:bg-lime-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs px-2 sm:px-3 h-7"
-            title={
-              (userMessages.quick_templates?.cargado || '').trim()
-                ? '⚡ Enviar "Cargado" — rota una de las variantes configuradas'
-                : 'Cargá al menos una variante de "Cargado" en Mi Configuración'
-            }
-            data-testid="chat-quick-cargado-btn"
-          >
-            ⚡<span className="hidden sm:inline ml-1">Cargado</span>
-          </Button>
+          <div className="relative" ref={webRef}>
+            <Button
+              onClick={() => setShowWebMenu(v => !v)}
+              size="sm"
+              className="bg-cyan-600 hover:bg-cyan-500 text-white text-xs px-2 sm:px-3 h-7"
+              data-testid="chat-web-btn"
+              disabled={!Array.isArray(userMessages.derivation_webs) || userMessages.derivation_webs.length === 0}
+              title={
+                Array.isArray(userMessages.derivation_webs) && userMessages.derivation_webs.length > 0
+                  ? 'Derivar a una web'
+                  : 'Cargá webs de derivación en tu perfil'
+              }
+            >
+              <Globe className="w-3.5 h-3.5" /><span className="hidden sm:inline ml-1">Web</span>
+            </Button>
+            {showWebMenu && Array.isArray(userMessages.derivation_webs) && userMessages.derivation_webs.length > 0 && (
+              <div
+                className="absolute right-0 top-full mt-1.5 w-64 max-h-80 overflow-y-auto rounded-lg border border-slate-700 bg-slate-900 shadow-xl z-50"
+                data-testid="chat-web-menu"
+              >
+                <div className="px-3 py-2 border-b border-slate-700 text-[11px] uppercase tracking-wide text-slate-400 sticky top-0 bg-slate-900">
+                  Elegí una web ({userMessages.derivation_webs.length})
+                </div>
+                {userMessages.derivation_webs.map((url, idx) => (
+                  <button
+                    key={`${url}-${idx}`}
+                    type="button"
+                    onClick={() => sendDerivarWeb(url)}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-white hover:bg-cyan-500/15 border-b border-slate-800 last:border-b-0 text-left"
+                    data-testid={`chat-web-option-${idx}`}
+                  >
+                    <Globe className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                    <span className="truncate flex-1 font-mono text-xs">{url}</span>
+                    <span className="ml-auto text-[10px] text-slate-500">#{idx + 1}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
           <Button onClick={sendUsuario} size="sm" className="bg-blue-600 hover:bg-blue-500 text-white text-xs px-2 sm:px-3 h-7">
             👤<span className="hidden sm:inline ml-1">Usuario</span>
           </Button>

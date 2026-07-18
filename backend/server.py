@@ -370,6 +370,8 @@ async def get_me(current_user=Depends(get_current_user)):
         "auto_welcome_enabled": current_user.get("auto_welcome_enabled", True),
         "derivation_message": current_user.get("derivation_message", ""),
         "derivation_numbers": current_user.get("derivation_numbers", []),
+        "derivation_web_message": current_user.get("derivation_web_message", ""),
+        "derivation_webs": current_user.get("derivation_webs", []),
         "cbu_list": current_user.get("cbu_list", []),
         "broadcast_monthly_quota": int(current_user.get("broadcast_monthly_quota", 0) or 0),
         "quick_templates": current_user.get("quick_templates", {}) or {},
@@ -403,12 +405,24 @@ class MyMessagesUpdate(BaseModel):
     auto_welcome_enabled: Optional[bool] = None
     derivation_message: Optional[str] = None
     derivation_numbers: Optional[List[str]] = None
+    derivation_web_message: Optional[str] = None
+    derivation_webs: Optional[List[str]] = None
     cbu_list: Optional[List[Dict]] = None
     quick_templates: Optional[Dict[str, str]] = None
     # Per-cashier AI-assistant config. See ai_agent.DEFAULT_AI_CONFIG for the
     # allowed keys and defaults. When enabled=true the AI classifies every
     # inbound message and auto-responds according to the intent flow.
     ai_config: Optional[Dict[str, Any]] = None
+
+
+def _sanitize_web_url(url: str) -> str:
+    """Ensure the URL is a non-empty string and has http:// or https:// prefix."""
+    url = str(url or "").strip()
+    if not url:
+        return ""
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return f"https://{url}"
+    return url
 
 
 @api_router.put("/auth/me/messages")
@@ -421,6 +435,8 @@ async def update_my_messages(payload: MyMessagesUpdate, current_user=Depends(get
     for k, v in payload.model_dump(exclude_unset=True).items():
         if k == "derivation_numbers" and v is not None:
             update_data[k] = [n.strip() for n in v if n and n.strip()]
+        elif k == "derivation_webs" and v is not None:
+            update_data[k] = [_sanitize_web_url(w) for w in v if w and w.strip()]
         elif k == "cbu_list" and v is not None:
             update_data[k] = _sanitize_cbu_list(v)
         elif k == "auto_welcome_enabled":
@@ -497,6 +513,8 @@ async def update_my_messages(payload: MyMessagesUpdate, current_user=Depends(get
         "auto_welcome_enabled": refreshed.get("auto_welcome_enabled", True),
         "derivation_message": refreshed.get("derivation_message", ""),
         "derivation_numbers": refreshed.get("derivation_numbers", []),
+        "derivation_web_message": refreshed.get("derivation_web_message", ""),
+        "derivation_webs": refreshed.get("derivation_webs", []),
         "cbu_list": refreshed.get("cbu_list", []),
         "quick_templates": refreshed.get("quick_templates", {}) or {},
         "ai_config": _merged_ai_config_for_response(refreshed),
@@ -528,6 +546,8 @@ class UserCreate(BaseModel):
     auto_welcome_enabled: Optional[bool] = True
     derivation_message: Optional[str] = ""
     derivation_numbers: Optional[List[str]] = []
+    derivation_web_message: Optional[str] = ""
+    derivation_webs: Optional[List[str]] = []
     cbu_list: Optional[List[Dict]] = []  # [{cbu: "...", name: "..."}]
     broadcast_monthly_quota: Optional[int] = 0  # 0 = sin permiso de broadcasts; >0 = cupo base mensual
 
@@ -542,6 +562,8 @@ class UserUpdate(BaseModel):
     auto_welcome_enabled: Optional[bool] = None
     derivation_message: Optional[str] = None
     derivation_numbers: Optional[List[str]] = None
+    derivation_web_message: Optional[str] = None
+    derivation_webs: Optional[List[str]] = None
     cbu_list: Optional[List[Dict]] = None
     broadcast_monthly_quota: Optional[int] = None
 
@@ -564,6 +586,8 @@ async def create_user(data: UserCreate, current_user=Depends(get_current_user)):
         "auto_welcome_enabled": data.auto_welcome_enabled if data.auto_welcome_enabled is not None else True,
         "derivation_message": data.derivation_message or "",
         "derivation_numbers": [n.strip() for n in (data.derivation_numbers or []) if n and n.strip()],
+        "derivation_web_message": data.derivation_web_message or "",
+        "derivation_webs": [_sanitize_web_url(w) for w in (data.derivation_webs or []) if w and w.strip()],
         "cbu_list": _sanitize_cbu_list(data.cbu_list or []),
         "broadcast_monthly_quota": int(data.broadcast_monthly_quota or 0),
         "is_active": True,
@@ -616,6 +640,9 @@ async def update_user(user_id: str, data: UserUpdate, current_user=Depends(get_c
         elif k == "derivation_numbers" and v is not None:
             # Sanitize list: trim and drop empties
             update_data[k] = [n.strip() for n in v if n and n.strip()]
+        elif k == "derivation_webs" and v is not None:
+            # Sanitize list: trim, apply scheme and drop empties
+            update_data[k] = [_sanitize_web_url(w) for w in v if w and w.strip()]
         elif k == "cbu_list" and v is not None:
             update_data[k] = _sanitize_cbu_list(v)
         elif k == "broadcast_monthly_quota" and v is not None:

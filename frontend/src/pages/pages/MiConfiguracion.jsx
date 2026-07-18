@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { Settings, Save, RefreshCw, Plus, Trash2, Info, MessageSquare, UserCheck, Landmark, Share2, CreditCard, Link2, Unlink, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Settings, Save, RefreshCw, Plus, Trash2, Info, MessageSquare, UserCheck, Landmark, Share2, CreditCard, Link2, Unlink, CheckCircle2, AlertCircle, Globe } from 'lucide-react';
 import { useSearchParams } from 'react-router-dom';
 import api from '@/utils/api';
 import { Button } from '@/components/ui/button';
@@ -28,8 +28,8 @@ export default function MiConfiguracion() {
   const [cbuList, setCbuList] = useState([]); // [{cbu, name}]
   const [derivationMessage, setDerivationMessage] = useState('');
   const [derivationNumbers, setDerivationNumbers] = useState([]);
-  // Quick-templates: object { cargado: "variante 1\n---\nvariante 2..." }
-  const [quickTemplates, setQuickTemplates] = useState({});
+  const [derivationWebMessage, setDerivationWebMessage] = useState('');
+  const [derivationWebs, setDerivationWebs] = useState([]);
   // Per-cashier AI-agent config
   const [aiConfig, setAiConfig] = useState({
     enabled: false, brand_name: '', brand_tone: 'casual',
@@ -115,7 +115,8 @@ export default function MiConfiguracion() {
       setCbuList(Array.isArray(data.cbu_list) ? data.cbu_list : []);
       setDerivationMessage(data.derivation_message || '');
       setDerivationNumbers(Array.isArray(data.derivation_numbers) ? data.derivation_numbers : []);
-      setQuickTemplates(data.quick_templates && typeof data.quick_templates === 'object' ? data.quick_templates : {});
+      setDerivationWebMessage(data.derivation_web_message || '');
+      setDerivationWebs(Array.isArray(data.derivation_webs) ? data.derivation_webs : []);
       if (data.ai_config && typeof data.ai_config === 'object') setAiConfig(prev => ({ ...prev, ...data.ai_config }));
     } catch {
       toast.error('No pude cargar tu configuración');
@@ -135,13 +136,11 @@ export default function MiConfiguracion() {
         auto_welcome_enabled: autoWelcomeEnabled,
         derivation_message: derivationMessage,
         derivation_numbers: derivationNumbers.map(n => (n || '').trim()).filter(Boolean),
+        derivation_web_message: derivationWebMessage,
+        derivation_webs: derivationWebs.map(w => (w || '').trim()).filter(Boolean),
         cbu_list: cbuList
           .map(item => ({ cbu: (item.cbu || '').trim(), name: (item.name || '').trim() }))
           .filter(item => item.cbu),
-        // Only send keys that have non-empty content — keeps the doc clean.
-        quick_templates: Object.fromEntries(
-          Object.entries(quickTemplates).map(([k, v]) => [k, (v || '').trim()]).filter(([, v]) => v)
-        ),
         ai_config: {
           ...aiConfig,
           // Strip empty/whitespace platform entries only at save time so the
@@ -178,6 +177,11 @@ export default function MiConfiguracion() {
   const addNumber = () => setDerivationNumbers(prev => [...prev, '']);
   const updateNumber = (idx, value) => setDerivationNumbers(prev => prev.map((n, i) => i === idx ? value : n));
   const removeNumber = (idx) => setDerivationNumbers(prev => prev.filter((_, i) => i !== idx));
+
+  // Web list helpers
+  const addWeb = () => setDerivationWebs(prev => [...prev, '']);
+  const updateWeb = (idx, value) => setDerivationWebs(prev => prev.map((w, i) => i === idx ? value : w));
+  const removeWeb = (idx) => setDerivationWebs(prev => prev.filter((_, i) => i !== idx));
 
   if (loading) {
     return (
@@ -249,38 +253,54 @@ export default function MiConfiguracion() {
             </p>
           </section>
 
-          {/* ⚡ Cargado — Respuestas rápidas rotativas */}
-          <section className="rounded-lg border border-slate-800 bg-slate-900/40 p-4" data-testid="section-quick-cargado">
-            <div className="flex items-center justify-between gap-2 mb-3">
-              <div className="flex items-center gap-2">
-                <span className="text-lime-400 text-lg leading-none">⚡</span>
-                <h2 className="text-sm font-semibold">Cargado — respuestas rotativas</h2>
+          {/* 🌐 Derivación a Web */}
+          <section className="rounded-lg border border-slate-800 bg-slate-900/40 p-4" data-testid="section-derivation-web">
+            <div className="flex items-center gap-2 mb-3">
+              <Globe className="w-4 h-4 text-cyan-400" />
+              <h2 className="text-sm font-semibold">🌐 Derivación a Web</h2>
+            </div>
+            <div className="space-y-3">
+              <div>
+                <Label className="text-xs text-slate-400">Texto que acompaña la derivación a Web</Label>
+                <Textarea value={derivationWebMessage} onChange={e => setDerivationWebMessage(e.target.value)}
+                  placeholder="Ej: Genial! Ingresá a nuestra web desde el siguiente link:"
+                  className="bg-slate-800 border-slate-700 text-white text-sm min-h-[80px] mt-1"
+                  data-testid="derivation-web-message-textarea" />
               </div>
-              <span className="text-[10px] text-slate-500 uppercase tracking-wide">
-                {((quickTemplates.cargado || '').split(/\n\s*-{3,}\s*\n/).map(s => s.trim()).filter(Boolean).length)} variantes
-              </span>
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <Label className="text-xs text-slate-400">Webs de derivación</Label>
+                  <Button size="sm" variant="outline" onClick={addWeb}
+                    className="border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10 h-7 text-xs"
+                    data-testid="add-derivation-web-btn">
+                    <Plus className="w-3.5 h-3.5 mr-1" /> Agregar web
+                  </Button>
+                </div>
+                {derivationWebs.length === 0 ? (
+                  <p className="text-xs text-slate-500 italic">No tenés webs cargadas.</p>
+                ) : (
+                  <div className="space-y-2">
+                    {derivationWebs.map((w, idx) => (
+                      <div key={idx} className="flex items-center gap-2" data-testid={`derivation-web-row-${idx}`}>
+                        <Input value={w} onChange={e => updateWeb(idx, e.target.value)}
+                          placeholder="ej: ganamos.com"
+                          className="flex-1 bg-slate-800 border-slate-700 text-white text-sm h-9"
+                          data-testid={`derivation-web-input-${idx}`} />
+                        <button onClick={() => removeWeb(idx)}
+                          className="p-1.5 text-red-400 hover:bg-red-500/10 rounded"
+                          data-testid={`derivation-web-remove-${idx}`}>
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
-            <Textarea
-              value={quickTemplates.cargado || ''}
-              onChange={e => setQuickTemplates(prev => ({ ...prev, cargado: e.target.value }))}
-              placeholder={`Escribí una variante por bloque separado por --- en línea propia. Ej:\n¡Cargado! ✅\n---\nListo, papu 🎉\n---\nSe cargó ya ⚡`}
-              className="bg-slate-800 border-slate-700 text-white text-sm min-h-[220px] font-mono leading-relaxed"
-              data-testid="quick-cargado-textarea"
-            />
-            <div className="mt-2 space-y-1.5 text-[11px] text-slate-500">
-              <p className="flex gap-1.5">
-                <Info className="w-3 h-3 shrink-0 mt-0.5" />
-                <span>
-                  Cada vez que el cajero presione el botón <span className="text-lime-400">⚡ Cargado</span> del chat,
-                  el sistema elige aleatoriamente una de las variantes. Meta detecta el mismo mensaje repetido a
-                  muchos clientes como <em>bot</em> — rotarlo previene la caída de las líneas principales.
-                </span>
-              </p>
-              <p className="pl-4 text-slate-600">
-                💡 Separador: tres o más guiones <code className="text-slate-400">---</code> en una línea propia entre variantes.
-                Recomendado: 8-10 variantes.
-              </p>
-            </div>
+            <p className="text-[11px] text-slate-500 mt-2 flex gap-1.5">
+              <Info className="w-3 h-3 shrink-0 mt-0.5" />
+              El botón "Web" del chat le manda al cliente el texto + un link de esta lista (se le agregará https:// si no lo tiene).
+            </p>
           </section>
 
           {/* 🤖 Asistente IA — auto-respuesta por intent */}

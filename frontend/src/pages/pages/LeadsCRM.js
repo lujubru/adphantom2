@@ -1975,6 +1975,8 @@ export default function LeadsCRM() {
                   user_message: currentUser?.user_message,
                   derivation_message: currentUser?.derivation_message,
                   derivation_numbers: currentUser?.derivation_numbers || [],
+                  derivation_web_message: currentUser?.derivation_web_message,
+                  derivation_webs: currentUser?.derivation_webs || [],
                   cbu_list: currentUser?.cbu_list || [],
                   quick_templates: currentUser?.quick_templates || {}
                 }}
