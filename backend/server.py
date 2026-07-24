@@ -3130,17 +3130,8 @@ async def wa_webhook_receive(request: Request):
                     if target_line_id:
                         # First try to find lead already assigned to this specific line
                         crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": target_line_id})
-                        if not crm_lead:
-                            # Check for unassigned lead
-                            crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": None})
-                            if crm_lead:
-                                # Assign unassigned lead to this line
-                                await db.crm_leads.update_one(
-                                    {"id": crm_lead["id"]},
-                                    {"$set": {"line_id": target_line_id, "updated_at": now}}
-                                )
-                                crm_lead["line_id"] = target_line_id
-                            # If lead exists on a DIFFERENT line, crm_lead stays None → new lead created below
+                        # If lead exists on a DIFFERENT line or is unassigned (line_id: None),
+                        # crm_lead stays None -> new clean lead created below
                     else:
                         # No line matched — only reuse leads that are ALSO
                         # unassigned. NEVER attach messages to a lead that
@@ -6365,24 +6356,9 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                         logger.info(f"CRM: Resurrected soft-deleted lead {crm_lead['id']} ({from_phone}) on line {line['name']}")
                     
                     if not crm_lead:
-                        # Check if there's an unassigned lead (no line_id) we can claim
-                        unassigned_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": None})
-                        
-                        if unassigned_lead:
-                            # Assign existing unassigned lead to this line
-                            update_fields = {"line_id": line_id, "updated_at": now}
-                            if ad_source and not unassigned_lead.get("ad_source"):
-                                update_fields["ad_source"] = ad_source
-                                update_fields["utm_content"] = utm_content
-                                update_fields["click_id"] = click_id
-                            await db.crm_leads.update_one(
-                                {"id": unassigned_lead["id"]},
-                                {"$set": update_fields}
-                            )
-                            crm_lead = unassigned_lead
-                            crm_lead["line_id"] = line_id
-                        # NOTE: If lead exists on a DIFFERENT line, crm_lead stays None
-                        # so a NEW lead will be created for THIS line below
+                        # Orphaned leads (line_id: None) stay null.
+                        # A new clean lead for THIS line will be created below.
+                        pass
                     
                     # Update ad_source if lead exists but doesn't have ad tracking
                     if crm_lead and ad_source and not crm_lead.get("ad_source"):
@@ -6726,7 +6702,9 @@ async def crm_funnel_stats(
         {
             "$or": [
                 {"classified_at": {"$gte": date_from, "$lte": date_to}},
-                {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": date_from, "$lte": date_to}}
+                {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": date_from, "$lte": date_to}},
+                {"classified_at": {"$exists": False}, "created_at": {"$gte": date_from, "$lte": date_to}},
+                {"updated_at": {"$gte": date_from, "$lte": date_to}}
             ]
         }
     ]
@@ -6833,30 +6811,22 @@ async def crm_funnel_by_ad(
     """Get conversion stats grouped by ad source (utm_content)"""
     now = datetime.now(timezone.utc)
     start_date = (now - timedelta(days=days)).isoformat()
-    date_query = {"created_at": {"$gte": start_date}}
-    
-    # Build line filter based on user role
-    user_line_ids = current_user.get("line_ids", [])
-    if current_user.get("role") == "cajero" and user_line_ids:
-        if line_id and line_id in user_line_ids:
-            line_query = {"line_id": line_id}
-        else:
-            line_query = {"line_id": {"$in": user_line_ids}}
-    elif current_user.get("role") == "cajero" and not user_line_ids:
-        return []
-    elif line_id:
-        line_query = {"line_id": line_id}
-    else:
-        line_query = {}
+    date_match = {
+        "$or": [
+            {"created_at": {"$gte": start_date}},
+            {"classified_at": {"$gte": start_date}},
+            {"updated_at": {"$gte": start_date}}
+        ]
+    }
     
     # Aggregate by utm_content/ad_source
     pipeline = [
-        {"$match": {**line_query, **date_query, "ad_source": {"$ne": None, "$exists": True}}},
+        {"$match": {**line_query, **date_match, "ad_source": {"$ne": None, "$exists": True}}},
         {"$group": {
             "_id": "$ad_source",
-            "total_leads": {"$sum": 1},
+            "total_leads": {"$sum": {"$cond": [{"$gte": ["$created_at", start_date]}, 1, 0]}},
             "validos": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
-            "total_monto": {"$sum": {"$ifNull": ["$charge_amount", 0]}},
+            "total_monto": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, {"$ifNull": ["$charge_amount", 0]}, 0]}},
         }},
         {"$sort": {"total_leads": -1}}
     ]
@@ -13212,7 +13182,16 @@ async def dashboard_overview(
 
     cur_match = {**line_q, "created_at": {"$gte": s, "$lte": e}}
     cur_leads = await db.crm_leads.count_documents(cur_match)
-    cur_validos_match = {**cur_match, "status": "valido"}
+    cur_validos_match = {
+        **line_q,
+        "status": "valido",
+        "$or": [
+            {"classified_at": {"$gte": s, "$lte": e}},
+            {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": s, "$lte": e}},
+            {"classified_at": {"$exists": False}, "created_at": {"$gte": s, "$lte": e}},
+            {"updated_at": {"$gte": s, "$lte": e}}
+        ]
+    }
     cur_validos = await db.crm_leads.count_documents(cur_validos_match)
     agg = await db.crm_leads.aggregate([
         {"$match": cur_validos_match},
