@@ -6719,12 +6719,33 @@ async def crm_funnel_stats(
     chats_result = await db.crm_leads.aggregate(chats_pipeline).to_list(1)
     total_chats = chats_result[0]["total"] if chats_result else 0
 
-    # Cargas (válidos)
-    total_cargas = await db.crm_leads.count_documents({**line_query, **date_query, "status": "valido"})
+    # Cargas (válidos): se calcula usando la fecha de conversión (classified_at) y filtrando por el cajero clasificador si aplica
+    cargas_query_parts = [
+        {"status": "valido"},
+        line_query if line_query else {},
+        {
+            "$or": [
+                {"classified_at": {"$gte": date_from, "$lte": date_to}},
+                {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": date_from, "$lte": date_to}}
+            ]
+        }
+    ]
+    if is_cajero and current_user.get("email"):
+        cargas_query_parts.append({
+            "$or": [
+                {"classified_by": current_user.get("email")},
+                {"classified_by": {"$in": [None, ""]}}
+            ]
+        })
 
-    # Monto desde charge_amount de leads válidos
+    cargas_query = {"$and": cargas_query_parts}
+
+    total_cargas = await db.crm_leads.count_documents(cargas_query)
+
+    # Monto desde charge_amount de leads válidos del cajero/línea
     monto_pipeline = [
-        {"$match": {**line_query, **date_query, "status": "valido", "charge_amount": {"$gt": 0}}},
+        {"$match": cargas_query},
+        {"$match": {"charge_amount": {"$gt": 0}}},
         {"$group": {"_id": None, "total_monto": {"$sum": "$charge_amount"}}}
     ]
     monto_result = await db.crm_leads.aggregate(monto_pipeline).to_list(1)
@@ -9649,25 +9670,43 @@ async def _finanzas_ingresos_by_day(user_id: str, start_iso: str, end_iso: str) 
     asignados a este cajero. Si el cajero tiene `line_ids`, filtra por esas líneas.
     NOTA: usa `charge_amount` + `created_at` igual que el embudo de conversión
     (`/api/crm/funnel/stats`) para mantener consistencia con lo que el cajero ve."""
-    user = await db.users.find_one({"id": user_id}, {"_id": 0, "line_ids": 1, "role": 1})
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "email": 1, "line_ids": 1, "role": 1})
     line_filter: Dict = {}
+    cajero_filter: Dict = {}
     if user and user.get("role") not in ("admin", "superadmin"):
         line_ids = user.get("line_ids") or []
         if line_ids:
             line_filter = {"line_id": {"$in": line_ids}}
         else:
             return {}  # cajero sin líneas asignadas → sin ingresos
+        if user.get("email"):
+            cajero_filter = {
+                "$or": [
+                    {"classified_by": user.get("email")},
+                    {"classified_by": {"$in": [None, ""]}}
+                ]
+            }
     start_dt, end_dt = _finanzas_range_utc_bounds(start_iso, end_iso)
-    query = {
-        **line_filter,
-        "status": "valido",
-        "created_at": {"$gte": start_dt, "$lte": end_dt},
-        "charge_amount": {"$gt": 0},
-    }
+    query_parts = [
+        {"status": "valido"},
+        {"charge_amount": {"$gt": 0}},
+        {
+            "$or": [
+                {"classified_at": {"$gte": start_dt, "$lte": end_dt}},
+                {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": start_dt, "$lte": end_dt}}
+            ]
+        }
+    ]
+    if line_filter:
+        query_parts.append(line_filter)
+    if cajero_filter:
+        query_parts.append(cajero_filter)
+
+    query = {"$and": query_parts}
     by_day: Dict[str, float] = {}
-    cursor = db.crm_leads.find(query, {"_id": 0, "created_at": 1, "charge_amount": 1})
+    cursor = db.crm_leads.find(query, {"_id": 0, "classified_at": 1, "created_at": 1, "charge_amount": 1})
     async for lead in cursor:
-        d = (lead.get("created_at") or "")[:10]
+        d = ((lead.get("classified_at") or lead.get("created_at")) or "")[:10]
         if not d:
             continue
         try:
