@@ -5066,7 +5066,7 @@ async def crm_get_all_lines(current_user=Depends(get_current_user)):
         line["leads_count"] = await db.crm_leads.count_documents({"line_id": line["id"]})
         line["cargas_count"] = await db.crm_leads.count_documents({
             "line_id": line["id"], 
-            "status": "cliente_real"
+            "status": "valido"
         })
     
     return lines
@@ -6767,7 +6767,7 @@ async def crm_funnel_by_line(
         leads_count = await db.crm_leads.count_documents({"line_id": line["id"]})
         cargas_count = await db.crm_leads.count_documents({
             "line_id": line["id"],
-            "status": "cliente_real"
+            "status": "valido"
         })
         
         # Get monto from receipts
@@ -8707,14 +8707,14 @@ async def crm_dashboard_stats(current_user=Depends(get_current_user)):
     for status in CRM_LEAD_STATUSES:
         status_counts[status] = await db.crm_leads.count_documents({"status": status})
     
-    # Valid leads (interesado + potencial + cliente_real)
-    valid_leads = status_counts.get("interesado", 0) + status_counts.get("potencial", 0) + status_counts.get("cliente_real", 0)
+    # Valid leads (valido + otros si aplica)
+    valid_leads = status_counts.get("valido", 0) + status_counts.get("interesado", 0) + status_counts.get("potencial", 0)
     
-    # Discarded leads (basura)
-    discarded_leads = status_counts.get("basura", 0)
+    # Discarded leads (spam / basura)
+    discarded_leads = status_counts.get("spam", 0) + status_counts.get("basura", 0)
     
-    # Real conversions (only cliente_real)
-    conversions = status_counts.get("cliente_real", 0)
+    # Real conversions (only valido)
+    conversions = status_counts.get("valido", 0)
     
     # Quality percentage
     quality_percentage = round((valid_leads / total_leads * 100), 1) if total_leads > 0 else 0
@@ -8758,8 +8758,8 @@ async def crm_dashboard_trends(
         {"$group": {
             "_id": "$date_str",
             "total": {"$sum": 1},
-            "cliente_real": {"$sum": {"$cond": [{"$eq": ["$status", "cliente_real"]}, 1, 0]}},
-            "basura": {"$sum": {"$cond": [{"$eq": ["$status", "basura"]}, 1, 0]}},
+            "valido": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
+            "basura": {"$sum": {"$cond": [{"$eq": ["$status", "spam"]}, 1, 0]}},
         }},
         {"$sort": {"_id": 1}},
     ]
@@ -8769,7 +8769,7 @@ async def crm_dashboard_trends(
         trends.append({
             "date": r["_id"],
             "total": r["total"],
-            "conversions": r["cliente_real"],
+            "conversions": r["valido"],
             "discarded": r["basura"],
         })
     
@@ -8782,7 +8782,7 @@ async def crm_leads_by_source(current_user=Depends(get_current_user)):
         {"$group": {
             "_id": "$source",
             "count": {"$sum": 1},
-            "conversions": {"$sum": {"$cond": [{"$eq": ["$status", "cliente_real"]}, 1, 0]}},
+            "conversions": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
         }},
         {"$sort": {"count": -1}},
     ]
