@@ -3543,13 +3543,6 @@ async def wa_sync_to_crm(line_id: str = Query(..., description="CRM Line ID to a
         # Check if lead already exists
         existing = await db.crm_leads.find_one({"phone": phone})
         if existing:
-            # Update line_id if not set
-            if not existing.get("line_id"):
-                await db.crm_leads.update_one(
-                    {"phone": phone},
-                    {"$set": {"line_id": line_id}}
-                )
-                synced += 1
             continue
         
         # Map wa classification to crm status
