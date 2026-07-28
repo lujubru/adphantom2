@@ -6688,18 +6688,11 @@ async def crm_funnel_stats(
     chats_result = await db.crm_leads.aggregate(chats_pipeline).to_list(1)
     total_chats = chats_result[0]["total"] if chats_result else 0
 
-    # Cargas (válidos): se calcula usando la fecha de conversión (classified_at) y filtrando por el cajero clasificador si aplica
+    # Cargas (válidos): se calcula usando la fecha de creación (cohort-based) para coincidir con chats
     cargas_query_parts = [
         {"status": "valido"},
         line_query if line_query else {},
-        {
-            "$or": [
-                {"classified_at": {"$gte": date_from, "$lte": date_to}},
-                {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": date_from, "$lte": date_to}},
-                {"classified_at": {"$exists": False}, "created_at": {"$gte": date_from, "$lte": date_to}},
-                {"updated_at": {"$gte": date_from, "$lte": date_to}}
-            ]
-        }
+        date_query
     ]
     if is_cajero and current_user.get("email"):
         cargas_query_parts.append({
@@ -6804,20 +6797,14 @@ async def crm_funnel_by_ad(
     """Get conversion stats grouped by ad source (utm_content)"""
     now = datetime.now(timezone.utc)
     start_date = (now - timedelta(days=days)).isoformat()
-    date_match = {
-        "$or": [
-            {"created_at": {"$gte": start_date}},
-            {"classified_at": {"$gte": start_date}},
-            {"updated_at": {"$gte": start_date}}
-        ]
-    }
+    date_match = {"created_at": {"$gte": start_date}}
     
     # Aggregate by utm_content/ad_source
     pipeline = [
         {"$match": {**line_query, **date_match, "ad_source": {"$ne": None, "$exists": True}}},
         {"$group": {
             "_id": "$ad_source",
-            "total_leads": {"$sum": {"$cond": [{"$gte": ["$created_at", start_date]}, 1, 0]}},
+            "total_leads": {"$sum": 1},
             "validos": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
             "total_monto": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, {"$ifNull": ["$charge_amount", 0]}, 0]}},
         }},
