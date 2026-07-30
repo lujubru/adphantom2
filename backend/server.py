@@ -6702,43 +6702,51 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                         unassigned_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": None})
                         
                         if unassigned_lead:
-                            # Assign existing unassigned lead to this line
+                            # Assign existing unassigned lead to this line and update ad attribution for this interaction
                             update_fields = {"line_id": line_id, "updated_at": now}
-                            if ad_source and not unassigned_lead.get("ad_source"):
+                            if ad_source:
                                 update_fields["ad_source"] = ad_source
+                            if utm_content:
                                 update_fields["utm_content"] = utm_content
+                            if click_id:
                                 update_fields["click_id"] = click_id
+                            if referral_data:
+                                update_fields["referral"] = referral_data
+                            if ctwa_clid:
+                                update_fields["ctwa_clid"] = ctwa_clid
+                            if fb_login_id:
+                                update_fields["fb_login_id"] = fb_login_id
                             await db.crm_leads.update_one(
                                 {"id": unassigned_lead["id"]},
                                 {"$set": update_fields}
                             )
                             crm_lead = unassigned_lead
-                            crm_lead["line_id"] = line_id
+                            crm_lead.update(update_fields)
                         # NOTE: If lead exists on a DIFFERENT line, crm_lead stays None
                         # so a NEW lead will be created for THIS line below
                     
-                    # Update ad_source if lead exists but doesn't have ad tracking
-                    if crm_lead and ad_source and not crm_lead.get("ad_source"):
-                        update_data = {"ad_source": ad_source, "utm_content": utm_content, "click_id": click_id}
+                    # Update lead ad attribution whenever new tracking/referral data is present
+                    if crm_lead and (referral_data or ad_source or click_id or ctwa_clid or fb_login_id):
+                        update_data = {}
                         if referral_data:
                             update_data["referral"] = referral_data
+                        if ad_source:
+                            update_data["ad_source"] = ad_source
+                        if utm_content:
+                            update_data["utm_content"] = utm_content
+                        if click_id:
+                            update_data["click_id"] = click_id
                         if ctwa_clid:
                             update_data["ctwa_clid"] = ctwa_clid
                         if fb_login_id:
                             update_data["fb_login_id"] = fb_login_id
-                        await db.crm_leads.update_one(
-                            {"id": crm_lead["id"]},
-                            {"$set": update_data}
-                        )
-                    # Also update fb_login_id/ctwa_clid even if ad_source already set
-                    elif crm_lead and (fb_login_id or ctwa_clid):
-                        fb_update = {}
-                        if fb_login_id and not crm_lead.get("fb_login_id"):
-                            fb_update["fb_login_id"] = fb_login_id
-                        if ctwa_clid and not crm_lead.get("ctwa_clid"):
-                            fb_update["ctwa_clid"] = ctwa_clid
-                        if fb_update:
-                            await db.crm_leads.update_one({"id": crm_lead["id"]}, {"$set": fb_update})
+
+                        if update_data:
+                            await db.crm_leads.update_one(
+                                {"id": crm_lead["id"]},
+                                {"$set": update_data}
+                            )
+                            crm_lead.update(update_data)
                     
                     if not crm_lead:
                         # Create new lead. We intentionally do NOT auto-create
@@ -7526,11 +7534,29 @@ async def crm_get_lead_ad_preview(lead_id: str, current_user=Depends(get_current
     if not lead:
         raise HTTPException(status_code=404, detail="Lead no encontrado")
 
+    # Cajero permission check: respect line ownership
+    if not _user_can_use_line(current_user, lead.get("line_id")):
+        raise HTTPException(status_code=403, detail="Sin acceso a este lead")
+
     referral = lead.get("referral") or {}
     landing_code = lead.get("landing_code")
     ad_source = lead.get("ad_source")
     utm_content = lead.get("utm_content")
     ctwa_clid = lead.get("ctwa_clid")
+
+    # Fallback to related lead entry on the SAME line if referral is missing on this specific doc
+    if not (referral and (referral.get("headline") or referral.get("source_id") or referral.get("image_url") or referral.get("video_url"))) and lead.get("phone") and lead.get("line_id"):
+        rel_lead = await db.crm_leads.find_one(
+            {"phone": lead["phone"], "line_id": lead["line_id"], "referral": {"$ne": None, "$exists": True}},
+            {"_id": 0, "referral": 1, "landing_code": 1, "ad_source": 1, "utm_content": 1, "ctwa_clid": 1},
+            sort=[("updated_at", -1)]
+        )
+        if rel_lead:
+            referral = rel_lead.get("referral") or referral
+            landing_code = landing_code or rel_lead.get("landing_code")
+            ad_source = ad_source or rel_lead.get("ad_source")
+            utm_content = utm_content or rel_lead.get("utm_content")
+            ctwa_clid = ctwa_clid or rel_lead.get("ctwa_clid")
 
     # 1. Meta CTWA Ad referral — richest source (image, headline, body, etc.)
     if referral and (referral.get("headline") or referral.get("source_id") or referral.get("image_url") or referral.get("video_url")):
