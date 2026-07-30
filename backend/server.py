@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Query, Response, Body
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Query, Response, Body, BackgroundTasks
 from fastapi.responses import RedirectResponse, HTMLResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -8,7 +8,7 @@ import logging
 import asyncio
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import uuid
 from datetime import datetime, timezone, timedelta
 from passlib.context import CryptContext
@@ -43,7 +43,7 @@ if env_file.exists():
     load_dotenv(env_file, override=False)
 
 # MongoDB connection
-mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
+mongo_url = os.environ.get('MONGO_URL') or os.environ.get('MONGODB_URI') or os.environ.get('DATABASE_URL') or 'mongodb://localhost:27017'
 db_name = os.environ.get('DB_NAME', 'traffic_guardian')
 client = AsyncIOMotorClient(
     mongo_url,
@@ -64,6 +64,28 @@ EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
 WHATSAPP_TOKEN = os.environ.get('WHATSAPP_TOKEN', '')
 WHATSAPP_PHONE_NUMBER_ID = os.environ.get('WHATSAPP_PHONE_NUMBER_ID', '')
 WHATSAPP_VERIFY_TOKEN = os.environ.get('WHATSAPP_VERIFY_TOKEN', 'traffic_guardian_verify_2024')
+
+def get_cloaking_domain() -> str:
+    """
+    Resuelve el dominio para cloaking y derivaciones protegidas.
+    Prioriza explícitamente las variables específicas de cloaking configuradas en el entorno:
+      1. CLOAKING_DOMAIN / CLOACKING_DOMAIN (variante ortográfica)
+      2. HANDSHAKE_DOMAIN / REACT_APP_HANDSHAKE_DOMAIN / DERIVATION_DOMAIN
+      3. APP_URL / REACT_APP_BACKEND_URL
+    """
+    domain = (
+        os.environ.get("CLOAKING_DOMAIN") or
+        os.environ.get("CLOACKING_DOMAIN") or
+        os.environ.get("HANDSHAKE_DOMAIN") or
+        os.environ.get("DERIVATION_DOMAIN") or
+        os.environ.get("REACT_APP_HANDSHAKE_DOMAIN") or
+        os.environ.get("APP_URL") or
+        os.environ.get("REACT_APP_BACKEND_URL") or
+        ""
+    ).strip().rstrip("/")
+    if domain and not domain.startswith(("http://", "https://")):
+        domain = f"https://{domain}"
+    return domain
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12, bcrypt__ident="2b")
@@ -174,26 +196,29 @@ async def get_current_user(request: Request):
 
 # ─── Traffic Inspector ─────────────────────────────────────────────
 
-# Meta/Facebook known IP ranges (prefixes)
+# Meta/Facebook known IP ranges (prefixes) + Meta crawler & reviewer datacenters
 META_IP_PREFIXES = (
     '173.252.', '31.13.', '69.171.', '66.220.', '157.240.',
     '179.60.', '185.60.', '204.15.20.', '69.63.', '199.201.64.',
-    '199.201.65.', '204.15.20.', '2a03:2880:',
+    '199.201.65.', '2a03:2880:', '2a03:2881:', '2a03:2884:', '2a03:2885:',
+    '2a03:2886:', '2a03:2887:', '2620:108:', '2620:0:1c00:',
 )
 
 BOT_PATTERNS = re.compile(
     r'bot|crawl|spider|scrape|meta-externalagent|facebookexternalhit|facebot|'
     r'twitterbot|linkedinbot|pinterest|slackbot|telegram|'
-    r'googlebot|bingbot|yandex|baidu|duckduck|monitoring|checker|validator|preview|fetcher',
+    r'googlebot|bingbot|yandex|baidu|duckduck|monitoring|checker|validator|preview|fetcher|headless|puppeteer|selenium',
     re.IGNORECASE
 )
 META_PATTERNS = re.compile(
-    r'meta-externalagent|facebookexternalhit|facebot',
+    r'meta-externalagent|facebookexternalhit|facebot|facebookcatalog|meta-fetcher',
     re.IGNORECASE
 )
 
 def is_meta_ip(ip: str) -> bool:
     """Check if IP belongs to Meta/Facebook infrastructure"""
+    if not ip:
+        return False
     return any(ip.startswith(prefix) for prefix in META_IP_PREFIXES)
 
 def is_bot(user_agent: str) -> bool:
@@ -234,33 +259,57 @@ def calculate_behavioral_score(is_bot_flag: bool, is_vpn: bool, is_datacenter: b
     return max(0.0, score)
 
 def detect_vpn(headers: dict) -> bool:
-    # Disabled auto VPN detection - Railway/Cloudflare proxies cause false positives
-    # Real VPN detection would require an IP intelligence API
+    """Detect proxy/VPN indicators from edge headers"""
+    headers_lower = {str(k).lower(): str(v) for k, v in headers.items()}
+    # Known Cloudflare / proxy headers indicating data center or proxy forwarding
+    if "x-forwarded-for" in headers_lower and len(headers_lower["x-forwarded-for"].split(",")) > 2:
+        return True
+    if headers_lower.get("via") or headers_lower.get("x-proxy-id"):
+        return True
     return False
 
-def should_block(config: dict, ip: str, country: str, device: str, os_name: str, referrer: str, bot: bool, vpn: bool):
+def get_client_country(request: Request) -> str:
+    """Extract country from Cloudflare / proxy headers or return XX if unknown"""
+    cf_country = request.headers.get("cf-ipcountry") or request.headers.get("x-country-code")
+    if cf_country and len(cf_country) == 2:
+        return cf_country.upper()
+    return "XX"
+
+def should_block(config: dict, ip: str, country: str, device: str, os_name: str, referrer: str, bot: bool, vpn: bool, user_agent: str = ""):
     if config.get('whitelist_ips') and ip in config['whitelist_ips']:
         return False, ""
-    # Never block Meta/Facebook IPs - they're real users from Meta ads or crawlers
+    
+    # Meta / Facebook IPs & Crawlers must ALWAYS be blocked from target offer page (cloaked to safe page)
     if is_meta_ip(ip):
-        return False, ""
+        return True, "IP de Meta/Facebook bloqueada"
+    if is_meta_crawler(user_agent):
+        return True, "Meta Crawler detectado"
+
     if ip in config.get('blacklist_ips', []):
         return True, "IP en lista negra"
-    # Only block explicit bots (Googlebot, scrapers, etc.) - not mobile users
-    if bot and not any(m in (device or '') for m in ('Mobile', 'Tablet', 'Desktop')):
-        return True, "Bot detectado"
+
+    # Block explicit bots regardless of spoofed device type
+    if bot:
+        return True, "Bot o scraper detectado"
+
+    if vpn and config.get('block_vpn', False):
+        return True, "VPN o proxy detectado"
+
     if config.get('block_empty_referrer') and not referrer:
         return True, "Referrer vacío bloqueado"
+
     allowed_countries = config.get('allowed_countries', [])
-    # Skip country check if no real GeoIP (country = "XX")
     if allowed_countries and country != "XX" and country not in allowed_countries:
         return True, f"País {country} no permitido"
+
     allowed_devices = config.get('allowed_devices', [])
     if allowed_devices and device not in allowed_devices:
         return True, f"Dispositivo {device} no permitido"
+
     allowed_os = config.get('allowed_os', [])
     if allowed_os and os_name not in allowed_os:
         return True, f"SO {os_name} no permitido"
+
     return False, ""
 
 def generate_fingerprint(ip: str, user_agent: str, headers: dict) -> str:
@@ -858,7 +907,7 @@ async def track_click(campaign_id: str, request: Request):
     headers_dict = dict(request.headers)
 
     device, os_name, browser = parse_device_info(user_agent)
-    country = "XX"  # Simplified - would use GeoIP in production
+    country = get_client_country(request)
 
     bot = is_bot(user_agent)
     meta = is_meta_crawler(user_agent)
@@ -875,7 +924,7 @@ async def track_click(campaign_id: str, request: Request):
         'blacklist_ips': campaign.get('blacklist_ips', []),
         'whitelist_ips': campaign.get('whitelist_ips', []),
     }
-    blocked, block_reason = should_block(config, ip, country, device, os_name, referrer, bot, vpn)
+    blocked, block_reason = should_block(config, ip, country, device, os_name, referrer, bot, vpn, user_agent)
 
     # Check AI-generated rules (skip for Meta IPs - they're always allowed)
     is_real_device = device in ('Mobile', 'Tablet', 'Desktop')
@@ -2244,6 +2293,63 @@ async def _send_crm_video_to_wa_async(
             pass
 
 
+async def _send_sms_async(to_phone: str, body: str, line: dict = None) -> bool:
+    """Send SMS using Twilio.
+    Supports line-specific Twilio credentials/from_number if provided,
+    otherwise falls back to environment variables.
+    """
+    import os
+    import base64
+    import urllib.parse
+    
+    line = line or {}
+    account_sid = line.get("twilio_account_sid") or os.environ.get("TWILIO_ACCOUNT_SID")
+    auth_token = line.get("twilio_auth_token") or os.environ.get("TWILIO_AUTH_TOKEN")
+    from_number = line.get("twilio_from_number") or os.environ.get("TWILIO_FROM_NUMBER")
+    
+    if not account_sid or not auth_token or not from_number:
+        logger.error(
+            f"Twilio credentials missing. line_sid={account_sid[:5] if account_sid else 'none'} "
+            f"from_num={from_number}"
+        )
+        return False
+        
+    # E.164 formatting check
+    to_phone_clean = to_phone.strip()
+    if not to_phone_clean.startswith("+"):
+        to_phone_clean = f"+{to_phone_clean}"
+        
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+    auth_str = f"{account_sid}:{auth_token}"
+    auth_b64 = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
+    
+    headers = {
+        "Authorization": f"Basic {auth_b64}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    
+    payload = {
+        "To": to_phone_clean,
+        "From": from_number,
+        "Body": body
+    }
+    
+    data_str = urllib.parse.urlencode(payload)
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.post(url, headers=headers, content=data_str)
+            if res.status_code in (200, 201):
+                logger.info(f"Twilio SMS sent successfully to {to_phone_clean}")
+                return True
+            else:
+                logger.error(f"Twilio API error {res.status_code}: {res.text}")
+                return False
+    except Exception as e:
+        logger.exception(f"Exception sending SMS to {to_phone_clean} via Twilio: {e}")
+        return False
+
+
 async def _send_crm_audio_to_wa_async(
     message_id: str,
     file_bytes: bytes,
@@ -2318,6 +2424,59 @@ async def _send_crm_audio_to_wa_async(
             pass
 
 
+_LINE_HEALTH_CACHE: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+
+async def get_line_health_shield_status(line_id: str, token: str, phone_id: str, waba_id: Optional[str] = None) -> Dict[str, Any]:
+    """Fetch or return cached 45-second health inspection of the WhatsApp line"""
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    if line_id and line_id in _LINE_HEALTH_CACHE:
+        cached_ts, cached_info = _LINE_HEALTH_CACHE[line_id]
+        if (now_ts - cached_ts) < 45:
+            return cached_info
+
+    meta_info = await _wa_fetch_phone_quality(phone_id, token) if (phone_id and token) else {}
+    waba_info = await _wa_fetch_waba_status(waba_id, token) if (waba_id and token) else {}
+
+    quality = (meta_info.get("quality_rating") or "UNKNOWN").upper()
+    number_status = (meta_info.get("status") or "").upper()
+    account_mode = (meta_info.get("account_mode") or "").upper()
+    waba_review = (waba_info.get("account_review_status") or "").upper()
+
+    BAD_NUMBER_STATUSES = {"BANNED", "RESTRICTED", "FLAGGED", "DISCONNECTED", "RATE_LIMITED", "MIGRATED"}
+    BAD_WABA_STATUSES = {"DISABLED", "REJECTED", "FLAGGED"}
+
+    reasons = []
+    if number_status in BAD_NUMBER_STATUSES:
+        reasons.append(f"Estado del número en Meta: {number_status}")
+    if account_mode == "DISABLED":
+        reasons.append("Cuenta deshabilitada por Meta (account_mode=DISABLED)")
+    if waba_review in BAD_WABA_STATUSES:
+        reasons.append(f"WABA en estado: {waba_review}")
+    if quality == "RED":
+        reasons.append("Calidad de línea en RED (Riesgo Alto)")
+
+    if account_mode == "DISABLED" or (number_status in BAD_NUMBER_STATUSES) or (waba_review in BAD_WABA_STATUSES) or (quality == "RED"):
+        health = "blocked"
+    elif quality == "YELLOW":
+        health = "warning"
+    elif quality == "GREEN" and number_status in ("CONNECTED", "", "PENDING"):
+        health = "ok"
+    else:
+        health = "ok"
+
+    result = {
+        "health": health,
+        "quality_rating": quality,
+        "number_status": number_status or "CONNECTED",
+        "account_mode": account_mode or "ACTIVE",
+        "waba_review_status": waba_review or "APPROVED",
+        "reasons": reasons,
+    }
+    if line_id:
+        _LINE_HEALTH_CACHE[line_id] = (now_ts, result)
+    return result
+
+
 async def _send_crm_message_to_wa_async(
     message_id: str,
     phone: str,
@@ -2325,12 +2484,54 @@ async def _send_crm_message_to_wa_async(
     token: str,
     phone_id: str,
     line_name: Optional[str] = None,
+    line_id: Optional[str] = None,
 ):
-    """Background task: send a crm_messages doc's content via WhatsApp and
-    update its delivery_status + wa_result. Isolated from the HTTP request
-    so the cashier's UI shows the message immediately even if Meta is slow.
+    """Background task with Anti-Ban Shield protection & explicit cashier action logging.
+    Isolated from the HTTP request so cashier UI shows message immediately.
     """
     try:
+        # 1. Inspect line health & Anti-Ban Shield status
+        health_info = {"health": "ok", "reasons": []}
+        if line_id or line_name:
+            line_query = {"id": line_id} if line_id else {"name": line_name}
+            line_doc = await db.crm_lines.find_one(line_query, {"_id": 0})
+            if line_doc:
+                lid = line_doc.get("id", line_id or "")
+                waba = line_doc.get("waba_id") or line_doc.get("whatsapp_business_account_id")
+                health_info = await get_line_health_shield_status(lid, token, phone_id, waba)
+
+        # 2. Hard block if line is suspended / banned / RED
+        if health_info.get("health") == "blocked":
+            reasons_str = ", ".join(health_info.get("reasons") or ["Línea suspendida en Meta"])
+            guide = (
+                f"⛔ ENVÍO BLOQUEADO POR ESCUDO ANTI-BAN: La línea '{line_name or ''}' está en estado '{health_info.get('number_status', 'BLOCKED')}'. "
+                f"Motivo: {reasons_str}. "
+                f"👉 ACCIÓN PARA EL CAJERO: Mové o derivá este chat a otra línea sana activa o avisá al administrador."
+            )
+            logger.error(f"CRM Anti-Ban Shield: Stopped send on msg {message_id}: {guide}")
+            await db.crm_messages.update_one(
+                {"id": message_id},
+                {"$set": {
+                    "delivery_status": "error",
+                    "delivery_error_code": "ANTI_BAN_SHIELD_BLOCKED",
+                    "delivery_error_title": guide,
+                    "line_health": health_info,
+                }}
+            )
+            return
+
+        # 3. Apply human typing delay based on risk level
+        if health_info.get("health") == "warning":
+            # Line in YELLOW quality -> extended typing delay (7 to 15s)
+            delay_sec = random.uniform(7.0, 15.0)
+            logger.info(f"Anti-Ban Shield: Line '{line_name}' is in WARNING/YELLOW. Applying {round(delay_sec, 1)}s delay for msg {message_id}")
+            await asyncio.sleep(delay_sec)
+        else:
+            # Normal GREEN -> natural typing delay (1.5 to 3.5s)
+            delay_sec = random.uniform(1.5, 3.5)
+            await asyncio.sleep(delay_sec)
+
+        # 4. Dispatch to WhatsApp API
         wa_result = await wa_send_text(
             phone=phone,
             message=content,
@@ -2348,19 +2549,38 @@ async def _send_crm_message_to_wa_async(
             "wa_result": wa_result,
             "wa_message_id": wamid,
             "delivery_status": "sent" if wamid else "error",
+            "line_health": health_info,
         }
         if not wamid and isinstance(wa_result, dict):
             err = wa_result.get("error") or {}
             if isinstance(err, dict):
-                update["delivery_error_code"] = err.get("code")
-                update["delivery_error_title"] = err.get("message") or err.get("title")
+                err_code = err.get("code")
+                err_msg = err.get("message") or err.get("title") or "Error Meta"
+                update["delivery_error_code"] = err_code
+
+                if err_code == 131047:
+                    guide = "🔴 Ventana de 24hs cerrada (Meta Error 131047). El cliente no respondió recientemente. 👉 ACCIÓN: Enviá un template de Broadcast para reabrir el chat."
+                elif err_code in (131056, 131048):
+                    guide = f"🟡 Límite de velocidad alcanzado en Meta ({err_code}). 👉 ACCIÓN: Esperá unos segundos antes de reintentar."
+                elif err_code in (131026, 131009):
+                    guide = f"🔴 El número de WhatsApp del cliente no es válido o no puede recibir mensajes ({err_code})."
+                elif err_code in (131030, 131031):
+                    guide = f"⛔ Cuenta o línea deshabilitada en Meta ({err_code}). 👉 ACCIÓN: Derivá este chat a otra línea activa."
+                else:
+                    guide = f"🔴 Error Meta ({err_code}): {err_msg}. 👉 ACCIÓN: Verificá la línea o probá en unos momentos."
+
+                update["delivery_error_title"] = guide
+
         await db.crm_messages.update_one({"id": message_id}, {"$set": update})
     except Exception as e:
         logger.error(f"CRM: Background WA send FAILED for msg {message_id}: {e}")
         try:
             await db.crm_messages.update_one(
                 {"id": message_id},
-                {"$set": {"delivery_status": "error", "delivery_error_title": str(e)[:200]}},
+                {"$set": {
+                    "delivery_status": "error",
+                    "delivery_error_title": f"🔴 Error de conexión en envío: {str(e)[:180]}. 👉 ACCIÓN: Revisá la conexión o reintentá el mensaje."
+                }},
             )
         except Exception:
             pass
@@ -3130,8 +3350,17 @@ async def wa_webhook_receive(request: Request):
                     if target_line_id:
                         # First try to find lead already assigned to this specific line
                         crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": target_line_id})
-                        # If lead exists on a DIFFERENT line or is unassigned (line_id: None),
-                        # crm_lead stays None -> new clean lead created below
+                        if not crm_lead:
+                            # Check for unassigned lead
+                            crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": None})
+                            if crm_lead:
+                                # Assign unassigned lead to this line
+                                await db.crm_leads.update_one(
+                                    {"id": crm_lead["id"]},
+                                    {"$set": {"line_id": target_line_id, "updated_at": now}}
+                                )
+                                crm_lead["line_id"] = target_line_id
+                            # If lead exists on a DIFFERENT line, crm_lead stays None → new lead created below
                     else:
                         # No line matched — only reuse leads that are ALSO
                         # unassigned. NEVER attach messages to a lead that
@@ -3543,6 +3772,13 @@ async def wa_sync_to_crm(line_id: str = Query(..., description="CRM Line ID to a
         # Check if lead already exists
         existing = await db.crm_leads.find_one({"phone": phone})
         if existing:
+            # Update line_id if not set
+            if not existing.get("line_id"):
+                await db.crm_leads.update_one(
+                    {"phone": phone},
+                    {"$set": {"line_id": line_id}}
+                )
+                synced += 1
             continue
         
         # Map wa classification to crm status
@@ -4323,6 +4559,14 @@ META_PIXEL_ID = os.environ.get('META_PIXEL_ID', '')
 
 # ─── CRM Lines Pydantic Models ─────────────────────────────────────
 
+class CRMMetaImportLineRequest(BaseModel):
+    waba_id: str
+    phone_number_id: str
+    name: str
+    whatsapp_token: str
+    line_type: str = "publi"
+    whatsapp_number: str
+
 class CRMLineCreate(BaseModel):
     name: str
     line_type: str = "publi"  # publi, principal, spam
@@ -4341,6 +4585,10 @@ class CRMLineCreate(BaseModel):
     meta_pixel_id: Optional[str] = ""
     description: Optional[str] = ""
     is_active: bool = True
+    # Twilio overrides
+    twilio_from_number: Optional[str] = ""
+    twilio_account_sid: Optional[str] = ""
+    twilio_auth_token: Optional[str] = ""
 
 class CRMLineUpdate(BaseModel):
     name: Optional[str] = None
@@ -4357,6 +4605,9 @@ class CRMLineUpdate(BaseModel):
     notes: Optional[str] = None  # Observaciones admin: a qué corresponde la línea, recordatorios, etc.
     is_active: Optional[bool] = None
     receipt_ocr_enabled: Optional[bool] = None  # Claude Vision receipt OCR + auto-match to MP inbox
+    twilio_from_number: Optional[str] = None
+    twilio_account_sid: Optional[str] = None
+    twilio_auth_token: Optional[str] = None
 
 # ─── CRM Pydantic Models ───────────────────────────────────────────
 
@@ -5049,6 +5300,100 @@ async def send_meta_conversion_event(
 
 # ─── CRM Lines Routes ──────────────────────────────────────────────
 
+@api_router.get("/crm/meta/waba-lines")
+async def get_meta_waba_lines(access_token: str, current_user=Depends(get_current_user)):
+    """
+    Fetches the user's WABAs and Phone Numbers using a Facebook Login access token.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"https://graph.facebook.com/v19.0/me/businesses?access_token={access_token}"
+            )
+            resp.raise_for_status()
+            businesses = resp.json().get("data", [])
+
+            lines = []
+            for b in businesses:
+                business_id = b.get("id")
+                waba_resp = await client.get(
+                    f"https://graph.facebook.com/v19.0/{business_id}/owned_whatsapp_business_accounts?access_token={access_token}"
+                )
+                if waba_resp.status_code == 200:
+                    wabas = waba_resp.json().get("data", [])
+                    for w in wabas:
+                        waba_id = w.get("id")
+                        phones_resp = await client.get(
+                            f"https://graph.facebook.com/v19.0/{waba_id}/phone_numbers?access_token={access_token}"
+                        )
+                        if phones_resp.status_code == 200:
+                            phones = phones_resp.json().get("data", [])
+                            for p in phones:
+                                lines.append({
+                                    "business_name": b.get("name"),
+                                    "waba_id": waba_id,
+                                    "waba_name": w.get("name"),
+                                    "phone_number_id": p.get("id"),
+                                    "display_phone_number": p.get("display_phone_number"),
+                                    "quality_rating": p.get("quality_rating"),
+                                    "name_status": p.get("name_status")
+                                })
+            return {"data": lines}
+    except Exception as e:
+        logger.error(f"Error fetching waba lines: {e}")
+        raise HTTPException(status_code=400, detail="Error obteniendo líneas de Meta. Verifica los permisos de la app.")
+
+@api_router.post("/crm/meta/import-line")
+async def crm_meta_import_line(data: CRMMetaImportLineRequest, current_user=Depends(get_current_user)):
+    """
+    Subscribes the WABA to the app and saves the line to MongoDB.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://graph.facebook.com/v19.0/{data.waba_id}/subscribed_apps",
+                data={"access_token": data.whatsapp_token}
+            )
+            if resp.status_code != 200:
+                logger.error(f"Meta Subscribe App Error: {resp.text}")
+                raise HTTPException(status_code=400, detail="Error suscribiendo la App al WABA. Verifica que el token tenga permisos.")
+    except httpx.RequestError as e:
+        logger.error(f"Error network subscribing app: {e}")
+        raise HTTPException(status_code=500, detail="Error de red conectando con Meta.")
+
+    verify_token = f"verify_{uuid.uuid4().hex[:12]}"
+    line_id = str(uuid.uuid4())
+    
+    line = {
+        "id": line_id,
+        "name": data.name,
+        "line_type": data.line_type,
+        "whatsapp_number": data.whatsapp_number,
+        "whatsapp_token": data.whatsapp_token,
+        "phone_number_id": data.phone_number_id,
+        "verify_token": verify_token,
+        "whatsapp_business_account_id": data.waba_id,
+        "webhook_parent_line_id": None,
+        "meta_access_token": "",
+        "meta_pixel_id": "",
+        "description": "Línea importada automáticamente mediante Meta OAuth",
+        "twilio_from_number": "",
+        "twilio_account_sid": "",
+        "twilio_auth_token": "",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "is_active": True,
+        "created_by": current_user.get("user_id")
+    }
+
+    await db.crm_lines.insert_one(line)
+    
+    await _broadcast_system_message({
+        "type": "CRM_LINES_UPDATED",
+        "message": "Se importó una nueva línea de Meta."
+    })
+    
+    return {"status": "ok", "line_id": line_id, "verify_token": verify_token}
+
 @api_router.get("/crm/lines")
 async def crm_get_all_lines(current_user=Depends(get_current_user)):
     """Get all WhatsApp lines"""
@@ -5059,7 +5404,7 @@ async def crm_get_all_lines(current_user=Depends(get_current_user)):
         line["leads_count"] = await db.crm_leads.count_documents({"line_id": line["id"]})
         line["cargas_count"] = await db.crm_leads.count_documents({
             "line_id": line["id"], 
-            "status": "valido"
+            "status": "cliente_real"
         })
     
     return lines
@@ -5107,6 +5452,10 @@ async def crm_create_line(data: CRMLineCreate, current_user=Depends(get_current_
         "meta_pixel_id": data.meta_pixel_id or "",
         "description": data.description or "",
         "is_active": data.is_active,
+        # Twilio overrides
+        "twilio_from_number": data.twilio_from_number or "",
+        "twilio_account_sid": data.twilio_account_sid or "",
+        "twilio_auth_token": data.twilio_auth_token or "",
         "created_at": now,
         "updated_at": now,
         # Stats
@@ -6349,9 +6698,24 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                         logger.info(f"CRM: Resurrected soft-deleted lead {crm_lead['id']} ({from_phone}) on line {line['name']}")
                     
                     if not crm_lead:
-                        # Orphaned leads (line_id: None) stay null.
-                        # A new clean lead for THIS line will be created below.
-                        pass
+                        # Check if there's an unassigned lead (no line_id) we can claim
+                        unassigned_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": None})
+                        
+                        if unassigned_lead:
+                            # Assign existing unassigned lead to this line
+                            update_fields = {"line_id": line_id, "updated_at": now}
+                            if ad_source and not unassigned_lead.get("ad_source"):
+                                update_fields["ad_source"] = ad_source
+                                update_fields["utm_content"] = utm_content
+                                update_fields["click_id"] = click_id
+                            await db.crm_leads.update_one(
+                                {"id": unassigned_lead["id"]},
+                                {"$set": update_fields}
+                            )
+                            crm_lead = unassigned_lead
+                            crm_lead["line_id"] = line_id
+                        # NOTE: If lead exists on a DIFFERENT line, crm_lead stays None
+                        # so a NEW lead will be created for THIS line below
                     
                     # Update ad_source if lead exists but doesn't have ad tracking
                     if crm_lead and ad_source and not crm_lead.get("ad_source"):
@@ -6688,11 +7052,16 @@ async def crm_funnel_stats(
     chats_result = await db.crm_leads.aggregate(chats_pipeline).to_list(1)
     total_chats = chats_result[0]["total"] if chats_result else 0
 
-    # Cargas (válidos): se calcula usando la fecha de creación (cohort-based) para coincidir con chats
+    # Cargas (válidos): se calcula usando la fecha de conversión (classified_at) y filtrando por el cajero clasificador si aplica
     cargas_query_parts = [
         {"status": "valido"},
         line_query if line_query else {},
-        date_query
+        {
+            "$or": [
+                {"classified_at": {"$gte": date_from, "$lte": date_to}},
+                {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": date_from, "$lte": date_to}}
+            ]
+        }
     ]
     if is_cajero and current_user.get("email"):
         cargas_query_parts.append({
@@ -6753,7 +7122,7 @@ async def crm_funnel_by_line(
         leads_count = await db.crm_leads.count_documents({"line_id": line["id"]})
         cargas_count = await db.crm_leads.count_documents({
             "line_id": line["id"],
-            "status": "valido"
+            "status": "cliente_real"
         })
         
         # Get monto from receipts
@@ -6797,16 +7166,30 @@ async def crm_funnel_by_ad(
     """Get conversion stats grouped by ad source (utm_content)"""
     now = datetime.now(timezone.utc)
     start_date = (now - timedelta(days=days)).isoformat()
-    date_match = {"created_at": {"$gte": start_date}}
+    date_query = {"created_at": {"$gte": start_date}}
+    
+    # Build line filter based on user role
+    user_line_ids = current_user.get("line_ids", [])
+    if current_user.get("role") == "cajero" and user_line_ids:
+        if line_id and line_id in user_line_ids:
+            line_query = {"line_id": line_id}
+        else:
+            line_query = {"line_id": {"$in": user_line_ids}}
+    elif current_user.get("role") == "cajero" and not user_line_ids:
+        return []
+    elif line_id:
+        line_query = {"line_id": line_id}
+    else:
+        line_query = {}
     
     # Aggregate by utm_content/ad_source
     pipeline = [
-        {"$match": {**line_query, **date_match, "ad_source": {"$ne": None, "$exists": True}}},
+        {"$match": {**line_query, **date_query, "ad_source": {"$ne": None, "$exists": True}}},
         {"$group": {
             "_id": "$ad_source",
             "total_leads": {"$sum": 1},
             "validos": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
-            "total_monto": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, {"$ifNull": ["$charge_amount", 0]}, 0]}},
+            "total_monto": {"$sum": {"$ifNull": ["$charge_amount", 0]}},
         }},
         {"$sort": {"total_leads": -1}}
     ]
@@ -7906,6 +8289,7 @@ async def crm_send_message(
                 token=line["whatsapp_token"],
                 phone_id=line["phone_number_id"],
                 line_name=line.get("name"),
+                line_id=lead.get("line_id"),
             ))
         else:
             logger.warning(f"CRM: Line {lead.get('line_id')} missing whatsapp_token or phone_number_id")
@@ -7980,6 +8364,40 @@ async def crm_send_message(
         "contact_event_sent": meta_result is not None,
         "meta_result": meta_result
         }
+
+
+@api_router.post("/crm/leads/{lead_id}/simulate-inbound")
+async def crm_simulate_inbound_message(
+    lead_id: str,
+    content: Optional[str] = "Hola! Mensaje de prueba (Reabrir ventana 24hs)",
+    current_user=Depends(get_current_user)
+):
+    """
+    Simula un mensaje entrante del cliente (sender: 'lead').
+    Resetea y reabre instantáneamente la ventana de 24 horas de WhatsApp para pruebas.
+    """
+    lead = await db.crm_leads.find_one({"id": lead_id})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead no encontrado")
+
+    now = datetime.now(timezone.utc).isoformat()
+    msg_id = str(uuid.uuid4())
+    message = {
+        "id": msg_id,
+        "lead_id": lead_id,
+        "content": content or "Hola! Mensaje de prueba",
+        "sender": "lead",
+        "created_at": now,
+        "wa_result": None,
+        "wa_message_id": f"simulated_{msg_id[:8]}",
+        "delivery_status": "received",
+    }
+    await db.crm_messages.insert_one(message)
+    await db.crm_leads.update_one(
+        {"id": lead_id},
+        {"$set": {"last_message_at": now, "updated_at": now, "unread_count": 0}}
+    )
+    return {"message": "Mensaje de prueba de cliente recibido. Ventana de 24hs reabierta.", "msg_id": msg_id}
 
 
 # ─── CRM Send Quick Template (rotating pre-authored responses) ────
@@ -8078,6 +8496,7 @@ async def crm_send_quick_template(
                 token=line["whatsapp_token"],
                 phone_id=line["phone_number_id"],
                 line_name=line.get("name"),
+                line_id=lead.get("line_id"),
             ))
         else:
             await db.crm_messages.update_one(
@@ -8687,14 +9106,14 @@ async def crm_dashboard_stats(current_user=Depends(get_current_user)):
     for status in CRM_LEAD_STATUSES:
         status_counts[status] = await db.crm_leads.count_documents({"status": status})
     
-    # Valid leads (valido + otros si aplica)
-    valid_leads = status_counts.get("valido", 0) + status_counts.get("interesado", 0) + status_counts.get("potencial", 0)
+    # Valid leads (interesado + potencial + cliente_real)
+    valid_leads = status_counts.get("interesado", 0) + status_counts.get("potencial", 0) + status_counts.get("cliente_real", 0)
     
-    # Discarded leads (spam / basura)
-    discarded_leads = status_counts.get("spam", 0) + status_counts.get("basura", 0)
+    # Discarded leads (basura)
+    discarded_leads = status_counts.get("basura", 0)
     
-    # Real conversions (only valido)
-    conversions = status_counts.get("valido", 0)
+    # Real conversions (only cliente_real)
+    conversions = status_counts.get("cliente_real", 0)
     
     # Quality percentage
     quality_percentage = round((valid_leads / total_leads * 100), 1) if total_leads > 0 else 0
@@ -8738,8 +9157,8 @@ async def crm_dashboard_trends(
         {"$group": {
             "_id": "$date_str",
             "total": {"$sum": 1},
-            "valido": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
-            "basura": {"$sum": {"$cond": [{"$eq": ["$status", "spam"]}, 1, 0]}},
+            "cliente_real": {"$sum": {"$cond": [{"$eq": ["$status", "cliente_real"]}, 1, 0]}},
+            "basura": {"$sum": {"$cond": [{"$eq": ["$status", "basura"]}, 1, 0]}},
         }},
         {"$sort": {"_id": 1}},
     ]
@@ -8749,7 +9168,7 @@ async def crm_dashboard_trends(
         trends.append({
             "date": r["_id"],
             "total": r["total"],
-            "conversions": r["valido"],
+            "conversions": r["cliente_real"],
             "discarded": r["basura"],
         })
     
@@ -8762,7 +9181,7 @@ async def crm_leads_by_source(current_user=Depends(get_current_user)):
         {"$group": {
             "_id": "$source",
             "count": {"$sum": 1},
-            "conversions": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
+            "conversions": {"$sum": {"$cond": [{"$eq": ["$status", "cliente_real"]}, 1, 0]}},
         }},
         {"$sort": {"count": -1}},
     ]
@@ -11503,7 +11922,7 @@ class BroadcastCampaignCreate(BaseModel):
     audience_id: Optional[str] = None
     segment: Optional[BroadcastSegmentQuery] = None
     # Template (single)
-    template_name: str
+    template_name: Optional[str] = None
     template_language: str = "es_AR"
     # Rotación (d): si se pasan 2+ plantillas el sistema reparte uniformemente
     # entre ellas durante el envío. `template_name` queda como fallback/single.
@@ -11520,6 +11939,9 @@ class BroadcastCampaignCreate(BaseModel):
     resend_template_name: Optional[str] = None
     # Auto-pause (c): permite desactivar la auto-pausa para esta campaña
     autopause_disabled: Optional[bool] = False
+    # SMS specific
+    channel: Optional[str] = "whatsapp"  # "whatsapp" or "sms"
+    sms_body: Optional[str] = None
 
 
 @api_router.post("/broadcasts/campaigns")
@@ -11534,43 +11956,51 @@ async def broadcasts_create_campaign(
     if not line:
         raise HTTPException(status_code=404, detail="Línea no encontrada")
 
+    # If channel is SMS, we validate sms_body. Otherwise we validate template_name.
+    if payload.channel == "sms":
+        if not payload.sms_body or not payload.sms_body.strip():
+            raise HTTPException(status_code=400, detail="Debe especificar sms_body para canal SMS")
+    else:
+        if not payload.template_name:
+            raise HTTPException(status_code=400, detail="Debe especificar template_name para canal WhatsApp")
+
     # Health check (b): bloqueamos broadcasts si Meta marca la línea como RED,
     # BANNED, RESTRICTED, FLAGGED, DISCONNECTED, o si la WABA está DISABLED.
-    # Estos son los casos en que Meta NO va a entregar los mensajes y vamos
-    # a quemar la cuenta intentando. Si falla la consulta a Meta, dejamos
-    # pasar (no queremos romper el flow por un endpoint caído).
-    try:
-        meta = await _wa_fetch_phone_quality(
-            line.get("phone_number_id"),
-            line.get("whatsapp_token") or WHATSAPP_TOKEN,
-        )
-        waba_id = line.get("waba_id") or line.get("whatsapp_business_account_id")
-        waba = await _wa_fetch_waba_status(waba_id, line.get("whatsapp_token") or WHATSAPP_TOKEN) if waba_id else {}
+    # Estos son los casos en que Meta NO va a entregar los mensajes.
+    # Si el canal es SMS, ignoramos completamente estos chequeos de WhatsApp/Meta.
+    if payload.channel != "sms":
+        try:
+            meta = await _wa_fetch_phone_quality(
+                line.get("phone_number_id"),
+                line.get("whatsapp_token") or WHATSAPP_TOKEN,
+            )
+            waba_id = line.get("waba_id") or line.get("whatsapp_business_account_id")
+            waba = await _wa_fetch_waba_status(waba_id, line.get("whatsapp_token") or WHATSAPP_TOKEN) if waba_id else {}
 
-        number_status = (meta.get("status") or "").upper()
-        account_mode = (meta.get("account_mode") or "").upper()
-        waba_review = (waba.get("account_review_status") or "").upper()
-        quality = (meta.get("quality_rating") or "").upper()
+            number_status = (meta.get("status") or "").upper()
+            account_mode = (meta.get("account_mode") or "").upper()
+            waba_review = (waba.get("account_review_status") or "").upper()
+            quality = (meta.get("quality_rating") or "").upper()
 
-        if account_mode == "DISABLED" or waba_review in ("DISABLED", "REJECTED"):
-            raise HTTPException(
-                status_code=400,
-                detail="Esta línea pertenece a una cuenta de WhatsApp Business DESHABILITADA por Meta. No se pueden enviar mensajes. Tenés que apelar o usar un número nuevo en una cuenta nueva.",
-            )
-        if number_status in ("BANNED", "RESTRICTED", "FLAGGED"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"El número está en estado {number_status} en Meta. No se pueden enviar broadcasts hasta que Meta restablezca el número.",
-            )
-        if quality == "RED":
-            raise HTTPException(
-                status_code=400,
-                detail="Esta línea tiene quality rating RED en Meta. Pausá los envíos al menos 7 días para que el rating se recupere antes de programar nuevas campañas.",
-            )
-    except HTTPException:
-        raise
-    except Exception:
-        pass  # no romper si Meta no responde
+            if account_mode == "DISABLED" or waba_review in ("DISABLED", "REJECTED"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Esta línea pertenece a una cuenta de WhatsApp Business DESHABILITADA por Meta. No se pueden enviar mensajes. Tenés que apelar o usar un número nuevo en una cuenta nueva.",
+                )
+            if number_status in ("BANNED", "RESTRICTED", "FLAGGED"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"El número está en estado {number_status} en Meta. No se pueden enviar broadcasts hasta que Meta restablezca el número.",
+                )
+            if quality == "RED":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Esta línea tiene quality rating RED en Meta. Pausá los envíos al menos 7 días para que el rating se recupere antes de programar nuevas campañas.",
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # no romper si Meta no responde
 
     if not (payload.audience_id or payload.segment):
         raise HTTPException(status_code=400, detail="Debe especificar audience_id o segment")
@@ -11622,16 +12052,18 @@ async def broadcasts_create_campaign(
         "line_id": payload.line_id,
         "line_name": line.get("name"),
         "name": payload.name,
+        "channel": payload.channel or "whatsapp",
+        "sms_body": payload.sms_body if payload.channel == "sms" else None,
         "audience_id": payload.audience_id,
         "segment": payload.segment.dict() if payload.segment else None,
-        "template_name": payload.template_name,
-        "template_language": payload.template_language,
-        "template_pool": [t for t in (payload.template_pool or []) if t] or None,
-        "template_var_mapping": payload.template_var_mapping or [],
-        "header_image_url": payload.header_image_url,
+        "template_name": payload.template_name if payload.channel != "sms" else None,
+        "template_language": payload.template_language if payload.channel != "sms" else "es_AR",
+        "template_pool": [t for t in (payload.template_pool or []) if t] or None if payload.channel != "sms" else None,
+        "template_var_mapping": payload.template_var_mapping or [] if payload.channel != "sms" else [],
+        "header_image_url": payload.header_image_url if payload.channel != "sms" else None,
         "scheduled_at": payload.scheduled_at,
-        "resend_after_hours": payload.resend_after_hours,
-        "resend_template_name": payload.resend_template_name,
+        "resend_after_hours": payload.resend_after_hours if payload.channel != "sms" else None,
+        "resend_template_name": payload.resend_template_name if payload.channel != "sms" else None,
         "autopause_disabled": bool(payload.autopause_disabled),
         "status": status,
         "target_count": target_count,
@@ -11773,6 +12205,46 @@ async def _csv_campaign_scheduler(campaign_id: str):
         logger.error(f"campaign scheduler {campaign_id} failed: {e}")
 
 
+async def _send_sms_async(to_phone: str, body: str, line: Optional[Dict[str, Any]] = None) -> bool:
+    """Envía un SMS usando Twilio.
+    Si la línea tiene credenciales (twilio_from_number, twilio_account_sid, twilio_auth_token), las usa.
+    De lo contrario, cae a las variables globales (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER).
+    """
+    account_sid = (line or {}).get("twilio_account_sid") or os.environ.get("TWILIO_ACCOUNT_SID", "")
+    auth_token = (line or {}).get("twilio_auth_token") or os.environ.get("TWILIO_AUTH_TOKEN", "")
+    from_number = (line or {}).get("twilio_from_number") or os.environ.get("TWILIO_FROM_NUMBER", "")
+
+    if not account_sid or not auth_token or not from_number:
+        logger.error("SMS Error: credenciales no configuradas (falta TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN o TWILIO_FROM_NUMBER)")
+        return False
+
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+    auth = (account_sid, auth_token)
+
+    clean_phone = to_phone.strip()
+    if not clean_phone.startswith("+"):
+        clean_phone = f"+{clean_phone}"
+
+    payload = {
+        "To": clean_phone,
+        "From": from_number,
+        "Body": body,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10, auth=auth) as client:
+            resp = await client.post(url, data=payload)
+            if resp.status_code in (200, 201):
+                logger.info(f"SMS enviado exitosamente a {clean_phone} vía Twilio.")
+                return True
+            else:
+                logger.error(f"Error API Twilio enviando SMS a {clean_phone}: {resp.status_code} - {resp.text}")
+                return False
+    except Exception as e:
+        logger.error(f"Fallo al enviar SMS Twilio a {clean_phone}: {e}")
+        return False
+
+
 async def _csv_campaign_worker(campaign_id: str):
     """Send a CSV campaign — staggered template messages, night-pause aware."""
     import random
@@ -11787,9 +12259,11 @@ async def _csv_campaign_worker(campaign_id: str):
                 {"$set": {"status": "failed", "paused_reason": "Línea no encontrada"}}
             )
             return
+
+        channel = c.get("channel") or "whatsapp"
         token = line.get("whatsapp_token") or WHATSAPP_TOKEN
         phone_id = line.get("phone_number_id") or WHATSAPP_PHONE_NUMBER_ID
-        if not token or not phone_id:
+        if channel == "whatsapp" and (not token or not phone_id):
             await db.broadcast_campaigns.update_one(
                 {"id": campaign_id},
                 {"$set": {"status": "failed", "paused_reason": "WhatsApp no configurado en la línea"}}
@@ -11887,106 +12361,152 @@ async def _csv_campaign_worker(campaign_id: str):
                     logger.info(f"campaign {campaign_id} paused: monthly quota reached for {owner_email}")
                     return
 
-            # Rate limiter (a): si superamos N envíos/hora para esta línea,
-            # esperamos hasta liberar slot. Esto distribuye los envíos para
-            # que Meta no vea ráfagas.
-            wait_s = await _broadcast_throttle_wait(c["line_id"], line)
-            while wait_s > 0:
-                await db.broadcast_campaigns.update_one(
-                    {"id": campaign_id},
-                    {"$set": {"paused_reason": f"Rate limit: esperando {wait_s}s para liberar slot horario"}}
-                )
-                await asyncio.sleep(min(wait_s, 60))
-                # re-check status mientras esperamos
-                state = await db.broadcast_campaigns.find_one(
-                    {"id": campaign_id}, {"_id": 0, "status": 1}
-                )
-                if not state or state.get("status") not in ("running",):
+            channel = c.get("channel") or "whatsapp"
+
+            if channel == "sms":
+                # SMS flow
+                raw_body = c.get("sms_body") or ""
+                cust_name = (contact.get("name") or "").strip() or "amigo"
+                resolved_sms_body = raw_body.replace("{name}", cust_name)
+
+                msg_id = str(uuid.uuid4())
+                success = await _send_sms_async(phone, resolved_sms_body, line=line)
+                err = None if success else "Twilio SMS request failed"
+                
+                doc = {
+                    "id": msg_id,
+                    "campaign_id": campaign_id,
+                    "line_id": c["line_id"],
+                    "phone": phone,
+                    "name": contact.get("name", ""),
+                    "channel": "sms",
+                    "sms_body": resolved_sms_body,
+                    "status": "sent" if success else "failed",
+                    "error": err,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                await db.broadcast_messages.insert_one(doc)
+                inc = {"stats.sent": 1} if success else {"stats.failed": 1}
+                await db.broadcast_campaigns.update_one({"id": campaign_id}, {"$inc": inc})
+
+                # Increment quota usage on successful send (skip admins — unlimited)
+                if success and owner_email and owner_user and owner_user.get("role") != "admin":
+                    await _quota_increment(owner_email, by=1)
+
+                # Auto-pause on invalid credentials / balance error from Twilio
+                if err and any(k in err.lower() for k in ("twilio", "auth", "credential", "balance", "limit")):
+                    await db.broadcast_campaigns.update_one(
+                        {"id": campaign_id},
+                        {"$set": {"status": "paused", "paused_reason": f"Twilio error: {err[:80]}"}}
+                    )
+                    logger.warning(f"campaign {campaign_id} auto-paused due to Twilio error: {err}")
                     return
+
+                # SMS delay: 0.5 to 1.5 seconds (faster than WhatsApp but safe for carrier gateways)
+                delay = random.uniform(0.5, 1.5)
+                await asyncio.sleep(delay)
+            else:
+                # WhatsApp flow (original)
+                # Rate limiter (a): si superamos N envíos/hora para esta línea,
+                # esperamos hasta liberar slot. Esto distribuye los envíos para
+                # que Meta no vea ráfagas.
                 wait_s = await _broadcast_throttle_wait(c["line_id"], line)
-            await db.broadcast_campaigns.update_one(
-                {"id": campaign_id}, {"$set": {"paused_reason": None}}
-            )
-
-            # Build template variables
-            tpl_vars: List[str] = []
-            for col in var_mapping:
-                if col == "name":
-                    tpl_vars.append((contact.get("name") or "").strip() or "amigo")
-                else:
-                    v = (contact.get("vars") or {}).get(col, "")
-                    tpl_vars.append(str(v) if v is not None else "")
-
-            # Rotación (d): elegimos la próxima plantilla del pool
-            chosen_template = template_pool[_tpl_idx % len(template_pool)]
-            _tpl_idx += 1
-
-            msg_id = str(uuid.uuid4())
-            send_result = await wa_send_template(
-                phone=phone,
-                template_name=chosen_template,
-                language=c.get("template_language") or "es_AR",
-                variables=tpl_vars or None,
-                header_image_url=c.get("header_image_url"),
-                token=token,
-                phone_id=phone_id,
-            )
-
-            wa_msg_id = None
-            err = None
-            success = False
-            if isinstance(send_result, dict):
-                if "error" in send_result:
-                    err = str(send_result.get("error"))[:300]
-                elif send_result.get("messages"):
-                    wa_msg_id = send_result["messages"][0].get("id")
-                    success = True
-                else:
-                    err = str(send_result)[:300]
-
-            doc = {
-                "id": msg_id,
-                "campaign_id": campaign_id,
-                "line_id": c["line_id"],
-                "phone": phone,
-                "name": contact.get("name", ""),
-                "template_name": chosen_template,
-                "wa_message_id": wa_msg_id,
-                "status": "sent" if success else "failed",
-                "error": err,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-            await db.broadcast_messages.insert_one(doc)
-            inc = {"stats.sent": 1} if success else {"stats.failed": 1}
-            await db.broadcast_campaigns.update_one({"id": campaign_id}, {"$inc": inc})
-
-            # Increment quota usage on successful send (skip admins — unlimited)
-            if success and owner_email and owner_user and owner_user.get("role") != "admin":
-                await _quota_increment(owner_email, by=1)
-
-            # Auto-pause (c): si el % de fallos supera el threshold con muestra
-            # mínima, frenamos automáticamente para no quemar la línea.
-            autopause_reason = await _broadcast_check_autopause(campaign_id)
-            if autopause_reason:
+                while wait_s > 0:
+                    await db.broadcast_campaigns.update_one(
+                        {"id": campaign_id},
+                        {"$set": {"paused_reason": f"Rate limit: esperando {wait_s}s para liberar slot horario"}}
+                    )
+                    await asyncio.sleep(min(wait_s, 60))
+                    # re-check status mientras esperamos
+                    state = await db.broadcast_campaigns.find_one(
+                        {"id": campaign_id}, {"_id": 0, "status": 1}
+                    )
+                    if not state or state.get("status") not in ("running",):
+                        return
+                    wait_s = await _broadcast_throttle_wait(c["line_id"], line)
                 await db.broadcast_campaigns.update_one(
-                    {"id": campaign_id},
-                    {"$set": {"status": "paused", "paused_reason": autopause_reason}}
+                    {"id": campaign_id}, {"$set": {"paused_reason": None}}
                 )
-                logger.warning(f"campaign {campaign_id} auto-paused (high fail rate): {autopause_reason}")
-                return
 
-            # Auto-pause on Meta rate-limit (#80007 / #131056) or auth error
-            if err and any(k in err for k in ("131056", "80007", "rate", "OAuthException")):
-                await db.broadcast_campaigns.update_one(
-                    {"id": campaign_id},
-                    {"$set": {"status": "paused", "paused_reason": f"Meta error: {err[:80]}"}}
+                # Build template variables
+                tpl_vars: List[str] = []
+                for col in var_mapping:
+                    if col == "name":
+                        tpl_vars.append((contact.get("name") or "").strip() or "amigo")
+                    else:
+                        v = (contact.get("vars") or {}).get(col, "")
+                        tpl_vars.append(str(v) if v is not None else "")
+
+                # Rotación (d): elegimos la próxima plantilla del pool
+                chosen_template = template_pool[_tpl_idx % len(template_pool)]
+                _tpl_idx += 1
+
+                msg_id = str(uuid.uuid4())
+                send_result = await wa_send_template(
+                    phone=phone,
+                    template_name=chosen_template,
+                    language=c.get("template_language") or "es_AR",
+                    variables=tpl_vars or None,
+                    header_image_url=c.get("header_image_url"),
+                    token=token,
+                    phone_id=phone_id,
                 )
-                logger.warning(f"campaign {campaign_id} auto-paused: {err[:120]}")
-                return
 
-            # Cauta delay
-            delay = random.uniform(CAUTA_MIN_DELAY_S, CAUTA_MAX_DELAY_S)
-            await asyncio.sleep(delay)
+                wa_msg_id = None
+                err = None
+                success = False
+                if isinstance(send_result, dict):
+                    if "error" in send_result:
+                        err = str(send_result.get("error"))[:300]
+                    elif send_result.get("messages"):
+                        wa_msg_id = send_result["messages"][0].get("id")
+                        success = True
+                    else:
+                        err = str(send_result)[:300]
+
+                doc = {
+                    "id": msg_id,
+                    "campaign_id": campaign_id,
+                    "line_id": c["line_id"],
+                    "phone": phone,
+                    "name": contact.get("name", ""),
+                    "template_name": chosen_template,
+                    "wa_message_id": wa_msg_id,
+                    "status": "sent" if success else "failed",
+                    "error": err,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                await db.broadcast_messages.insert_one(doc)
+                inc = {"stats.sent": 1} if success else {"stats.failed": 1}
+                await db.broadcast_campaigns.update_one({"id": campaign_id}, {"$inc": inc})
+
+                # Increment quota usage on successful send (skip admins — unlimited)
+                if success and owner_email and owner_user and owner_user.get("role") != "admin":
+                    await _quota_increment(owner_email, by=1)
+
+                # Auto-pause (c): si el % de fallos supera el threshold con muestra
+                # mínima, frenamos automáticamente para no quemar la línea.
+                autopause_reason = await _broadcast_check_autopause(campaign_id)
+                if autopause_reason:
+                    await db.broadcast_campaigns.update_one(
+                        {"id": campaign_id},
+                        {"$set": {"status": "paused", "paused_reason": autopause_reason}}
+                    )
+                    logger.warning(f"campaign {campaign_id} auto-paused (high fail rate): {autopause_reason}")
+                    return
+
+                # Auto-pause on Meta rate-limit (#80007 / #131056) or auth error
+                if err and any(k in err for k in ("131056", "80007", "rate", "OAuthException")):
+                    await db.broadcast_campaigns.update_one(
+                        {"id": campaign_id},
+                        {"$set": {"status": "paused", "paused_reason": f"Meta error: {err[:80]}"}}
+                    )
+                    logger.warning(f"campaign {campaign_id} auto-paused: {err[:120]}")
+                    return
+
+                # Cauta delay
+                delay = random.uniform(CAUTA_MIN_DELAY_S, CAUTA_MAX_DELAY_S)
+                await asyncio.sleep(delay)
 
         # Done with first pass
         await db.broadcast_campaigns.update_one(
@@ -12653,6 +13173,141 @@ async def api_root():
 # Short URL router (must be separate, no prefix)
 go_router = APIRouter()
 
+@go_router.get("/d/{identifier}")
+async def serve_protected_derivation(
+    identifier: str, 
+    request: Request, 
+    lead_id: Optional[str] = None,
+    phone: Optional[str] = None
+):
+    """
+    Ruta pública de Derivación Protegida (Cloaking de Derivación).
+    - Evalúa la solicitud usando el motor de tráfico (antibot, Meta crawlers, Meta IPs).
+    - Si es un Bot o Inspector de Meta -> sirve la SAFE PAGE de cloaking (página limpia).
+    - Si es un Usuario Real:
+        * Si 'phone' o 'identifier' es un número telefónico (ej: 54911...) -> redirige al WhatsApp de ese número.
+        * De lo contrario -> ejecuta la Derivación Inteligente analizando la salud y vida de las líneas
+          y redirige automáticamente al WhatsApp de la línea más sana.
+    """
+    user_agent = request.headers.get("user-agent", "")
+    ip = get_client_ip(request)
+    headers_dict = dict(request.headers)
+    
+    bot_flag = is_bot(user_agent)
+    meta_crawler = is_meta_crawler(user_agent)
+    meta_ip = is_meta_ip(ip)
+
+    # 1. Cloaking: Si es bot/crawler de Meta -> Mostrar Safe Page
+    if bot_flag or meta_crawler or meta_ip:
+        logger.info(f"Derivación Protegida /d/{identifier}: Cloaking activado - bot={bot_flag}, meta={meta_crawler}, meta_ip={meta_ip}")
+        return HTMLResponse(content=SAFE_PAGE_HTML, status_code=200)
+
+    # 2. Verificar si se pasó un número directo (o si el identifier es un número)
+    target_phone = phone or ""
+    clean_identifier = re.sub(r"\D", "", identifier)
+    if not target_phone and len(clean_identifier) >= 8:
+        target_phone = clean_identifier
+
+    if target_phone:
+        clean_p = re.sub(r"\D", "", target_phone)
+        await db.crm_derivations.insert_one({
+            "id": str(uuid.uuid4()),
+            "lead_id": lead_id or "web_direct",
+            "phone": clean_p,
+            "cashier_identifier": identifier,
+            "type": "cloaked_direct_phone",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+        wa_target_url = f"https://wa.me/{clean_p}?text=Hola!%20Quiero%20mas%20informacion"
+        return RedirectResponse(url=wa_target_url, status_code=302)
+
+    # 3. Buscar por cajero/usuario
+    user_doc = await db.users.find_one(
+        {"$or": [{"email": identifier}, {"id": identifier}, {"name": identifier}]},
+        {"_id": 0}
+    )
+
+    candidate_numbers = []
+    if user_doc:
+        candidate_numbers = (user_doc.get("derivation_numbers") or []) + (user_doc.get("derivation_webs") or [])
+
+    system_lines = []
+    if not candidate_numbers:
+        system_lines = await db.crm_lines.find({"is_active": True}, {"_id": 0}).to_list(100)
+        candidate_numbers = [l.get("whatsapp_number") for l in system_lines if l.get("whatsapp_number")]
+
+    if not candidate_numbers:
+        return HTMLResponse(content=SAFE_PAGE_HTML, status_code=200)
+
+    # Derivación Inteligente según la vida de la línea
+    now = datetime.now(timezone.utc)
+    start_of_today = datetime(now.year, now.month, now.day, tzinfo=timezone.utc).isoformat()
+
+    scored_candidates = []
+    for raw_entry in candidate_numbers:
+        phone_clean = re.sub(r"\D", "", str(raw_entry))
+        if not phone_clean:
+            continue
+
+        line_doc = next((l for l in system_lines if l.get("whatsapp_number") == phone_clean), None)
+        if not line_doc:
+            line_doc = await db.crm_lines.find_one({"whatsapp_number": phone_clean}, {"_id": 0})
+
+        created_at_str = line_doc.get("created_at") if line_doc else None
+        line_age_days = 30
+        if created_at_str:
+            try:
+                created_dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+                line_age_days = (now - created_dt).days
+            except Exception:
+                pass
+
+        if line_age_days < 7:
+            daily_limit = 40
+            life_stage = "joven"
+        elif line_age_days < 30:
+            daily_limit = 150
+            life_stage = "media"
+        else:
+            daily_limit = 350
+            life_stage = "madura"
+
+        today_derivations = await db.crm_derivations.count_documents({
+            "phone": phone_clean,
+            "timestamp": {"$gte": start_of_today}
+        })
+
+        usage_ratio = today_derivations / max(daily_limit, 1)
+
+        scored_candidates.append({
+            "phone": phone_clean,
+            "today_derivations": today_derivations,
+            "daily_limit": daily_limit,
+            "life_stage": life_stage,
+            "usage_ratio": usage_ratio
+        })
+
+    if not scored_candidates:
+        return HTMLResponse(content=SAFE_PAGE_HTML, status_code=200)
+
+    available_healthy = [c for c in scored_candidates if c["usage_ratio"] < 1.0]
+    if available_healthy:
+        chosen = sorted(available_healthy, key=lambda x: (x["usage_ratio"], x["today_derivations"]))[0]
+    else:
+        chosen = sorted(scored_candidates, key=lambda x: (x["usage_ratio"], x["today_derivations"]))[0]
+
+    await db.crm_derivations.insert_one({
+        "id": str(uuid.uuid4()),
+        "lead_id": lead_id or "web_direct",
+        "phone": chosen["phone"],
+        "cashier_identifier": identifier,
+        "life_stage": chosen["life_stage"],
+        "timestamp": now.isoformat()
+    })
+
+    wa_target_url = f"https://wa.me/{chosen['phone']}?text=Hola!%20Quiero%20mas%20informacion"
+    return RedirectResponse(url=wa_target_url, status_code=302)
+
 @go_router.get("/l/{code}")
 async def serve_wa_landing(code: str, request: Request):
     """Serve WhatsApp landing page with antibot cloaking"""
@@ -13162,16 +13817,7 @@ async def dashboard_overview(
 
     cur_match = {**line_q, "created_at": {"$gte": s, "$lte": e}}
     cur_leads = await db.crm_leads.count_documents(cur_match)
-    cur_validos_match = {
-        **line_q,
-        "status": "valido",
-        "$or": [
-            {"classified_at": {"$gte": s, "$lte": e}},
-            {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": s, "$lte": e}},
-            {"classified_at": {"$exists": False}, "created_at": {"$gte": s, "$lte": e}},
-            {"updated_at": {"$gte": s, "$lte": e}}
-        ]
-    }
+    cur_validos_match = {**cur_match, "status": "valido"}
     cur_validos = await db.crm_leads.count_documents(cur_validos_match)
     agg = await db.crm_leads.aggregate([
         {"$match": cur_validos_match},
@@ -14364,6 +15010,7 @@ async def _persist_and_send_ai_reply(lead: dict, line: dict, reply_text: str):
             token=line["whatsapp_token"],
             phone_id=line["phone_number_id"],
             line_name=line.get("name"),
+            line_id=line.get("id") or lead.get("line_id"),
         ))
 
 
@@ -15025,6 +15672,404 @@ async def _process_receipt_ocr(message_id: str, lead_id: str, media_id: str, mim
     except Exception as e:
         logger.error(f"Receipt OCR process failed for msg {message_id}: {e}")
 
+# ─── UNOFFICIAL WHATSAPP SHIELD (CAPA 2) ENDPOINTS ───────────────
+
+import os
+WA_SERVICE_URL = os.environ.get("WA_SERVICE_URL", "http://localhost:3005/api/wa")
+
+@api_router.post("/crm/wa-unofficial/session/{cajero_id}/start")
+async def wa_unofficial_start(cajero_id: str):
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.post(f"{WA_SERVICE_URL}/session/{cajero_id}/start")
+            return resp.json()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/crm/wa-unofficial/session/{cajero_id}/status")
+async def wa_unofficial_status(cajero_id: str):
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(f"{WA_SERVICE_URL}/session/{cajero_id}/status")
+            return resp.json()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.post("/crm/wa-unofficial/session/{cajero_id}/logout")
+async def wa_unofficial_logout(cajero_id: str):
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.post(f"{WA_SERVICE_URL}/session/{cajero_id}/logout")
+            return resp.json()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+class PrincipalCreate(BaseModel):
+    name: str
+
+@api_router.get("/crm/wa-unofficial/{cajero_id}/principals")
+async def get_principals(cajero_id: str):
+    principals = await db.crm_unofficial_principals.find({"cajero_id": cajero_id}).to_list(None)
+    async with httpx.AsyncClient(timeout=10) as client:
+        for p in principals:
+            p["_id"] = str(p["_id"])
+            try:
+                resp = await client.get(f"{WA_SERVICE_URL}/session/{p['id']}/status")
+                if resp.status_code == 200:
+                    p["status"] = resp.json().get("status", "DISCONNECTED")
+                else:
+                    p["status"] = "DISCONNECTED"
+            except Exception:
+                p["status"] = "DISCONNECTED"
+    return principals
+
+@api_router.post("/crm/wa-unofficial/{cajero_id}/principals")
+async def create_principal(cajero_id: str, payload: PrincipalCreate):
+    import uuid
+    from datetime import datetime, timezone
+    uid = str(uuid.uuid4())
+    principal_id = f"{cajero_id}:::{uid}"
+    
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.post(f"{WA_SERVICE_URL}/session/{principal_id}/start")
+            data = resp.json()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Microservice error: {e}")
+            
+    doc = {
+        "id": principal_id,
+        "cajero_id": cajero_id,
+        "name": payload.name,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.crm_unofficial_principals.insert_one(doc)
+    doc["_id"] = str(doc["_id"])
+    doc["qr"] = data.get("qr")
+    doc["status"] = data.get("status")
+    return doc
+
+@api_router.delete("/crm/wa-unofficial/principals/{principal_id:path}")
+async def delete_principal(principal_id: str):
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            await client.post(f"{WA_SERVICE_URL}/session/{principal_id}/logout")
+        except:
+            pass
+    await db.crm_unofficial_principals.delete_one({"id": principal_id})
+    return {"success": True}
+
+class RepescaPayload(BaseModel):
+    message: str
+    source_principal_id: str
+    target_audience: str
+
+async def execute_repesca_task(targets, source_principal_id, message, cajero_id):
+    import asyncio
+    import random
+    import httpx
+    from datetime import datetime, timezone
+    
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for clean_phone, target_number in targets.items():
+            try:
+                # Obfuscate the template for each individual user to avoid content-hash matching by Meta
+                unique_message = await obfuscate_message(message)
+                
+                # Add delay BEFORE sending to avoid instant bans (except first message)
+                await asyncio.sleep(random.uniform(4.0, 9.0))
+                
+                send_resp = await client.post(
+                    f"{WA_SERVICE_URL}/session/{source_principal_id}/send",
+                    json={"number": target_number, "message": unique_message}
+                )
+                if send_resp.status_code == 200 and send_resp.json().get("success"):
+                    msg_doc = {
+                        "id": f"out_repesca_{datetime.now().timestamp()}",
+                        "cajero_id": cajero_id,
+                        "principal_id": source_principal_id,
+                        "phone": clean_phone,
+                        "content": unique_message,
+                        "sender": "admin",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "type": "chat",
+                        "raw": None
+                    }
+                    await db.crm_unofficial_messages.insert_one(msg_doc)
+            except Exception as e:
+                print(f"Error in background repesca: {e}")
+                pass
+
+@api_router.post("/crm/wa-unofficial/repesca/{cajero_id}")
+async def wa_unofficial_repesca(cajero_id: str, payload: RepescaPayload, bg_tasks: BackgroundTasks):
+    cajero = await db.users.find_one({"email": cajero_id})
+    if not cajero:
+        raise HTTPException(status_code=404, detail="Cajero no encontrado")
+        
+    targets = {}
+    if payload.target_audience in ["leads", "all"]:
+        leads = await db.crm_leads.find({"owner": cajero_id}).to_list(None)
+        for lead in leads:
+            phone = lead.get("phone_number") or lead.get("id")
+            if phone:
+                clean = "".join(filter(str.isdigit, phone))
+                if clean: targets[clean] = clean
+                
+    if payload.target_audience.startswith("chats_") or payload.target_audience == "all":
+        q = {"cajero_id": cajero_id}
+        if payload.target_audience.startswith("chats_") and payload.target_audience != "chats_all":
+            p_id = payload.target_audience.replace("chats_", "")
+            q["principal_id"] = p_id
+        chats = await db.crm_unofficial_chats.find(q).to_list(None)
+        for chat in chats:
+            phone = chat.get("phone")
+            if phone:
+                clean = "".join(filter(str.isdigit, phone))
+                if clean: targets[clean] = chat.get("original_jid") or clean
+
+    if not targets:
+        return {"success": True, "sent": 0, "failed": 0, "message": "No hay leads ni chats"}
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            status_resp = await client.get(f"{WA_SERVICE_URL}/session/{payload.source_principal_id}/status")
+            if status_resp.status_code != 200 or status_resp.json().get("status") not in ["READY", "AUTHENTICATED"]:
+                raise HTTPException(status_code=400, detail="El WhatsApp seleccionado no está listo.")
+        except Exception:
+            raise HTTPException(status_code=500, detail="Error conectando con WA")
+
+    # Dispatch to background task
+    bg_tasks.add_task(execute_repesca_task, targets, payload.source_principal_id, payload.message, cajero_id)
+    
+    return {"success": True, "sent": f"Procesando {len(targets)}", "failed": 0, "message": "Repesca iniciada en segundo plano para evitar bloqueos."}
+
+@api_router.post("/crm/wa-unofficial/webhook")
+async def wa_unofficial_webhook(payload: dict = Body(...)):
+    raw_id = payload.get("cajero_id")
+    if raw_id and ":::" in raw_id:
+        cajero_id, principal_id = raw_id.split(":::", 1)
+    else:
+        cajero_id = raw_id
+        principal_id = raw_id
+    msg = payload.get("message", {})
+    if not cajero_id or not msg:
+        return {"success": False}
+        
+    # Ignore outgoing messages from webhook to prevent split chats for LIDs.
+    # Outgoing messages sent via CRM are already saved synchronously.
+    if msg.get("fromMe"):
+        return {"success": True, "ignored": True}
+        
+    remote_phone = msg.get("to") if msg.get("fromMe") else msg.get("from")
+    if not remote_phone:
+        return {"success": False}
+        
+    clean_phone = "".join(filter(str.isdigit, remote_phone.split("@")[0]))
+    
+    media_url = None
+    media_data = msg.get("mediaData")
+    if media_data:
+        import base64
+        import uuid
+        import os
+        import mimetypes
+        ext = mimetypes.guess_extension(msg.get("mediaMime", "").split(";")[0]) or ".bin"
+        if msg.get("mediaMime", "").startswith("image/"):
+            ext = ".jpg" if "jpeg" in msg.get("mediaMime") else ext
+        filename = f"wa_media_{uuid.uuid4().hex}{ext}"
+        os.makedirs("/app/backend/uploads/chat", exist_ok=True)
+        filepath = f"/app/backend/uploads/chat/{filename}"
+        try:
+            media_data_padded = media_data + "=" * ((4 - len(media_data) % 4) % 4)
+            with open(filepath, "wb") as f:
+                f.write(base64.b64decode(media_data_padded))
+            media_url = f"/api/crm/chat-image/{filename}"
+        except Exception as e:
+            print("Error saving WA media:", e)
+    
+    msg_doc = {
+        "id": msg.get("id"),
+        "cajero_id": cajero_id,
+        "principal_id": principal_id,
+        "phone": clean_phone,
+        "content": msg.get("body", "") or (f"[{msg.get('type')}]" if msg.get("type") else ""),
+        "sender": "admin" if msg.get("fromMe") else "lead",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "type": msg.get("type"),
+        "media_url": media_url,
+        "raw": None
+    }
+    original_jid = msg.get("original_to") if msg.get("fromMe") else msg.get("original_from")
+    
+    chat_update = {
+        "cajero_id": cajero_id,
+        "principal_id": principal_id,
+        "phone": clean_phone,
+        "last_message": msg_doc["content"],
+        "last_message_time": msg_doc["timestamp"]
+    }
+    if original_jid:
+        chat_update["original_jid"] = original_jid
+        
+    pushname = msg.get("pushname")
+    if pushname:
+        chat_update["contact_name"] = pushname
+    
+    await db.crm_unofficial_chats.update_one(
+        {"cajero_id": cajero_id, "phone": clean_phone},
+        {
+            "$set": chat_update,
+            "$inc": {"unread_count": 0 if msg.get("fromMe") else 1}
+        },
+        upsert=True
+    )
+    
+    await db.crm_unofficial_messages.update_one(
+        {"id": msg_doc["id"]},
+        {"$set": msg_doc},
+        upsert=True
+    )
+    return {"success": True}
+
+@api_router.get("/crm/wa-unofficial/{cajero_id}/chats")
+async def wa_unofficial_chats(cajero_id: str):
+    query = {} if cajero_id == "all" else {"cajero_id": cajero_id}
+    chats = await db.crm_unofficial_chats.find(query).sort("last_message_time", -1).to_list(None)
+    for c in chats:
+        c["_id"] = str(c["_id"])
+    return chats
+
+@api_router.get("/crm/wa-unofficial/{cajero_id}/chats/{phone}/messages")
+async def wa_unofficial_chat_messages(cajero_id: str, phone: str):
+    query = {"phone": phone} if cajero_id == "all" else {"cajero_id": cajero_id, "phone": phone}
+    messages = await db.crm_unofficial_messages.find(query).sort("timestamp", 1).to_list(None)
+    for m in messages:
+        m["_id"] = str(m["_id"])
+    
+    await db.crm_unofficial_chats.update_one(
+        {"phone": phone} if cajero_id == "all" else {"cajero_id": cajero_id, "phone": phone},
+        {"$set": {"unread_count": 0}}
+    )
+    return messages
+async def obfuscate_message(text: str) -> str:
+    # Only obfuscate text messages that are templates or standard responses (longer than 20 chars).
+    # Avoid obfuscating links, CBU/ALIAS info, or short acknowledgments.
+    if len(text) < 20 or "http" in text or "CBU" in text or "ALIAS" in text or "cbu" in text.lower():
+        return text
+        
+    import os
+    # Priority to env var, fallback to the provided key
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "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")
+    
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": anthropic_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                },
+                json={
+                    "model": "claude-3-haiku-20240307",
+                    "max_tokens": 150,
+                    "system": "Eres un asistente de ofuscación anti-spam para un CRM en Argentina. Tu única tarea es reescribir el mensaje que recibas para que mantenga exactamente el mismo significado, tono amable e intención, pero usando palabras o estructuras ligeramente diferentes (parafraseo). NO agregues saludos adicionales si el original no los tiene. NO agregues comillas. Devuelve ÚNICAMENTE el texto reescrito.",
+                    "messages": [
+                        {"role": "user", "content": f"Reescribe esto de forma natural:\n\n{text}"}
+                    ]
+                }
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                if "content" in result and len(result["content"]) > 0:
+                    obfuscated = result["content"][0]["text"].strip()
+                    # Claude sometimes wraps in quotes despite instructions
+                    if obfuscated.startswith('"') and obfuscated.endswith('"'):
+                        obfuscated = obfuscated[1:-1]
+                    return obfuscated
+    except Exception as e:
+        print(f"Error obfuscating message with Claude: {e}")
+    
+    return text
+
+@api_router.post("/crm/wa-unofficial/{cajero_id}/send")
+async def wa_unofficial_send_message(cajero_id: str, payload: dict = Body(...)):
+    # payload: { phone: str, message: str }
+    phone = payload.get("phone")
+    message = payload.get("message")
+    
+    if not phone or not message:
+        raise HTTPException(status_code=400, detail="Missing phone or message")
+        
+    # Apply anti-ban dynamic obfuscation
+    message = await obfuscate_message(message)
+        
+    # Fetch the chat to see if we have an original_jid mapped for it
+    chat = await db.crm_unofficial_chats.find_one({"cajero_id": cajero_id, "phone": phone})
+    target_number = phone
+    if chat and chat.get("original_jid"):
+        target_number = chat.get("original_jid")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            p_id = payload.get("principal_id")
+            if p_id and ":::" not in p_id:
+                p_id = f"{cajero_id}:::{p_id}"
+            elif not p_id:
+                p_id = cajero_id
+            
+            resp = await client.post(
+                f"{WA_SERVICE_URL}/session/{p_id}/send",
+                json={"number": target_number, "message": message}
+            )
+            resp.raise_for_status()
+        except httpx.RequestError:
+            raise HTTPException(status_code=500, detail="Error de comunicación con el servicio de WhatsApp")
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=e.response.status_code, detail="Error del servicio de WhatsApp")
+            
+    # Save message in our DB immediately
+    msg_doc = {
+        "id": f"out_{datetime.now().timestamp()}",
+        "cajero_id": cajero_id,
+        "phone": phone,
+        "content": message,
+        "sender": "admin",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "type": "chat",
+        "raw": None
+    }
+    await db.crm_unofficial_messages.insert_one(msg_doc)
+    
+    await db.crm_unofficial_chats.update_one(
+        {"cajero_id": cajero_id, "phone": phone},
+        {"$set": {
+            "last_message": message,
+            "last_message_time": msg_doc["timestamp"]
+        }},
+        upsert=True
+    )
+    
+    if "_id" in msg_doc:
+        msg_doc["_id"] = str(msg_doc["_id"])
+        
+    return {"success": True, "message": msg_doc}
+
+@api_router.patch("/crm/wa-unofficial/{cajero_id}/chats/{phone}/name")
+async def wa_unofficial_update_name(cajero_id: str, phone: str, payload: dict = Body(...)):
+    name = payload.get("name")
+    if name is None:
+        raise HTTPException(status_code=400, detail="Missing name")
+    
+    query = {"phone": phone} if cajero_id == "all" else {"cajero_id": cajero_id, "phone": phone}
+    result = await db.crm_unofficial_chats.update_one(
+        query,
+        {"$set": {"contact_name": name}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    
+    return {"success": True, "contact_name": name}
 
 # ─── Router registration (MUST be after all @api_router decorators) ──
 app.include_router(api_router)
