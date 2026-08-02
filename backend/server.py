@@ -6993,7 +6993,18 @@ async def crm_funnel_stats(
         date_to = (now_ar - AR_OFFSET).replace(tzinfo=timezone.utc).isoformat()
         period_label = f"Últimos {days} días"
     
-    date_query = {"created_at": {"$gte": date_from, "$lte": date_to}}
+    # Ensure ISO bounds handle both '+00:00' and 'Z' suffixes in string comparisons
+    date_from_z = date_from.replace("+00:00", "Z")
+    date_to_z = date_to.replace("+00:00", "Z")
+    date_from_p = date_from.replace("Z", "+00:00") if "Z" in date_from else date_from
+    date_to_p = date_to.replace("Z", "+00:00") if "Z" in date_to else date_to
+
+    date_query = {
+        "$or": [
+            {"created_at": {"$gte": date_from_p, "$lte": date_to_p}},
+            {"created_at": {"$gte": date_from_z, "$lte": date_to_z}}
+        ]
+    }
 
     # Determinar qué líneas puede ver este usuario
     user_line_ids = current_user.get("line_ids", [])
@@ -7060,24 +7071,19 @@ async def crm_funnel_stats(
     chats_result = await db.crm_leads.aggregate(chats_pipeline).to_list(1)
     total_chats = chats_result[0]["total"] if chats_result else 0
 
-    # Cargas (válidos): se calcula usando la fecha de conversión (classified_at) y filtrando por el cajero clasificador si aplica
+    # Cargas (válidos): se calcula usando las líneas asignadas al cajero/filtro de línea sin restringir por email clasificador
     cargas_query_parts = [
         {"status": "valido"},
         line_query if line_query else {},
         {
             "$or": [
-                {"classified_at": {"$gte": date_from, "$lte": date_to}},
-                {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": date_from, "$lte": date_to}}
+                {"classified_at": {"$gte": date_from_p, "$lte": date_to_p}},
+                {"classified_at": {"$gte": date_from_z, "$lte": date_to_z}},
+                {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": date_from_p, "$lte": date_to_p}},
+                {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": date_from_z, "$lte": date_to_z}}
             ]
         }
     ]
-    if is_cajero and current_user.get("email"):
-        cargas_query_parts.append({
-            "$or": [
-                {"classified_by": current_user.get("email")},
-                {"classified_by": {"$in": [None, ""]}}
-            ]
-        })
 
     cargas_query = {"$and": cargas_query_parts}
 
@@ -9943,20 +9949,16 @@ _broadcast_workers: Dict[str, "asyncio.Task"] = {}
 # ════════════════════════════════════════════════════════════════════
 # FINANZAS (Cajero) — Bono, Ingresos, Egresos, Balance
 # ════════════════════════════════════════════════════════════════════
-# Cada cajero gestiona su propia caja: ve cuánto ingresó (sacado del
-# embudo: leads "valido"), cuánto egresó (carga manual), cuánto bono
-# entregó (% configurable, versionado por fecha para que cambios no
-# alteren históricos) y su balance.
 
 class FinanzasBonusRateUpdate(BaseModel):
     percentage: float  # 0..100
-    apply_retroactive: bool = False  # si True, aplica a TODO el histórico (borra versiones previas)
+    apply_retroactive: bool = False
 
 
 class FinanzasExpenseCreate(BaseModel):
     amount: float
-    category_id: Optional[str] = None  # nuevo: categoría seleccionada
-    observation: Optional[str] = ""    # legacy / texto libre opcional
+    category_id: Optional[str] = None
+    observation: Optional[str] = ""
 
 
 class FinanzasExpenseUpdate(BaseModel):
@@ -9972,19 +9974,19 @@ class FinanzasCategoryCreate(BaseModel):
 
 class FinanzasManualIncomeCreate(BaseModel):
     amount: float
-    category_id: str  # plataforma o tipo de ingreso manual
+    category_id: str
     observation: Optional[str] = ""
 
 
 class FinanzasBonoPanelCreate(BaseModel):
     amount: float
     observation: Optional[str] = ""
-    category_id: Optional[str] = None  # opcional: plataforma asociada
+    category_id: Optional[str] = None
 
 
 class FinanzasCargaPlatformAssign(BaseModel):
     lead_id: str
-    category_id: Optional[str] = None  # None = quitar asignación
+    category_id: Optional[str] = None
 
 
 def _today_utc_iso_date() -> str:
@@ -10009,6 +10011,24 @@ async def _finanzas_get_bonus_rate_for_date(user_id: str, date_iso: str) -> floa
 async def _finanzas_get_current_bonus_rate(user_id: str) -> float:
     today = _today_utc_iso_date()
     return await _finanzas_get_bonus_rate_for_date(user_id, today)
+
+
+def _iso_to_ar_date_str(iso_str: Optional[str]) -> str:
+    """Convierte un timestamp ISO (UTC, Z, offset o sin tz) a la fecha corta YYYY-MM-DD
+    en la zona horaria local de Argentina (UTC-3)."""
+    if not iso_str:
+        return ""
+    try:
+        s = str(iso_str).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        ar_dt = dt.astimezone(timezone(timedelta(hours=-3)))
+        return ar_dt.strftime("%Y-%m-%d")
+    except Exception:
+        return str(iso_str)[:10]
 
 
 def _finanzas_range_utc_bounds(start_iso: str, end_iso: str) -> tuple:
@@ -10061,47 +10081,43 @@ def _finanzas_resolve_date_range(
 
 
 async def _finanzas_ingresos_by_day(user_id: str, start_iso: str, end_iso: str) -> Dict[str, float]:
-    """Suma de charge_amount por día (YYYY-MM-DD) de leads marcados como `valido`
+    """Suma de charge_amount por día (YYYY-MM-DD) en hora Argentina de leads marcados como `valido`
     asignados a este cajero. Si el cajero tiene `line_ids`, filtra por esas líneas.
-    NOTA: usa `charge_amount` + `created_at` igual que el embudo de conversión
+    NOTA: usa `charge_amount` + `classified_at/created_at` igual que el embudo de conversión
     (`/api/crm/funnel/stats`) para mantener consistencia con lo que el cajero ve."""
     user = await db.users.find_one({"id": user_id}, {"_id": 0, "email": 1, "line_ids": 1, "role": 1})
     line_filter: Dict = {}
-    cajero_filter: Dict = {}
     if user and user.get("role") not in ("admin", "superadmin"):
         line_ids = user.get("line_ids") or []
         if line_ids:
             line_filter = {"line_id": {"$in": line_ids}}
         else:
             return {}  # cajero sin líneas asignadas → sin ingresos
-        if user.get("email"):
-            cajero_filter = {
-                "$or": [
-                    {"classified_by": user.get("email")},
-                    {"classified_by": {"$in": [None, ""]}}
-                ]
-            }
+
     start_dt, end_dt = _finanzas_range_utc_bounds(start_iso, end_iso)
+    start_dt_z = start_dt.replace("+00:00", "Z")
+    end_dt_z = end_dt.replace("+00:00", "Z")
+
     query_parts = [
         {"status": "valido"},
         {"charge_amount": {"$gt": 0}},
         {
             "$or": [
                 {"classified_at": {"$gte": start_dt, "$lte": end_dt}},
-                {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": start_dt, "$lte": end_dt}}
+                {"classified_at": {"$gte": start_dt_z, "$lte": end_dt_z}},
+                {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": start_dt, "$lte": end_dt}},
+                {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": start_dt_z, "$lte": end_dt_z}}
             ]
         }
     ]
     if line_filter:
         query_parts.append(line_filter)
-    if cajero_filter:
-        query_parts.append(cajero_filter)
 
     query = {"$and": query_parts}
     by_day: Dict[str, float] = {}
     cursor = db.crm_leads.find(query, {"_id": 0, "classified_at": 1, "created_at": 1, "charge_amount": 1})
     async for lead in cursor:
-        d = ((lead.get("classified_at") or lead.get("created_at")) or "")[:10]
+        d = _iso_to_ar_date_str(lead.get("classified_at") or lead.get("created_at"))
         if not d:
             continue
         try:
@@ -10121,7 +10137,7 @@ async def _finanzas_manual_ingresos_by_day(user_id: str, start_iso: str, end_iso
         {"_id": 0, "created_at": 1, "amount": 1},
     )
     async for ing in cursor:
-        d = (ing.get("created_at") or "")[:10]
+        d = _iso_to_ar_date_str(ing.get("created_at"))
         if not d:
             continue
         try:
@@ -10141,7 +10157,7 @@ async def _finanzas_bonos_panel_by_day(user_id: str, start_iso: str, end_iso: st
         {"_id": 0, "created_at": 1, "amount": 1},
     )
     async for b in cursor:
-        d = (b.get("created_at") or "")[:10]
+        d = _iso_to_ar_date_str(b.get("created_at"))
         if not d:
             continue
         try:
@@ -10149,6 +10165,82 @@ async def _finanzas_bonos_panel_by_day(user_id: str, start_iso: str, end_iso: st
         except Exception:
             pass
     return by_day
+
+
+async def _finanzas_egresos_by_day(user_id: str, start_iso: str, end_iso: str) -> Dict[str, float]:
+    start_dt, end_dt = _finanzas_range_utc_bounds(start_iso, end_iso)
+    by_day: Dict[str, float] = {}
+    cursor = db.cajero_expenses.find(
+        {"user_id": user_id, "created_at": {"$gte": start_dt, "$lte": end_dt}},
+        {"_id": 0, "created_at": 1, "amount": 1},
+    )
+    async for ex in cursor:
+        d = _iso_to_ar_date_str(ex.get("created_at"))
+        if not d:
+            continue
+        try:
+            by_day[d] = by_day.get(d, 0.0) + float(ex.get("amount") or 0)
+        except Exception:
+            pass
+    return by_day
+
+
+async def _finanzas_get_cargas_list(user_id: str, start_iso: str, end_iso: str) -> list:
+    """Devuelve la lista de cargas válidas individuales con su bono calculado
+    según el % vigente EL DÍA que se clasificó. Ordenadas por fecha desc."""
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "line_ids": 1, "role": 1})
+    line_filter: Dict = {}
+    if user and user.get("role") not in ("admin", "superadmin"):
+        line_ids = user.get("line_ids") or []
+        if line_ids:
+            line_filter = {"line_id": {"$in": line_ids}}
+        else:
+            return []
+    start_dt, end_dt = _finanzas_range_utc_bounds(start_iso, end_iso)
+    query = {
+        **line_filter,
+        "status": "valido",
+        "created_at": {"$gte": start_dt, "$lte": end_dt},
+        "charge_amount": {"$gt": 0},
+    }
+    # Cache de rates por día para no consultar 1 vez por carga (puede haber muchas)
+    rate_cache: Dict[str, float] = {}
+
+    async def _rate_for(day: str) -> float:
+        if day not in rate_cache:
+            rate_cache[day] = await _finanzas_get_bonus_rate_for_date(user_id, day)
+        return rate_cache[day]
+
+    cargas = []
+    cursor = db.crm_leads.find(
+        query,
+        {"_id": 0, "id": 1, "name": 1, "phone": 1, "line_id": 1, "line_name": 1,
+         "created_at": 1, "charge_amount": 1,
+         "finanzas_plataforma_id": 1, "finanzas_plataforma_name": 1},
+    ).sort("created_at", -1)
+    async for lead in cursor:
+        try:
+            value = float(lead.get("charge_amount") or 0)
+        except Exception:
+            value = 0
+        day = _iso_to_ar_date_str(lead.get("classified_at") or lead.get("created_at"))
+        rate = await _rate_for(day) if day else 0
+        bono = round(value * rate / 100.0, 2) if rate > 0 else 0.0
+        cargas.append({
+            "lead_id": lead.get("id"),
+            "name": lead.get("name") or "(sin nombre)",
+            "phone": lead.get("phone"),
+            "line_id": lead.get("line_id"),
+            "line_name": lead.get("line_name"),
+            "classified_at": lead.get("created_at"),
+            "monto": round(value, 2),
+            "bono_pct": rate,
+            "bono": bono,
+            "fichas_entregadas": round(value + bono, 2),
+            "plataforma_id": lead.get("finanzas_plataforma_id"),
+            "plataforma_name": lead.get("finanzas_plataforma_name"),
+        })
+    return cargas
 
 
 async def _finanzas_egresos_by_day(user_id: str, start_iso: str, end_iso: str) -> Dict[str, float]:
