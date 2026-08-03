@@ -6922,6 +6922,70 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
 
 # ─── CRM Funnel/Embudo Routes ──────────────────────────────────────
 
+async def _get_meta_purchase_stats(
+    start_iso: str,
+    end_iso: str,
+    line_id: Optional[str] = None,
+    effective_line_ids: Optional[list] = None
+) -> tuple:
+    """Devuelve (conversiones_count, total_revenue) desde meta_events_log para eventos 'Purchase'.
+    Fallback a crm_leads status='valido' si no hay registros en meta_events_log para ese período."""
+    start_z = start_iso.replace("+00:00", "Z")
+    end_z = end_iso.replace("+00:00", "Z")
+    start_p = start_iso.replace("Z", "+00:00") if "Z" in start_iso else start_iso
+    end_p = end_iso.replace("Z", "+00:00") if "Z" in end_iso else end_iso
+
+    date_or = [
+        {"created_at": {"$gte": start_p, "$lte": end_p}},
+        {"created_at": {"$gte": start_z, "$lte": end_z}}
+    ]
+
+    line_match = {}
+    if effective_line_ids:
+        if len(effective_line_ids) == 1:
+            line_match = {"line_id": effective_line_ids[0]}
+        else:
+            line_match = {"line_id": {"$in": effective_line_ids}}
+    elif line_id:
+        line_match = {"line_id": line_id}
+
+    meta_query = {
+        "event_name": "Purchase",
+        **line_match,
+        "$or": date_or
+    }
+
+    count = await db.meta_events_log.count_documents(meta_query)
+
+    if count > 0:
+        agg = await db.meta_events_log.aggregate([
+            {"$match": meta_query},
+            {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$value", 0]}}}}
+        ]).to_list(1)
+        rev = float(agg[0]["total"]) if agg else 0.0
+        return count, round(rev, 2)
+
+    # Fallback to crm_leads if meta_events_log has no records for this period
+    cargas_query = {
+        **line_match,
+        "status": "valido",
+        "$or": [
+            {"classified_at": {"$gte": start_p, "$lte": end_p}},
+            {"classified_at": {"$gte": start_z, "$lte": end_z}},
+            {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": start_p, "$lte": end_p}},
+            {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": start_z, "$lte": end_z}}
+        ]
+    }
+    fallback_count = await db.crm_leads.count_documents(cargas_query)
+    monto_agg = await db.crm_leads.aggregate([
+        {"$match": cargas_query},
+        {"$match": {"charge_amount": {"$gt": 0}}},
+        {"$group": {"_id": None, "total": {"$sum": "$charge_amount"}}}
+    ]).to_list(1)
+    fallback_rev = float(monto_agg[0]["total"]) if monto_agg else 0.0
+    return fallback_count, round(fallback_rev, 2)
+
+
 @api_router.get("/crm/funnel/stats")
 async def crm_funnel_stats(
     line_id: Optional[str] = None,
@@ -7071,32 +7135,12 @@ async def crm_funnel_stats(
     chats_result = await db.crm_leads.aggregate(chats_pipeline).to_list(1)
     total_chats = chats_result[0]["total"] if chats_result else 0
 
-    # Cargas (válidos): se calcula usando las líneas asignadas al cajero/filtro de línea sin restringir por email clasificador
-    cargas_query_parts = [
-        {"status": "valido"},
-        line_query if line_query else {},
-        {
-            "$or": [
-                {"classified_at": {"$gte": date_from_p, "$lte": date_to_p}},
-                {"classified_at": {"$gte": date_from_z, "$lte": date_to_z}},
-                {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": date_from_p, "$lte": date_to_p}},
-                {"classified_at": {"$in": [None, ""]}, "created_at": {"$gte": date_from_z, "$lte": date_to_z}}
-            ]
-        }
-    ]
-
-    cargas_query = {"$and": cargas_query_parts}
-
-    total_cargas = await db.crm_leads.count_documents(cargas_query)
-
-    # Monto desde charge_amount de leads válidos del cajero/línea
-    monto_pipeline = [
-        {"$match": cargas_query},
-        {"$match": {"charge_amount": {"$gt": 0}}},
-        {"$group": {"_id": None, "total_monto": {"$sum": "$charge_amount"}}}
-    ]
-    monto_result = await db.crm_leads.aggregate(monto_pipeline).to_list(1)
-    total_monto = monto_result[0]["total_monto"] if monto_result else 0
+    # Cargas (compras) y monto alineados con eventos Purchase de Meta CAPI (meta_events_log)
+    total_cargas, total_monto = await _get_meta_purchase_stats(
+        start_iso=date_from,
+        end_iso=date_to,
+        effective_line_ids=effective_line_ids
+    )
 
     total_leads = await db.crm_leads.count_documents({**line_query, **date_query})
 
@@ -7213,12 +7257,30 @@ async def crm_funnel_by_ad(
     # Format results
     formatted = []
     for r in results:
+        ad_src = r["_id"]
+        meta_ad_q = {
+            "event_name": "Purchase",
+            "ad_source": ad_src,
+            "created_at": {"$gte": start_date},
+            **line_query
+        }
+        ad_purchases_count = await db.meta_events_log.count_documents(meta_ad_q)
+        if ad_purchases_count > 0:
+            rev_agg = await db.meta_events_log.aggregate([
+                {"$match": meta_ad_q},
+                {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$value", 0]}}}}
+            ]).to_list(1)
+            ad_monto = float(rev_agg[0]["total"]) if rev_agg else 0.0
+        else:
+            ad_purchases_count = r["validos"]
+            ad_monto = float(r["total_monto"] or 0)
+
         formatted.append({
-            "ad_source": r["_id"],
+            "ad_source": ad_src,
             "leads": r["total_leads"],
-            "conversiones": r["validos"],
-            "monto_total": r["total_monto"],
-            "conversion_rate": round((r["validos"] / r["total_leads"] * 100), 2) if r["total_leads"] > 0 else 0,
+            "conversiones": ad_purchases_count,
+            "monto_total": round(ad_monto, 2),
+            "conversion_rate": round((ad_purchases_count / r["total_leads"] * 100), 2) if r["total_leads"] > 0 else 0,
         })
     
     return formatted
@@ -13935,15 +13997,13 @@ async def dashboard_overview(
 
     cur_match = {**line_q, "created_at": {"$gte": s, "$lte": e}}
     cur_leads = await db.crm_leads.count_documents(cur_match)
-    cur_validos_match = {**cur_match, "status": "valido"}
-    cur_validos = await db.crm_leads.count_documents(cur_validos_match)
-    agg = await db.crm_leads.aggregate([
-        {"$match": cur_validos_match},
-        {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$charge_amount", 0]}}}},
-    ]).to_list(1)
-    total_revenue = float(agg[0]["total"]) if agg else 0.0
-    avg_ticket = (total_revenue / cur_validos) if cur_validos else 0.0
-    conv_rate = (cur_validos / cur_leads * 100) if cur_leads else 0.0
+    cur_validos, total_revenue = await _get_meta_purchase_stats(
+        start_iso=s,
+        end_iso=e,
+        line_id=line_id
+    )
+    avg_ticket = round(total_revenue / cur_validos, 2) if cur_validos else 0.0
+    conv_rate = round(cur_validos / cur_leads * 100, 2) if cur_leads else 0.0
 
     # Previous period comparison
     try:
@@ -13952,9 +14012,15 @@ async def dashboard_overview(
         span = e_dt - s_dt
         prev_e = s_dt
         prev_s = prev_e - span
-        prev_match = {**line_q, "created_at": {"$gte": prev_s.isoformat(), "$lt": prev_e.isoformat()}}
+        prev_s_iso = prev_s.isoformat()
+        prev_e_iso = prev_e.isoformat()
+        prev_match = {**line_q, "created_at": {"$gte": prev_s_iso, "$lt": prev_e_iso}}
         prev_leads = await db.crm_leads.count_documents(prev_match)
-        prev_validos = await db.crm_leads.count_documents({**prev_match, "status": "valido"})
+        prev_validos, _ = await _get_meta_purchase_stats(
+            start_iso=prev_s_iso,
+            end_iso=prev_e_iso,
+            line_id=line_id
+        )
         prev_conv = (prev_validos / prev_leads * 100) if prev_leads else 0.0
     except Exception:
         prev_leads, prev_validos, prev_conv = 0, 0, 0.0
@@ -14074,19 +14140,40 @@ async def dashboard_ad_performance(
 
     out = []
     for r in rows:
+        ad_src = r["_id"]
+        # Query meta_events_log for Purchase events of this ad_source in range [s, e]
+        meta_ad_q = {
+            "event_name": "Purchase",
+            "ad_source": ad_src,
+            "created_at": {"$gte": s, "$lte": e}
+        }
+        if line_id:
+            meta_ad_q["line_id"] = line_id
+
+        ad_purchases_count = await db.meta_events_log.count_documents(meta_ad_q)
+        if ad_purchases_count > 0:
+            rev_agg = await db.meta_events_log.aggregate([
+                {"$match": meta_ad_q},
+                {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$value", 0]}}}}
+            ]).to_list(1)
+            ad_rev = float(rev_agg[0]["total"]) if rev_agg else 0.0
+        else:
+            ad_purchases_count = r["validos"]
+            ad_rev = float(r["revenue"] or 0)
+
         ref = r.get("sample_referral") or {}
         preview_image = ref.get("image_url") or ref.get("thumbnail_url")
-        headline = ref.get("headline") or r["_id"]
+        headline = ref.get("headline") or ad_src
         body = ref.get("body") or ""
         source_url = ref.get("source_url")
         out.append({
-            "ad_source": r["_id"],
+            "ad_source": ad_src,
             "leads": r["leads"],
-            "conversiones": r["validos"],
+            "conversiones": ad_purchases_count,
             "spam": r["spam"],
-            "revenue": round(float(r["revenue"] or 0), 2),
-            "avg_ticket": round(float(r["revenue"] or 0) / r["validos"], 2) if r["validos"] else 0.0,
-            "conversion_rate": round((r["validos"] / r["leads"] * 100), 2) if r["leads"] else 0,
+            "revenue": round(ad_rev, 2),
+            "avg_ticket": round(ad_rev / ad_purchases_count, 2) if ad_purchases_count else 0.0,
+            "conversion_rate": round((ad_purchases_count / r["leads"] * 100), 2) if r["leads"] else 0,
             "preview_image": preview_image,
             "headline": headline,
             "body": body,
@@ -14247,26 +14334,70 @@ async def dashboard_timeline(
     line_q = {"line_id": line_id} if line_id else {}
     match = {**line_q, "created_at": {"$gte": s, "$lte": e}}
 
-    pipe = [
+    # 1. Leads by day
+    leads_pipe = [
         {"$match": match},
-        {"$addFields": {
-            "day": {"$substr": ["$created_at", 0, 10]},
-        }},
+        {"$addFields": {"day": {"$substr": ["$created_at", 0, 10]}}},
+        {"$group": {"_id": "$day", "leads": {"$sum": 1}}},
+        {"$sort": {"_id": 1}},
+    ]
+    leads_rows = await db.crm_leads.aggregate(leads_pipe).to_list(400)
+    by_day_dict = {r["_id"]: {"leads": r["leads"], "conversiones": 0, "revenue": 0.0} for r in leads_rows if r.get("_id")}
+
+    # 2. Meta purchase events by day
+    meta_purch_q = {"event_name": "Purchase", "created_at": {"$gte": s, "$lte": e}, **line_q}
+    meta_pipe = [
+        {"$match": meta_purch_q},
+        {"$addFields": {"day": {"$substr": ["$created_at", 0, 10]}}},
         {"$group": {
             "_id": "$day",
-            "leads": {"$sum": 1},
-            "conversiones": {"$sum": {"$cond": [{"$eq": ["$status", "valido"]}, 1, 0]}},
-            "revenue": {"$sum": {"$ifNull": ["$charge_amount", 0]}},
+            "conversiones": {"$sum": 1},
+            "revenue": {"$sum": {"$ifNull": ["$value", 0]}}
         }},
         {"$sort": {"_id": 1}},
     ]
-    rows = await db.crm_leads.aggregate(pipe).to_list(400)
-    return [{
-        "date": r["_id"],
-        "leads": r["leads"],
-        "conversiones": r["conversiones"],
-        "revenue": round(float(r["revenue"] or 0), 2),
-    } for r in rows]
+    meta_rows = await db.meta_events_log.aggregate(meta_pipe).to_list(400)
+
+    if meta_rows:
+        for r in meta_rows:
+            day = r.get("_id")
+            if not day:
+                continue
+            if day not in by_day_dict:
+                by_day_dict[day] = {"leads": 0, "conversiones": 0, "revenue": 0.0}
+            by_day_dict[day]["conversiones"] = r["conversiones"]
+            by_day_dict[day]["revenue"] = float(r["revenue"] or 0)
+    else:
+        # Fallback to crm_leads valid status
+        crm_conv_pipe = [
+            {"$match": {**match, "status": "valido"}},
+            {"$addFields": {"day": {"$substr": ["$created_at", 0, 10]}}},
+            {"$group": {
+                "_id": "$day",
+                "conversiones": {"$sum": 1},
+                "revenue": {"$sum": {"$ifNull": ["$charge_amount", 0]}}
+            }}
+        ]
+        crm_conv_rows = await db.crm_leads.aggregate(crm_conv_pipe).to_list(400)
+        for r in crm_conv_rows:
+            day = r.get("_id")
+            if not day:
+                continue
+            if day not in by_day_dict:
+                by_day_dict[day] = {"leads": 0, "conversiones": 0, "revenue": 0.0}
+            by_day_dict[day]["conversiones"] = r["conversiones"]
+            by_day_dict[day]["revenue"] = float(r["revenue"] or 0)
+
+    out = []
+    for day_str in sorted(by_day_dict.keys()):
+        d = by_day_dict[day_str]
+        out.append({
+            "date": day_str,
+            "leads": d["leads"],
+            "conversiones": d["conversiones"],
+            "revenue": round(d["revenue"], 2),
+        })
+    return out
 
 
 @api_router.get("/dashboard/hourly-heatmap")

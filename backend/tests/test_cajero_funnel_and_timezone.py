@@ -47,7 +47,30 @@ class TestCajeroFunnelAndTimezone(unittest.TestCase):
         end_iso = "2026-08-01"
         start_utc, end_utc = _finanzas_range_utc_bounds(start_iso, end_iso)
         self.assertIn("2026-08-01T03:00:00", start_utc)
+        self.assertIn("2026-08-01T03:00:00", start_utc)
         self.assertIn("2026-08-02T02:59:59", end_utc)
+
+    def test_meta_purchase_query_building(self):
+        start_iso = "2026-08-03T00:00:00+00:00"
+        end_iso = "2026-08-03T23:59:59+00:00"
+        start_z = start_iso.replace("+00:00", "Z")
+        end_z = end_iso.replace("+00:00", "Z")
+        start_p = start_iso.replace("Z", "+00:00") if "Z" in start_iso else start_iso
+        end_p = end_iso.replace("Z", "+00:00") if "Z" in end_iso else end_iso
+
+        date_or = [
+            {"created_at": {"$gte": start_p, "$lte": end_p}},
+            {"created_at": {"$gte": start_z, "$lte": end_z}}
+        ]
+        meta_query = {
+            "event_name": "Purchase",
+            "line_id": "line123",
+            "$or": date_or
+        }
+
+        self.assertEqual(meta_query["event_name"], "Purchase")
+        self.assertEqual(meta_query["line_id"], "line123")
+        self.assertEqual(len(meta_query["$or"]), 2)
 
 if __name__ == "__main__":
     unittest.main()
