@@ -3348,24 +3348,11 @@ async def wa_webhook_receive(request: Request):
                     target_line_id = crm_line["id"] if crm_line else None
                     
                     if target_line_id:
-                        # First try to find lead already assigned to this specific line
+                        # Find lead already assigned to this specific line
                         crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": target_line_id})
-                        if not crm_lead:
-                            # Check for unassigned lead
-                            crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": None})
-                            if crm_lead:
-                                # Assign unassigned lead to this line
-                                await db.crm_leads.update_one(
-                                    {"id": crm_lead["id"]},
-                                    {"$set": {"line_id": target_line_id, "updated_at": now}}
-                                )
-                                crm_lead["line_id"] = target_line_id
-                            # If lead exists on a DIFFERENT line, crm_lead stays None → new lead created below
+                        # Do NOT claim unassigned leads (line_id: None) — crm_lead stays None so a brand new lead is created below for this line
                     else:
-                        # No line matched — only reuse leads that are ALSO
-                        # unassigned. NEVER attach messages to a lead that
-                        # belongs to a real line, that would leak the
-                        # message into another cajero's chat.
+                        # No line matched — only reuse leads that are ALSO unassigned.
                         crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": None})
                     
                     if not crm_lead:
@@ -3682,8 +3669,9 @@ async def wa_classify_contact(phone: str, data: WAClassify, current_user=Depends
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Contacto no encontrado")
     
-    # Also update CRM lead if exists
-    crm_lead = await db.crm_leads.find_one({"phone": phone})
+    # Also update CRM lead if exists (scoped to specific lead ID to avoid leaking status across lines)
+    line_id_filter = {"phone": phone, "line_id": data.line_id} if hasattr(data, "line_id") and data.line_id else {"phone": phone}
+    crm_lead = await db.crm_leads.find_one(line_id_filter)
     meta_result = None
     event_sent = None
     
@@ -3697,8 +3685,8 @@ async def wa_classify_contact(phone: str, data: WAClassify, current_user=Depends
         }
         new_status = status_map.get(data.classification, "nuevo")
         
-        await db.crm_leads.update_many(
-            {"phone": phone},
+        await db.crm_leads.update_one(
+            {"id": crm_lead["id"]},
             {"$set": {
                 "status": new_status,
                 "updated_at": datetime.now(timezone.utc).isoformat()
@@ -4185,6 +4173,7 @@ body{{font-family:'Poppins',sans-serif;background:#0a0a0a;color:#fff;min-height:
 .pulse-dot{{width:8px;height:8px;background:#4AD810;border-radius:50%;animation:blink 1.5s infinite}}
 @keyframes blink{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
 .footer{{font-size:.55rem;color:#555;text-align:center;padding:16px;max-width:360px}}
+.redirect-notice{{font-size:.85rem;color:#4AD810;margin-top:6px;font-weight:600;text-shadow:0 0 10px rgba(74,216,16,.4);animation:pulse 1.5s ease-in-out infinite}}
 </style></head><body>
 <div class="bg"></div>
 <div class="live-bar"><div class="pulse-dot"></div>EN VIVO: <span id="liveCount">4568</span>+ jugando</div>
@@ -4197,6 +4186,7 @@ body{{font-family:'Poppins',sans-serif;background:#0a0a0a;color:#fff;min-height:
 <svg viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347z"/><path d="M12 0C5.373 0 0 5.373 0 12c0 2.625.846 5.059 2.284 7.034L.789 23.492l4.625-1.469A11.958 11.958 0 0012 24c6.627 0 12-5.373 12-12S18.627 0 12 0zm0 21.75c-2.17 0-4.207-.68-5.893-1.834l-.422-.281-2.744.872.728-2.663-.307-.467A9.714 9.714 0 012.25 12C2.25 6.615 6.615 2.25 12 2.25S21.75 6.615 21.75 12 17.385 21.75 12 21.75z"/></svg>
 {btn_text}
 </button>
+<div id="redirectNotice" class="redirect-notice">Abriendo WhatsApp en <span id="countdown">5</span> segundos...</div>
 {bonus_html}
 </div>
 {notif_html}
@@ -4301,9 +4291,32 @@ getVisitorId().then(function(vid){{
   }}).catch(function(){{}});
 }});
 
+var redirectTimer=null;
+var autoRedirectDone=false;
+var secondsLeft=5;
+
+function startAutoRedirect(){{
+  redirectTimer=setInterval(function(){{
+    secondsLeft--;
+    var cd=document.getElementById("countdown");
+    if(cd) cd.textContent=secondsLeft;
+    if(secondsLeft<=0){{
+      clearInterval(redirectTimer);
+      if(!autoRedirectDone){{
+        autoRedirectDone=true;
+        goWA();
+      }}
+    }}
+  }},1000);
+}}
+startAutoRedirect();
+
 function goWA(){{
+if(redirectTimer) clearInterval(redirectTimer);
 var btn=document.getElementById("waBtn");
 btn.disabled=true;btn.textContent="CONECTANDO...";
+var notice=document.getElementById("redirectNotice");
+if(notice) notice.textContent="Redirigiendo a WhatsApp...";
 var num=WA_NUMBERS[Math.floor(Math.random()*WA_NUMBERS.length)];
 var msg=WA_MSG+" (ID: "+clickId+")";
 // Re-init Pixel with Advanced Matching (visitor_id) so the Lead/Contact event
@@ -6697,33 +6710,7 @@ async def crm_line_webhook_receive(line_id: str, request: Request):
                         crm_lead["deleted_at"] = None
                         logger.info(f"CRM: Resurrected soft-deleted lead {crm_lead['id']} ({from_phone}) on line {line['name']}")
                     
-                    if not crm_lead:
-                        # Check if there's an unassigned lead (no line_id) we can claim
-                        unassigned_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": None})
-                        
-                        if unassigned_lead:
-                            # Assign existing unassigned lead to this line and update ad attribution for this interaction
-                            update_fields = {"line_id": line_id, "updated_at": now}
-                            if ad_source:
-                                update_fields["ad_source"] = ad_source
-                            if utm_content:
-                                update_fields["utm_content"] = utm_content
-                            if click_id:
-                                update_fields["click_id"] = click_id
-                            if referral_data:
-                                update_fields["referral"] = referral_data
-                            if ctwa_clid:
-                                update_fields["ctwa_clid"] = ctwa_clid
-                            if fb_login_id:
-                                update_fields["fb_login_id"] = fb_login_id
-                            await db.crm_leads.update_one(
-                                {"id": unassigned_lead["id"]},
-                                {"$set": update_fields}
-                            )
-                            crm_lead = unassigned_lead
-                            crm_lead.update(update_fields)
-                        # NOTE: If lead exists on a DIFFERENT line, crm_lead stays None
-                        # so a NEW lead will be created for THIS line below
+                    # Do NOT claim unassigned leads (line_id: None) — if crm_lead is None for this line, crm_lead stays None so a brand new, clean lead is created below specifically for this line.
                     
                     # Update lead ad attribution whenever new tracking/referral data is present
                     if crm_lead and (referral_data or ad_source or click_id or ctwa_clid or fb_login_id):
@@ -8089,10 +8076,9 @@ async def crm_get_lead_messages(
 
     phone = lead.get("phone")
     line_id = lead.get("line_id")
-    if unified and phone:
-        # Scope unification to the same line_id so cajeros only see THEIR
-        # brand's history with this phone. line_id may be None for legacy
-        # leads — match those together too.
+    if unified and phone and line_id is not None:
+        # Scope unification strictly to the same line_id so cajeros only see THEIR
+        # brand's history with this phone.
         related = await db.crm_leads.find(
             {"phone": phone, "line_id": line_id},
             {"id": 1, "_id": 0}
