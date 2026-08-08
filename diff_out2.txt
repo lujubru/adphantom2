@@ -1,0 +1,82 @@
+--- main
++++ adphantom2
+@@ -1,39 +0,0 @@
+-            wait = max(jitter, min_gap)
+-            await asyncio.sleep(wait)
+-
+-        # Mark done
+-        await db.crm_broadcasts.update_one(
+-            {"id": broadcast_id},
+-            {"$set": {"status": "done", "finished_at": datetime.now(timezone.utc).isoformat()}}
+-        )
+-        logger.info(f"Broadcast {broadcast_id} done: sent={sent}, failed={failed}")
+-    except asyncio.CancelledError:
+-        await db.crm_broadcasts.update_one(
+-            {"id": broadcast_id}, {"$set": {"status": "cancelled"}}
+-        )
+-    except Exception as e:
+-        logger.error(f"Broadcast worker {broadcast_id} fatal: {e}")
+-        await db.crm_broadcasts.update_one(
+-            {"id": broadcast_id}, {"$set": {"status": "error", "error": str(e)[:300]}}
+-        )
+-    finally:
+-        _broadcast_workers.pop(broadcast_id, None)
+-
+-
+-@api_router.get("/crm/broadcasts")
+-async def crm_list_broadcasts(limit: int = Query(30, le=200), current_user=Depends(get_current_user)):
+-    """List broadcasts. Cajero sees only their own; admin sees all."""
+-    role = current_user.get("role")
+-    query = {}
+-    if role not in ("admin", "superadmin"):
+-        query = {"created_by": current_user.get("email")}
+-    docs = []
+-    async for d in db.crm_broadcasts.find(query, {"_id": 0, "target_phones": 0}).sort("created_at", -1).limit(limit):
+-        docs.append(d)
+-    return {"broadcasts": docs}
+-
+-
+-@api_router.get("/crm/broadcast/{broadcast_id}")
+-async def crm_get_broadcast_detail(broadcast_id: str, current_user=Depends(get_current_user)):
+-    """Detail of a broadcast. Cajero can only view their own."""
+-    doc = await db.crm_broadcasts.find_one({"id": broadcast_id}, {"_id": 0, "target_phones": 0})
+@@ -300,0 +262,39 @@
++        "id": str(uuid.uuid4()), "campaign_id": campaign["id"],
++        "ip": ip, "country": country, "user_agent": user_agent,
++        "device": device, "os": os_name, "browser": browser,
++        "referrer": referrer, "is_bot": bot_flag, "is_vpn": vpn,
++        "is_datacenter": False, "is_blocked": blocked,
++        "block_reason": block_reason if blocked else None,
++        "fingerprint_hash": fingerprint, "behavioral_score": score,
++        "created_at": datetime.now(timezone.utc).isoformat(),
++    }
++    await db.clicks.insert_one(click)
++    await db.campaigns.update_one({"id": campaign["id"]}, {"$inc": {"clicks_today": 1, "total_clicks": 1}})
++
++    safe_url = campaign.get("safe_page_url")
++    if meta or blocked:
++        if meta and campaign.get("landing_html"):
++            return HTMLResponse(content=campaign["landing_html"])
++        return RedirectResponse(url=safe_url, status_code=302) if safe_url else HTMLResponse(content=SAFE_PAGE_HTML)
++    if campaign.get("landing_html"):
++        return HTMLResponse(content=campaign["landing_html"])
++    return RedirectResponse(url=campaign["target_url"], status_code=302)
++
++@go_router.get("/")
++async def root_handler(request: Request, c: str = None):
++    # If ?c= parameter present, use it as short_code for tracking
++    if c:
++        campaign = await db.campaigns.find_one({"short_code": c}, {"_id": 0})
++        if not campaign or not campaign.get("is_active"):
++            return HTMLResponse(content=SAFE_PAGE_HTML, status_code=404)
++        if campaign.get("clicks_today", 0) >= campaign.get("daily_click_limit", 10000):
++            return HTMLResponse(content=SAFE_PAGE_HTML, status_code=429)
++
++        ip = get_client_ip(request)
++        user_agent = request.headers.get("user-agent", "")
++        referrer = request.headers.get("referer", "")
++        headers_dict = dict(request.headers)
++
++        device, os_name, browser = parse_device_info(user_agent)
++        country = "XX"
++        bot_flag = is_bot(user_agent)

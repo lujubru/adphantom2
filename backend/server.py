@@ -4200,8 +4200,8 @@ var BASE_URL="{base_url}";
 function gID(){{var c="ABCDEFGHJKLMNPQRSTUVWXYZ23456789",r="";for(var i=0;i<5;i++)r+=c[Math.floor(Math.random()*c.length)];return r}}
 function getCk(n){{var m=document.cookie.match(new RegExp("(^| )"+n+"=([^;]+)"));return m?m[2]:""}}
 function setCk(n,v){{document.cookie=n+"="+v+";path=/;max-age=63072000"}}
-function getFBP(){{var f=getCk("_fbp");if(!f){{f="fb.1."+Date.now()+"."+Math.floor(Math.random()*1e10);setCk("_fbp",f)}};return f}}
-function getFBC(){{var p=new URLSearchParams(window.location.search),c=p.get("fbclid");if(!c)return"";var f="fb.1."+Date.now()+"."+c;setCk("_fbc",f);return f}}
+function getFBP(){{var f=getCk("_fbp");if(!f){{f="fb.1."+Math.floor(Date.now()/1000)+"."+Math.floor(Math.random()*1e10);setCk("_fbp",f)}};return f}}
+function getFBC(){{var p=new URLSearchParams(window.location.search),c=p.get("fbclid");if(!c)return"";var f="fb.1."+Math.floor(Date.now()/1000)+"."+c;setCk("_fbc",f);return f}}
 
 // Meta CAPI Parameter Builder — initialize once, adds the server appendix
 // to _fbc/_fbp. Falls back to the legacy getFBP/getFBC if the SDK failed

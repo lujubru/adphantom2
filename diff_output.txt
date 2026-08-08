@@ -1,0 +1,102 @@
+--- adphantom-main
++++ adphantom2
+@@ -3348,24 +3348,11 @@
+                     target_line_id = crm_line["id"] if crm_line else None
+                     
+                     if target_line_id:
+-                        # First try to find lead already assigned to this specific line
++                        # Find lead already assigned to this specific line
+                         crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": target_line_id})
+-                        if not crm_lead:
+-                            # Check for unassigned lead
+-                            crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": None})
+-                            if crm_lead:
+-                                # Assign unassigned lead to this line
+-                                await db.crm_leads.update_one(
+-                                    {"id": crm_lead["id"]},
+-                                    {"$set": {"line_id": target_line_id, "updated_at": now}}
+-                                )
+-                                crm_lead["line_id"] = target_line_id
+-                            # If lead exists on a DIFFERENT line, crm_lead stays None → new lead created below
++                        # Do NOT claim unassigned leads (line_id: None) — crm_lead stays None so a brand new lead is created below for this line
+                     else:
+-                        # No line matched — only reuse leads that are ALSO
+-                        # unassigned. NEVER attach messages to a lead that
+-                        # belongs to a real line, that would leak the
+-                        # message into another cajero's chat.
++                        # No line matched — only reuse leads that are ALSO unassigned.
+                         crm_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": None})
+                     
+                     if not crm_lead:
+@@ -3682,8 +3669,9 @@
+     if result.matched_count == 0:
+         raise HTTPException(status_code=404, detail="Contacto no encontrado")
+     
+-    # Also update CRM lead if exists
+-    crm_lead = await db.crm_leads.find_one({"phone": phone})
++    # Also update CRM lead if exists (scoped to specific lead ID to avoid leaking status across lines)
++    line_id_filter = {"phone": phone, "line_id": data.line_id} if hasattr(data, "line_id") and data.line_id else {"phone": phone}
++    crm_lead = await db.crm_leads.find_one(line_id_filter)
+     meta_result = None
+     event_sent = None
+     
+@@ -3697,8 +3685,8 @@
+         }
+         new_status = status_map.get(data.classification, "nuevo")
+         
+-        await db.crm_leads.update_many(
+-            {"phone": phone},
++        await db.crm_leads.update_one(
++            {"id": crm_lead["id"]},
+             {"$set": {
+                 "status": new_status,
+                 "updated_at": datetime.now(timezone.utc).isoformat()
+@@ -6722,33 +6710,7 @@
+                         crm_lead["deleted_at"] = None
+                         logger.info(f"CRM: Resurrected soft-deleted lead {crm_lead['id']} ({from_phone}) on line {line['name']}")
+                     
+-                    if not crm_lead:
+-                        # Check if there's an unassigned lead (no line_id) we can claim
+-                        unassigned_lead = await db.crm_leads.find_one({"phone": from_phone, "line_id": None})
+-                        
+-                        if unassigned_lead:
+-                            # Assign existing unassigned lead to this line and update ad attribution for this interaction
+-                            update_fields = {"line_id": line_id, "updated_at": now}
+-                            if ad_source:
+-                                update_fields["ad_source"] = ad_source
+-                            if utm_content:
+-                                update_fields["utm_content"] = utm_content
+-                            if click_id:
+-                                update_fields["click_id"] = click_id
+-                            if referral_data:
+-                                update_fields["referral"] = referral_data
+-                            if ctwa_clid:
+-                                update_fields["ctwa_clid"] = ctwa_clid
+-                            if fb_login_id:
+-                                update_fields["fb_login_id"] = fb_login_id
+-                            await db.crm_leads.update_one(
+-                                {"id": unassigned_lead["id"]},
+-                                {"$set": update_fields}
+-                            )
+-                            crm_lead = unassigned_lead
+-                            crm_lead.update(update_fields)
+-                        # NOTE: If lead exists on a DIFFERENT line, crm_lead stays None
+-                        # so a NEW lead will be created for THIS line below
++                    # Do NOT claim unassigned leads (line_id: None) — if crm_lead is None for this line, crm_lead stays None so a brand new, clean lead is created below specifically for this line.
+                     
+                     # Update lead ad attribution whenever new tracking/referral data is present
+                     if crm_lead and (referral_data or ad_source or click_id or ctwa_clid or fb_login_id):
+@@ -8114,10 +8076,9 @@
+ 
+     phone = lead.get("phone")
+     line_id = lead.get("line_id")
+-    if unified and phone:
+-        # Scope unification to the same line_id so cajeros only see THEIR
+-        # brand's history with this phone. line_id may be None for legacy
+-        # leads — match those together too.
++    if unified and phone and line_id is not None:
++        # Scope unification strictly to the same line_id so cajeros only see THEIR
++        # brand's history with this phone.
+         related = await db.crm_leads.find(
+             {"phone": phone, "line_id": line_id},
+             {"id": 1, "_id": 0}
